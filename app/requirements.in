@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Hand-authored direct dependencies. requirements.txt is the compiled,
+# hash-pinned lockfile generated from this file (#195) — regenerate it
+# after editing this one; see the comment at the top of requirements.txt.
+
+flask>=3.1.3
+flask-babel>=4.0.0
+flask-compress>=1.24
+requests>=2.34.2
+tinytag>=2.3.0
+pillow>=12.3.0
+roonapi>=0.1.6,<0.2
+authlib>=1.7.2
+waitress>=3.0.2
+# #200: AcoustID/Chromaprint fingerprinting (fingerprint.py) — binds to the
+# libchromaprint1 shared lib via ctypes and decodes via audioread (already
+# shells out to the ffmpeg already installed for transcode.py), not the
+# fpcalc CLI — verified directly, see the #200 plan.
+pyacoustid>=1.3.1

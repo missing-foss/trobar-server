@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+name: Question
+description: Setup help or "how does X work?"
+labels: [question]
+body:
+  - type: checkboxes
+    id: docs
+    attributes:
+      label: Checked the docs?
+      options:
+        - label: I looked at the documentation (https://missing-foss.github.io/trobar-server/) first
+          required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Include your deployment shape (auth mode, provider) if it's setup-related
+    validations:
+      required: true

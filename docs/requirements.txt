@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Pinned like the rest of the repo's deps; bump deliberately.
+#
+# Every build prints a "MkDocs 2.0 will break all plugins, no migration
+# path, currently unlicensed" banner. That's Material's own advocacy
+# notice, not a risk here: this pin requires mkdocs<2,>=1.6, so a
+# transitive resolve can't pull 2.0 in regardless. No action needed on it.
+mkdocs-material==9.7.7

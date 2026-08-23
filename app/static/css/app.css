@@ -1,0 +1,125 @@
+/*
+ * SPDX-FileCopyrightText: 2026 missing-foss
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+/* Trobar web app — base page styles + the light/dark theme variables
+   consumed by the Tailwind config override in index.html <head>. The logo
+   (logo.css, img/bard-mark.svg) is intentionally NOT themed here — the
+   Bard renders the same regardless of page theme, same as a physical
+   record doesn't change color with the room lights. Toggling [data-theme]
+   on <html> re-themes everything below instantly, no Tailwind config
+   reload needed. */
+
+:root[data-theme="dark"]{
+  --c-canvas-grad: radial-gradient(120% 90% at 50% -10%, #221e16 0%, #141109 60%, #100e08 100%);
+  --c-panel:#221e16; --c-panel-b:#1b1810;
+  --c-metal:#5f584c; --c-metal-hi:#a9a08f; --c-metal-lo:#211d16;
+  --c-accent:#d76a83;
+  /* #101/#109: active tab/filter pill text — accent (#d76a83) on the
+     indigo-50 tint is only ~4.4:1; a lighter pink clears 4.5:1 on dark. */
+  --c-pill-active-fg:#e88aa0;
+  --c-burgundy:#a83250; --c-burgundy-hi:#e28aa0; --c-burgundy-lo:#6e1a2e;
+  --c-gray-50:#100e08; --c-gray-100:#241f17; --c-gray-200:#2c2619; --c-gray-300:#3d3524;
+  /* #101: --c-gray-400 lightened from #8f836b so muted 11px text clears WCAG AA
+     4.5:1 on the dark --c-panel (#221e16) — the old value was 4.44. */
+  --c-gray-400:#9a8e75; --c-gray-500:#9c917c; --c-gray-600:#b6ad98; --c-gray-700:#c7bfa9;
+  --c-gray-800:#ded6c4; --c-gray-900:#f2ede1;
+  --c-indigo-50:rgba(215,106,131,0.14); --c-indigo-300:rgba(215,106,131,0.45);
+  --c-indigo-400:#d76a83; --c-indigo-500:#d76a83; --c-indigo-600:#a83250; --c-indigo-700:#6e1a2e;
+  --c-green-100:rgba(140,209,150,0.16); --c-green-600:#7cc78f; --c-green-700:#8fd6a0;
+  --c-yellow-100:rgba(230,190,90,0.16); --c-yellow-700:#e8c15c;
+  --c-red-50:rgba(224,88,110,0.14); --c-red-500:#e2586e; --c-red-600:#e2586e;
+  --c-amber-600:#e0a94a;
+  --c-selection-bg:rgba(215,106,131,.35); --c-selection-fg:#f9efdf;
+  /* Categorical chart palette (#34) — 8 fixed hue slots, assigned in this
+     order only, never cycled/re-sorted per-chart (that's the CVD-safety
+     mechanism, see dataviz skill's color-formula.md). Validated with
+     scripts/validate_palette.js against this theme's real --c-panel
+     (#221e16): worst adjacent CVD dE 8.4, worst adjacent normal-vision dE
+     19.3, all 8 clear 3:1 contrast. Not derived from the brand's single
+     accent hue — the brand has no existing multi-hue categorical set, so
+     this reuses the skill's validated reference instance rather than
+     eyeballing new colors. */
+  --c-chart-1:#3987e5; --c-chart-2:#008300; --c-chart-3:#d55181; --c-chart-4:#c98500;
+  --c-chart-5:#199e70; --c-chart-6:#d95926; --c-chart-7:#9085e9; --c-chart-8:#e66767;
+}
+
+:root[data-theme="light"]{
+  --c-canvas-grad: radial-gradient(120% 90% at 50% -10%, #fdf8f1 0%, #f7efe3 55%, #f3e9d9 100%);
+  --c-panel:#ffffff;
+  /* #234: a much subtler cream than the panel/canvas gradient's own tones
+     (#f3ebe0) — that shade reads fine as decoration but fails WCAG AA
+     4.5:1 for --c-gray-400/500 text sitting directly on it (verified via
+     the profile/devices e2e a11y test, which is the first place this
+     token got real text on it — nothing else uses --c-panel-b yet).
+     #fdfcfa keeps real margin (gray-400 4.6:1, gray-500 4.8:1) while still
+     reading as a distinct, recessed card surface next to the pure-white
+     --c-panel it sits inside. */
+  --c-panel-b:#fdfcfa;
+  --c-metal:#6b5c4e; --c-metal-hi:#83705f; --c-metal-lo:#4a3d30;
+  --c-accent:#c2506b;
+  /* #101/#109: active tab/filter pill text — accent (#c2506b) on the
+     indigo-50 tint (#f9eef0) is only ~3.97:1; a deeper burgundy clears
+     4.5:1 on light. */
+  --c-pill-active-fg:#a83250;
+  --c-burgundy:#a83250; --c-burgundy-hi:#c2506b; --c-burgundy-lo:#6e1a2e;
+  --c-gray-50:#f7f3ed; --c-gray-100:#efe7da; --c-gray-200:#e4d9c8; --c-gray-300:#d3c4ac;
+  /* #101: --c-gray-400 darkened from #9c8f80 so muted text clears WCAG AA
+     4.5:1 on the light --c-panel (#ffffff) — the old value was ~3.2. */
+  --c-gray-400:#7f7161; --c-gray-500:#7c6f60; --c-gray-600:#6b5c4e; --c-gray-700:#4a3d30;
+  --c-gray-800:#33281f; --c-gray-900:#2b211b;
+  --c-indigo-50:rgba(194,80,107,0.10); --c-indigo-300:rgba(194,80,107,0.35);
+  --c-indigo-400:#c2506b; --c-indigo-500:#c2506b; --c-indigo-600:#a83250; --c-indigo-700:#6e1a2e;
+  --c-green-100:rgba(46,125,50,0.10); --c-green-600:#2e7d32; --c-green-700:#256b29;
+  --c-yellow-100:rgba(138,97,0,0.10); --c-yellow-700:#8a6100;
+  --c-red-50:rgba(179,38,30,0.08); --c-red-500:#b3261e; --c-red-600:#b3261e;
+  --c-amber-600:#8a5300;
+  --c-selection-bg:rgba(194,80,107,.25); --c-selection-fg:#ffffff;
+  /* Categorical chart palette (#34) — see the dark block's comment above;
+     validated against this theme's real --c-panel (#ffffff): worst
+     adjacent CVD dE 9.1, worst adjacent normal-vision dE 19.6. Three slots
+     (magenta/yellow/aqua) sit below 3:1 contrast on light by design — the
+     relief rule applies, so these are never the only place a value is
+     shown (the legend text next to each swatch always carries the number). */
+  --c-chart-1:#2a78d6; --c-chart-2:#008300; --c-chart-3:#e87ba4; --c-chart-4:#eda100;
+  --c-chart-5:#1baf7a; --c-chart-6:#eb6834; --c-chart-7:#4a3aa7; --c-chart-8:#e34948;
+}
+
+.ss-app-bg{
+  background:var(--c-canvas-grad);
+  min-height:100%;
+}
+
+::selection{background:var(--c-selection-bg); color:var(--c-selection-fg);}
+
+/* Form controls: without an explicit background + text colour they fell back
+   to the browser's default white field while inheriting the dark theme's
+   light text — unreadable (white-on-white) in dark mode. Pin both
+   to theme variables. `:where()` keeps specificity at zero so a Tailwind
+   text-/bg- utility on a specific input still wins where one is set. */
+:root[data-theme="dark"]{ color-scheme:dark; }
+:root[data-theme="light"]{ color-scheme:light; }
+input:where(:not([type=checkbox]):not([type=radio]):not([type=file])),
+select, textarea{
+  background-color:var(--c-gray-50);
+  color:var(--c-gray-900);
+}
+::placeholder{ color:var(--c-gray-400); opacity:1; }
+input[type=checkbox], input[type=radio]{ accent-color:var(--c-accent); }
+
+/* Visually hidden but exposed to assistive tech — the standard "sr-only"
+   pattern (not in the built tailwind.css). Used for the per-page <h1> that
+   gives screen readers a heading the visual design doesn't show (#101). */
+.sr-only{
+  position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+  overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;
+}
+
+/* #109: selected tab/filter pill text. Replaces `text-accent`, which failed
+   WCAG AA (~3.97:1 light / ~4.4:1 dark) on the indigo-50 pill background. */
+.text-pill-active{ color:var(--c-pill-active-fg); }
+
+/* Small Bard mark used in the top bar. */
+.ss-mark--header{width:28px;height:28px;}
+@media (min-width:640px){ .ss-mark--header{width:32px;height:32px;} }

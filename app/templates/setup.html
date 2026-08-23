@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+
+<!--
+SPDX-FileCopyrightText: 2026 missing-foss
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<html lang="{{ get_locale() }}" class="h-full" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script>
+  (function () {
+    var pref = localStorage.getItem('trobar-theme') || 'auto';
+    var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.setAttribute('data-theme', pref === 'auto' ? (systemDark ? 'dark' : 'light') : pref);
+  })();
+</script>
+<title>{{ _("Trobar — Setup") }}</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/favicon.svg') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/fonts.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/logo.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tailwind.css') }}">
+<script defer src="{{ url_for('static', filename='js/alpine-3.14.9.min.js') }}"></script>
+<script>
+  const I18N = {{ js_i18n | tojson }};
+  function t(key, vars) {
+    let s = I18N[key] || key;
+    for (const k in (vars || {})) s = s.replace('{' + k + '}', vars[k]);
+    return s;
+  }
+</script>
+</head>
+<body class="h-full ss-app-bg font-sans text-gray-900 flex items-center justify-center p-4">
+  <div class="w-full max-w-lg" x-data="setupWizard()" x-init="init()">
+    <div class="flex flex-col items-center gap-3 mb-6">
+      <div class="ss-mark" style="width:64px;height:64px;">
+        <img class="ss-bard" src="{{ url_for('static', filename='img/bard-mark.svg') }}" alt="">
+      </div>
+      <span class="font-display font-semibold text-xl">Trob<span class="text-accent">ar</span></span>
+    </div>
+
+    <!-- Step indicator -->
+    <div class="flex items-center justify-center gap-2 mb-4" x-show="!loading">
+      <!-- Three steps, not four: #309 removed the 'done' screen, so a fourth
+           dot would be one the user can never arrive at. -->
+      <template x-for="(s, i) in ['music', 'provider', 'lastfm']" :key="s">
+        <div class="flex items-center gap-2">
+          <div class="w-2 h-2 rounded-full"
+            :class="step === s ? 'bg-accent' : (['music','provider','lastfm'].indexOf(step) > i ? 'bg-accent/40' : 'bg-gray-300/40')"></div>
+          <div class="w-6 h-px bg-gray-300/30" x-show="i < 2"></div>
+        </div>
+      </template>
+    </div>
+
+    <div class="bg-panel rounded-lg border border-gray-300/30 p-5">
+      <template x-if="loading">
+        <p class="text-sm text-gray-400 text-center">{{ _("Loading…") }}</p>
+      </template>
+
+      <template x-if="error">
+        <p class="text-sm text-red-500 mb-3" x-text="error"></p>
+      </template>
+
+      <!-- Step 1: music library path -->
+      <template x-if="!loading && step === 'music'">
+        <div class="space-y-3">
+          <h1 class="font-semibold">{{ _("Where's your music?") }}</h1>
+          <p class="text-xs text-gray-400">{{ _("The folder the server should scan for tracks. It must already be reachable inside the container — see the docker-compose volume mount — but you can point it at any subfolder of that mount.") }}</p>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">{{ _("Music library path") }}</label>
+            <input x-model="musicRoot" placeholder="/music"
+              class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm bg-transparent font-mono">
+          </div>
+          <!-- warn if the chosen folder is on a writable mount -->
+          <div x-show="musicRootWritable"
+            class="flex items-start gap-2 rounded-md border border-amber-600 bg-yellow-100 text-yellow-700 text-xs px-3 py-2">
+            <span>⚠️</span>
+            <span>{{ _("This folder is on a writable mount. Trobar only ever reads your music — mount it read-only (add ':ro' to the volume in docker-compose) so a bug or compromise can't modify or delete your files. You can still continue.") }}</span>
+          </div>
+          <button @click="saveMusicRoot()" :disabled="saving"
+            class="w-full text-sm px-3 py-2 rounded bg-burgundy text-white hover:bg-burgundy-lo disabled:opacity-50">
+            <span x-text="saving ? t('savingLabel') : t('continueLabel')"></span>
+          </button>
+          <button x-show="musicRootWritable" @click="saveMusicRoot(true)" :disabled="saving"
+            class="w-full text-sm px-3 py-2 rounded border border-gray-300 hover:bg-gray-100/10 disabled:opacity-50">
+            {{ _("Continue anyway") }}
+          </button>
+        </div>
+      </template>
+
+      <!-- Step 2: provider -->
+      <template x-if="!loading && step === 'provider'">
+        <div class="space-y-3">
+          <h1 class="font-semibold">{{ _("Where's your library metadata coming from?") }}</h1>
+          <p class="text-xs text-gray-400">{{ _("Playlists and artist photos come from whichever of these you pick — Filesystem needs nothing set up at all, the others need a live server to talk to.") }}</p>
+
+          <div class="flex gap-1 flex-wrap">
+            <template x-for="opt in [{id: 'filesystem', label: 'Filesystem'}, {id: 'roon', label: 'Roon'}, {id: 'subsonic', label: 'Subsonic'}, {id: 'jellyfin', label: 'Jellyfin'}, {id: 'emby', label: 'Emby'}, {id: 'plex', label: 'Plex'}, {id: 'lms', label: 'LMS'}]" :key="opt.id">
+              <button type="button" @click="adminConfig.provider = opt.id; providerStatus = null"
+                :class="adminConfig.provider===opt.id ? 'bg-indigo-50 text-accent' : 'text-gray-400 hover:bg-gray-100/10'"
+                class="text-xs px-2 py-1 rounded-md border border-gray-300/40">
+                <span x-text="opt.label"></span>
+              </button>
+            </template>
+          </div>
+
+          <template x-if="adminConfig.provider === 'filesystem'">
+            <p class="text-xs text-gray-400">{{ _("Nothing to configure — playlists and artist photos are read straight from the music folder you just set, using conventions from tools like Jaikoz/Kodi/Jellyfin.") }}</p>
+          </template>
+
+          <div x-show="adminConfig.provider === 'roon'" class="flex flex-wrap items-end gap-2">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Roon host") }}</label>
+              <input x-model="adminConfig.roon_host" placeholder="192.168.1.50"
+                class="border border-gray-300 rounded px-2 py-1 text-sm bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Port") }}</label>
+              <input x-model.number="adminConfig.roon_port" type="number" placeholder="9330"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-24 bg-transparent">
+            </div>
+          </div>
+          <div x-show="adminConfig.provider === 'subsonic'" class="flex flex-wrap items-end gap-2">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Subsonic URL") }}</label>
+              <input x-model="adminConfig.subsonic_url" placeholder="https://navidrome.example.com"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-56 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Username") }}</label>
+              <input x-model="adminConfig.subsonic_username"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-32 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Password") }}</label>
+              <input x-model="adminConfig.subsonic_password" type="password"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-32 bg-transparent">
+            </div>
+          </div>
+          <div x-show="adminConfig.provider === 'jellyfin'" class="flex flex-wrap items-end gap-2">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Jellyfin URL") }}</label>
+              <input x-model="adminConfig.jellyfin_url" placeholder="http://192.168.1.10:8096"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-56 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("API key") }}</label>
+              <input x-model="adminConfig.jellyfin_api_key" type="password"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-40 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Username") }}</label>
+              <input x-model="adminConfig.jellyfin_username"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-32 bg-transparent">
+            </div>
+          </div>
+          <div x-show="adminConfig.provider === 'emby'" class="flex flex-wrap items-end gap-2">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Emby URL") }}</label>
+              <input x-model="adminConfig.emby_url" placeholder="http://192.168.1.10:8096"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-56 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("API key") }}</label>
+              <input x-model="adminConfig.emby_api_key" type="password"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-40 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Username") }}</label>
+              <input x-model="adminConfig.emby_username"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-32 bg-transparent">
+            </div>
+          </div>
+          <div x-show="adminConfig.provider === 'plex'" class="flex flex-wrap items-end gap-2">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Plex URL") }}</label>
+              <input x-model="adminConfig.plex_url" placeholder="http://192.168.1.10:32400"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-56 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Plex token") }}</label>
+              <input x-model="adminConfig.plex_token" type="password"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-40 bg-transparent">
+            </div>
+          </div>
+          <div x-show="adminConfig.provider === 'lms'" class="flex flex-wrap items-end gap-2">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("LMS URL") }}</label>
+              <input x-model="adminConfig.lms_url" placeholder="http://192.168.1.10:9000"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-56 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Username (optional)") }}</label>
+              <input x-model="adminConfig.lms_username"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-32 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Password (optional)") }}</label>
+              <input x-model="adminConfig.lms_password" type="password"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-32 bg-transparent">
+            </div>
+          </div>
+
+          <div class="flex items-center gap-2" x-show="adminConfig.provider !== 'filesystem'">
+            <button @click="testProviderConnection()" :disabled="testing" type="button"
+              class="text-sm px-3 py-1.5 rounded border border-gray-300 hover:bg-gray-100/10 disabled:opacity-50">
+              <span x-text="testing ? t('testingLabel') : t('testConnectionLabel')"></span>
+            </button>
+            <template x-if="providerStatus">
+              <span class="text-xs" :class="{
+                'text-green-500': providerStatus.state === 'paired',
+                'text-yellow-500': providerStatus.state === 'pending_approval',
+                'text-red-500': providerStatus.state === 'disconnected',
+              }" x-text="I18N.providerState[providerStatus.state] || providerStatus.state"></span>
+            </template>
+          </div>
+
+          <div class="flex gap-2">
+            <button @click="step = 'music'" type="button" class="text-sm px-3 py-2 text-gray-400 hover:underline">{{ _("Back") }}</button>
+            <button @click="continueFromProvider()" :disabled="saving"
+              class="flex-1 text-sm px-3 py-2 rounded bg-burgundy text-white hover:bg-burgundy-lo disabled:opacity-50">
+              <span x-text="saving ? t('savingLabel') : t('continueLabel')"></span>
+            </button>
+          </div>
+        </div>
+      </template>
+
+      <!-- Step 3: last.fm (optional) + finish -->
+      <template x-if="!loading && step === 'lastfm'">
+        <div class="space-y-3">
+          <h1 class="font-semibold">{{ _("Listening history (optional)") }}</h1>
+          <p class="text-xs text-gray-400">{{ _("Powers the Suggestions tab's top-played/recently-played sections, via Last.fm or ListenBrainz. Each user connects their own account in their profile; ListenBrainz needs no key at all. The only app-wide setting is an optional default Last.fm API key below — leave blank to skip, everything can be set later.") }}</p>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">{{ _("Default Last.fm API key") }}</label>
+            <input x-model="adminConfig.lastfm_api_key_default" placeholder="{{ _('Used if a user has none of their own') }}"
+              type="password" class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm bg-transparent">
+          </div>
+          <div class="flex gap-2">
+            <button @click="step = 'provider'" type="button" class="text-sm px-3 py-2 text-gray-400 hover:underline">{{ _("Back") }}</button>
+            <button @click="finish()" :disabled="saving"
+              class="flex-1 text-sm px-3 py-2 rounded bg-burgundy text-white hover:bg-burgundy-lo disabled:opacity-50">
+              <span x-text="saving ? t('finishingLabel') : t('finishSetupLabel')"></span>
+            </button>
+          </div>
+        </div>
+      </template>
+
+      <!-- #309: there is no "done" step any more. finish() starts the scan in
+           the background and navigates straight to the library, because the
+           final screen's only content was scan counts that no longer exist by
+           the time it would render — and waiting for them was the bug. -->
+    </div>
+  </div>
+
+  <script>
+    function setupWizard() {
+      return {
+        step: 'music',
+        loading: true,
+        saving: false,
+        testing: false,
+        error: '',
+        providerStatus: null,
+        musicRoot: '',
+        musicRootWritable: false,
+        adminConfig: {
+          provider: 'filesystem', roon_host: '', roon_port: null,
+          subsonic_url: '', subsonic_username: '', subsonic_password: '',
+          jellyfin_url: '', jellyfin_api_key: '', jellyfin_username: '',
+          emby_url: '', emby_api_key: '', emby_username: '',
+          plex_url: '', plex_token: '',
+          lms_url: '', lms_username: '', lms_password: '',
+          filesystem_root: '', lastfm_api_key_default: '',
+        },
+
+        async init() {
+          try {
+            const status = await (await fetch('/api/setup/status')).json();
+            if (status.completed) { window.location.href = '/'; return; }
+            this.musicRoot = status.music_root;
+            this.musicRootWritable = !!status.music_root_writable;
+            const config = await (await fetch('/api/admin/config')).json();
+            this.adminConfig = Object.assign({}, this.adminConfig, config);
+          } catch (e) {
+            this.error = t('genericFailure', {error: e.message});
+          }
+          this.loading = false;
+        },
+
+        async saveMusicRoot(proceedIfWritable = false) {
+          this.saving = true; this.error = '';
+          try {
+            const resp = await fetch('/api/setup/music-root', {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({path: this.musicRoot}),
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+            this.musicRoot = data.music_root;
+            this.musicRootWritable = !!data.music_root_writable;
+            // if the mount is writable, stay on this step so the
+            // warning is seen; the explicit "Continue anyway" passes true.
+            if (!this.musicRootWritable || proceedIfWritable) this.step = 'provider';
+          } catch (e) {
+            this.error = e.message;
+          }
+          this.saving = false;
+        },
+
+        async saveProviderConfig() {
+          this.adminConfig = await (await fetch('/api/admin/config', {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(this.adminConfig),
+          })).json();
+        },
+
+        async testProviderConnection() {
+          this.testing = true; this.error = '';
+          try {
+            await this.saveProviderConfig();
+            this.providerStatus = await (await fetch('/api/provider/status')).json();
+          } catch (e) {
+            this.error = t('genericFailure', {error: e.message});
+          }
+          this.testing = false;
+        },
+
+        async continueFromProvider() {
+          this.saving = true; this.error = '';
+          try {
+            await this.saveProviderConfig();
+            this.step = 'lastfm';
+          } catch (e) {
+            this.error = t('genericFailure', {error: e.message});
+          }
+          this.saving = false;
+        },
+
+        // #309: leaves for the main UI, flagging the in-progress scan so it can
+        // be announced there. sessionStorage because this is a real navigation
+        // to a different document — the toast mechanism lives in index.html.
+        goToLibrary(scanStarted) {
+          try {
+            sessionStorage.setItem('trobarFirstScan', scanStarted ? 'started' : 'failed');
+          } catch { /* private mode / storage disabled: just skip the toast */ }
+          window.location.href = '/';
+        },
+
+        async finish() {
+          this.saving = true; this.error = '';
+          try {
+            await this.saveProviderConfig();
+            const resp = await fetch('/api/setup/complete', {method: 'POST'});
+            const body = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              // A real, actionable failure (e.g. an unreadable MUSIC_ROOT).
+              // Setup was NOT saved, so staying here is correct and fixable.
+              this.error = body.error || t('genericFailure', {error: resp.status});
+              this.saving = false;
+              return;
+            }
+            this.goToLibrary(body.scan_started);
+            return;  // navigating away; don't clear `saving` and flash the form
+          } catch (e) {
+            // #309: the request died (proxy timeout, network blip) — but setup
+            // may well have been saved before it did, and the recovery already
+            // exists: setup.html's on-load check redirects when status reports
+            // completed. Ask, rather than leaving a dead end the user can only
+            // escape by guessing "reload".
+            try {
+              const status = await (await fetch('/api/setup/status')).json();
+              if (status.completed) { this.goToLibrary(true); return; }
+            } catch { /* status unreachable too — fall through to the error */ }
+            this.error = t('genericFailure', {error: e.message});
+          }
+          this.saving = false;
+        },
+      };
+    }
+  </script>
+</body>
+</html>

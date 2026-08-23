@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+site_name: Trobar
+site_url: https://missing-foss.github.io/trobar-server/
+repo_url: https://github.com/missing-foss/trobar-server
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - content.code.copy
+
+# Build strictly: every docs/*.md must be in nav, internal links must resolve,
+# and internal anchors must exist. External links (GitHub, README, SECURITY.md,
+# .env.example) are https URLs and aren't validated. `mkdocs build --strict`
+# escalates any of these to an error.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  nav:
+    omitted_files: warn
+    not_found: warn
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
+
+# `admonition` is NOT one of MkDocs' built-in defaults (those are toc, tables
+# and fenced_code, which is why those three have always worked here). Without
+# it every `!!! note` / `!!! warning` block is passed through as ordinary text,
+# so the published page shows a literal `!!! warning "..."` paragraph followed
+# by the body run together -- which is what the site did until this was added.
+# `--strict` cannot catch it: unparsed markdown is valid text, not a warning.
+# Only `admonition` is listed because it is all the docs use: no `???`
+# collapsibles, no `===` tabs, no footnotes -- add the matching extension
+# alongside the first page that needs one.
+markdown_extensions:
+  - admonition
+  # `???` collapsible blocks, for content a page itself says most readers
+  # don't need. Both come from pymdown-extensions, which mkdocs-material
+  # already depends on -- docs/requirements.txt needs nothing added.
+  #
+  # superfences is REQUIRED here, not decorative: a ``` fence nested inside a
+  # `???` block does not become a code block without it. Measured on
+  # networking.md's collapsed block, which contains exactly such a fence --
+  # without superfences the output has no <pre> at all and the shell command
+  # renders as flowed prose (the fence markers are consumed, so it does NOT
+  # show as literal backticks, which is what makes it easy to miss).
+  # If you test this yourself, assert on `<pre`, not on `<code>`: inline
+  # `code` spans in the surrounding paragraph satisfy a `<code>` check and
+  # will tell you it works when it doesn't.
+  - pymdownx.details
+  - pymdownx.superfences
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation & Deployment: getting-started/installation.md
+      - First Run & Setup Wizard: getting-started/first-run.md
+      - Authentication Modes: getting-started/authentication.md
+  - Providers:
+      - Overview: providers/index.md
+      - Roon: providers/roon.md
+      - Jellyfin: providers/jellyfin.md
+      - Emby: providers/emby.md
+      - Plex: providers/plex.md
+      - Lyrion Music Server: providers/lms.md
+      - Subsonic ecosystem: providers/subsonic.md
+      - Filesystem: providers/filesystem.md
+      - iTunes / Apple Music: providers/itunes.md
+      - Tidal: providers/tidal.md
+      - Spotify: providers/spotify.md
+      - Providers we don't support: providers/other.md
+  - Using Trobar:
+      - Library & Selections: using/library-selections.md
+      - Suggestions: using/suggestions.md
+      - Playlists: using/playlists.md
+      - Devices & Storage: using/devices.md
+      - Device Loss, Replacement & Migration: using/device-recovery.md
+      - Delegated Management: using/delegation.md
+  - Clients:
+      - Overview: clients/index.md
+      - Android app: clients/android.md
+      - Desktop app: clients/desktop.md
+      - Garmin watch app: clients/garmin.md
+  - Administration: administration.md
+  - Operations:
+      - Networking & Reverse Proxy: operations/networking.md
+      - Security & Threat Model: operations/security.md
+      - Backups & DATA_DIR: operations/backups.md
+      - Upgrading: operations/upgrading.md
+  - Troubleshooting: troubleshooting.md
+  - Reference:
+      - Environment Variables: reference/environment.md
+      - Architecture & Sync Protocol: reference/architecture.md
+      - Integration API: reference/integration-api.md
+      - Home Assistant Integration: reference/home-assistant.md
+  - Project:
+      - Why "Trobar": project/why-trobar.md
+      - Contributing: project/contributing.md
+      - Translating Trobar: project/translations.md
+      - Release Cycle & Versioning: project/releases.md

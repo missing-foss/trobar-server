@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# The image only needs app/ (see Dockerfile: COPY app/). Keep the build context
+# small and free of anything sensitive or irrelevant.
+.git
+.gitignore
+.dockerignore
+android
+desktop
+dev
+docs
+*.md
+# LICENSE/notices/VERSION ship in the image — the About page serves them
+#.
+!THIRD_PARTY_NOTICES.md
+SECURITY.md
+.env
+.env.*
+**/__pycache__
+*.pyc
+*.pyo

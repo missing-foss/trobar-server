@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Local dev environment for Trobar. Brings up the app in local-auth
+# mode against a generated, copyright-free test library, with a mock Last.fm and
+# live Navidrome + Jellyfin instances for exercising the Subsonic/Jellyfin
+# providers. Runs on rootless Docker — no privileged ports, nothing shared with
+# a production stack. From this dev/ dir:  docker compose up --build
+#
+# Then open http://localhost:5000 and complete the first-run wizard
+# (admin account -> music path defaults to /music -> Filesystem provider).
+
+name: trobar-dev
+
+services:
+  # One-shot: generate the tagged FLAC test library into the shared volume, then exit.
+  music-seed:
+    build: ./gen
+    volumes:
+      - music:/music
+      - ./testlib.json:/testlib.json:ro
+    restart: "no"
+
+  # Mock Last.fm — Suggestions / similar-artists / auto-fit ranking with no real key.
+  lastfm-mock:
+    build: ./lastfm-mock
+    volumes:
+      - ./testlib.json:/testlib.json:ro
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  # The app itself, built from the repo root, in fail-closed local-auth mode.
+  trobar:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: trobar:dev
+    environment:
+      TZ: ${TZ:-UTC}
+      AUTH_MODE: local
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      DATA_DIR: /data
+      MUSIC_ROOT: /music
+      # No real Last.fm account needed — point at the mock.
+      LASTFM_API_BASE: http://lastfm-mock:8080/2.0/
+      LASTFM_API_KEY: dev
+      # local http dev: the session cookie can't be Secure or login breaks.
+      SESSION_COOKIE_SECURE: "0"
+    volumes:
+      - music:/music:ro
+      - trobar-data:/data
+    ports:
+      - "${TROBAR_PORT:-5000}:5000"
+    depends_on:
+      music-seed:
+        condition: service_completed_successfully
+      lastfm-mock:
+        condition: service_started
+    restart: unless-stopped
+
+  # Subsonic-API server for testing the Subsonic/Navidrome provider.
+  # First-run: create the admin at http://localhost:4533, then wire it into
+  # Trobar's Administration panel (see dev/README.md).
+  navidrome:
+    image: deluan/navidrome:latest
+    environment:
+      ND_MUSICFOLDER: /music
+      ND_DATAFOLDER: /data
+      ND_LOGLEVEL: warn
+      ND_ENABLEINSIGHTSCOLLECTOR: "false"
+    volumes:
+      - music:/music:ro
+      - navidrome-data:/data
+    ports:
+      - "${NAVIDROME_PORT:-4533}:4533"
+    depends_on:
+      music-seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Jellyfin for testing the Jellyfin provider. First-run: complete the setup
+  # wizard at http://localhost:8096, add /music as a Music library, mint an API
+  # key, then wire it into Trobar's Administration panel (see dev/README.md).
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    volumes:
+      - music:/music:ro
+      - jellyfin-config:/config
+      - jellyfin-cache:/cache
+    ports:
+      - "${JELLYFIN_PORT:-8096}:8096"
+    depends_on:
+      music-seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Lidarr for testing #494's "request missing albums" feature. Not a
+  # mirror target and not seeded from /music at all — it's an acquisition
+  # target, and the whole point is requesting albums Trobar's library
+  # DOESN'T have. First-run: complete the setup wizard at
+  # http://localhost:8686, mint an API key (Settings > General > Security),
+  # add a root folder (any writable path — nothing needs to actually
+  # download for monitor-only requests to show up as wanted), then
+  # wire it into Trobar's Administration panel (see dev/README.md).
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ:-UTC}
+    volumes:
+      - lidarr-config:/config
+    ports:
+      - "${LIDARR_PORT:-8686}:8686"
+    restart: unless-stopped
+
+volumes:
+  music:
+  trobar-data:
+  navidrome-data:
+  jellyfin-config:
+  jellyfin-cache:
+  lidarr-config:

@@ -1,0 +1,3448 @@
+# Copyright (C) 2026 ORGANIZATION
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+msgid ""
+msgstr ""
+"Project-Id-Version: PROJECT VERSION\n"
+"Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
+"POT-Creation-Date: 2026-08-02 01:06+0200\n"
+"PO-Revision-Date: 2026-07-06 20:45+0200\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: fr\n"
+"Language-Team: fr <LL@li.org>\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: main.py:451
+msgid "Cross-site request blocked"
+msgstr "Requête intersite bloquée"
+
+#: main.py:649 main.py:736 main.py:743
+msgid "Login required"
+msgstr "Connexion requise"
+
+#: main.py:761
+msgid "Too many failed attempts. Please wait a few minutes and try again."
+msgstr "Trop de tentatives échouées. Patientez quelques minutes puis réessayez."
+
+#: main.py:767
+msgid "Username and password are required."
+msgstr "Nom d'utilisateur et mot de passe requis."
+
+#: main.py:781
+msgid "The first account must use the configured admin username."
+msgstr "Le premier compte doit utiliser le nom d'administrateur configuré."
+
+#: main.py:811
+msgid "Invalid credentials."
+msgstr "Identifiants invalides."
+
+#: main.py:841
+msgid "Sign-in failed. Please try again."
+msgstr "Échec de la connexion. Réessayez."
+
+#: main.py:846
+msgid "Your identity provider did not return a username."
+msgstr "Votre fournisseur d'identité n'a pas renvoyé de nom d'utilisateur."
+
+#: main.py:878
+msgid "Admin access required"
+msgstr "Réservé à l'administrateur"
+
+#: main.py:895
+msgid "Device not found"
+msgstr "Appareil introuvable"
+
+#: main.py:898
+msgid "Unauthorized access to this device"
+msgstr "Accès non autorisé à cet appareil"
+
+#: main.py:908
+msgid "Selection not found"
+msgstr "Sélection introuvable"
+
+#: main.py:918
+msgid "Unauthorized access to this selection"
+msgstr "Accès non autorisé à cette sélection"
+
+#: main.py:951
+msgid "Invalid playlist."
+msgstr "Playlist invalide."
+
+#: main.py:959
+msgid "This playlist is private."
+msgstr "Cette playlist est privée."
+
+#: main.py:997 main.py:1021 templates/index.html:260
+msgid "Library"
+msgstr "Bibliothèque"
+
+#: main.py:998 templates/index.html:977
+msgid "Playlists"
+msgstr "Playlists"
+
+#: main.py:999
+msgid "Sync"
+msgstr "Synchro"
+
+#: main.py:1000 main.py:1023 templates/index.html:348
+msgid "Suggestions"
+msgstr "Suggestions"
+
+#: main.py:1003
+msgid "System"
+msgstr "Système"
+
+#: main.py:1004
+msgid "Light"
+msgstr "Clair"
+
+#: main.py:1005
+msgid "Dark"
+msgstr "Sombre"
+
+#: main.py:1008 templates/index.html:1418 templates/index.html:3005
+msgid "Phone"
+msgstr "Téléphone"
+
+#: main.py:1008 templates/index.html:1419 templates/index.html:3006
+msgid "Tablet"
+msgstr "Tablette"
+
+#: main.py:1009 templates/index.html:1420 templates/index.html:3007
+msgid "Smartwatch"
+msgstr "Montre connectée"
+
+#: main.py:1009
+msgid "Dedicated audio player"
+msgstr "Lecteur audio dédié"
+
+#: main.py:1015 templates/index.html:1422 templates/index.html:3009
+msgid "Removable storage"
+msgstr "Stockage amovible"
+
+#: main.py:1016 templates/index.html:1423 templates/index.html:3010
+msgid "Local folder"
+msgstr "Dossier local"
+
+#: main.py:1022 templates/index.html:304 templates/index.html:1144
+msgid "Devices"
+msgstr "Appareils"
+
+#: main.py:1024 templates/index.html:414
+msgid "Recently added"
+msgstr "Ajouté récemment"
+
+#: main.py:1025 templates/index.html:469
+msgid "Recently released"
+msgstr "Sorti récemment"
+
+#: main.py:1026 templates/index.html:514
+msgid "Most played"
+msgstr "Les plus écoutés"
+
+#: main.py:1027 templates/index.html:205 templates/index.html:537
+msgid "Administration"
+msgstr "Administration"
+
+#: main.py:1032
+#, python-brace-format
+msgid "Move {name} up"
+msgstr "Déplacer {name} vers le haut"
+
+#: main.py:1033
+#, python-brace-format
+msgid "Move {name} down"
+msgstr "Déplacer {name} vers le bas"
+
+#: main.py:1038
+#, python-brace-format
+msgid "{gb} GB manual picks"
+msgstr "{gb} Go choisis manuellement"
+
+#: main.py:1039
+#, python-brace-format
+msgid "{gb} GB auto-fit (up to {pct}%)"
+msgstr "{gb} Go auto-remplis (jusqu'à {pct}%)"
+
+#: main.py:1040
+#, python-brace-format
+msgid "{gb} GB headroom"
+msgstr "{gb} Go de marge"
+
+#: main.py:1042 main.py:1069 main.py:3896
+msgid "Connected"
+msgstr "Connecté"
+
+#: main.py:1043 main.py:3897
+msgid "Awaiting approval"
+msgstr "En attente d'approbation"
+
+#: main.py:1044 main.py:3898
+msgid "Disconnected"
+msgstr "Déconnecté"
+
+#: main.py:1054
+msgid "Connected — choose a root folder and profiles below"
+msgstr "Connecté — choisissez un dossier racine et des profils ci-dessous"
+
+#: main.py:1060 main.py:1475
+msgid "Checking…"
+msgstr "Vérification…"
+
+#: main.py:1061
+msgid "✓ Reachable"
+msgstr "✓ Joignable"
+
+#: main.py:1062
+msgid "Could not connect — check the URL and credentials."
+msgstr "Impossible de se connecter — vérifiez l'URL et les identifiants."
+
+#: main.py:1068 main.py:4096
+msgid "Enter a valid http:// or https:// URL."
+msgstr "Saisissez une URL http:// ou https:// valide."
+
+#: main.py:1070
+msgid "Connection error"
+msgstr "Erreur de connexion"
+
+#: main.py:1071
+#, python-brace-format
+msgid "Select {n} album"
+msgstr "Sélectionner {n} album"
+
+#: main.py:1071
+#, python-brace-format
+msgid "Select {n} albums"
+msgstr "Sélectionner {n} albums"
+
+#: main.py:1072
+msgid "Sort: name"
+msgstr "Tri : nom"
+
+#: main.py:1073
+msgid "Sort: album count"
+msgstr "Tri : nb albums"
+
+#: main.py:1074
+msgid "Scanning…"
+msgstr "Analyse…"
+
+#: main.py:1075
+msgid "Rescan"
+msgstr "Rescanner"
+
+#: main.py:1076
+msgid "A full rescan re-reads every file and can take a while. Continue?"
+msgstr ""
+"Un rescan complet relit chaque fichier et peut prendre du temps. "
+"Continuer ?"
+
+#: main.py:1077
+#, python-brace-format
+msgid "{n} album"
+msgstr "{n} album"
+
+#: main.py:1077
+#, python-brace-format
+msgid "{n} albums"
+msgstr "{n} albums"
+
+#: main.py:1078
+#, python-brace-format
+msgid "reissued {y}"
+msgstr "réédité en {y}"
+
+#: main.py:1079
+msgid "List view"
+msgstr "Vue liste"
+
+#: main.py:1080
+msgid "Cover view"
+msgstr "Vue pochettes"
+
+#: main.py:1081
+#, python-brace-format
+msgid "{n} track"
+msgstr "{n} piste"
+
+#: main.py:1081
+#, python-brace-format
+msgid "{n} tracks"
+msgstr "{n} pistes"
+
+#: main.py:1082
+#, python-brace-format
+msgid "{duration} of music"
+msgstr "{duration} de musique"
+
+#: main.py:1085
+#, python-brace-format
+msgid "tracks {tracks}%, storage {storage}%"
+msgstr "morceaux {tracks} %, stockage {storage} %"
+
+#: main.py:1086
+#, python-brace-format
+msgid "{days} days, {hours} hours"
+msgstr "{days} jours, {hours} heures"
+
+#: main.py:1087
+#, python-brace-format
+msgid "{hours} hours"
+msgstr "{hours} heures"
+
+#: main.py:1088
+msgid "Syncing…"
+msgstr "Synchronisation…"
+
+#: main.py:1089
+msgid "Refresh playlists"
+msgstr "Rafraîchir les playlists"
+
+#: main.py:1092
+#, python-brace-format
+msgid "{shown} of {total} shown"
+msgstr "{shown} sur {total} affichées"
+
+#: main.py:1093
+#, python-brace-format
+msgid "{matched}/{total} tracks available locally ({pct}%)"
+msgstr "{matched}/{total} pistes disponibles localement ({pct}%)"
+
+#: main.py:1094
+msgid "Sending…"
+msgstr "Envoi…"
+
+#: main.py:1095
+msgid "Choose an image"
+msgstr "Choisir une image"
+
+#: main.py:1096 main.py:3900
+msgid "Saving…"
+msgstr "Enregistrement…"
+
+#: main.py:1097
+msgid "Disconnect"
+msgstr "Déconnecter"
+
+#: main.py:1098 main.py:1099
+#, python-brace-format
+msgid "Connected as {name}"
+msgstr "Connecté en tant que {name}"
+
+#: main.py:1100
+#, python-brace-format
+msgid "{count} on device, not in library"
+msgstr "{count} sur l'appareil, pas dans la bibliothèque"
+
+#: main.py:1101 main.py:1113
+msgid "Review these tracks"
+msgstr "Examiner ces morceaux"
+
+#: main.py:1102
+msgid "On device, not in your library"
+msgstr "Sur l'appareil, absents de votre bibliothèque"
+
+#: main.py:1104
+msgid ""
+"These are on the device but match no track in your library — added "
+"outside Trobar, or kept after a library change. Adopt to acknowledge one "
+"as device-owned: the server records it and leaves it alone (it isn't "
+"added to your library)."
+msgstr ""
+"Ces morceaux sont sur l'appareil mais ne correspondent à aucun morceau de"
+" votre bibliothèque — ajoutés hors de Trobar, ou conservés après une "
+"modification de la bibliothèque. Adoptez-en un pour le reconnaître comme "
+"propre à l'appareil : le serveur l'enregistre et n'y touche pas (il n'est"
+" pas ajouté à votre bibliothèque)."
+
+#: main.py:1108
+msgid "Adopt"
+msgstr "Adopter"
+
+#: main.py:1109
+msgid "Adopted"
+msgstr "Adopté"
+
+#: main.py:1110
+msgid "Adopt all"
+msgstr "Tout adopter"
+
+#: main.py:1111 main.py:1123
+msgid "Couldn't load or save — try again."
+msgstr "Échec du chargement ou de l'enregistrement — réessayez."
+
+#: main.py:1112
+#, python-brace-format
+msgid "{count} not matched locally"
+msgstr "{count} non associé(s) localement"
+
+#: main.py:1114
+msgid "Not matched to your library"
+msgstr "Non associés à votre bibliothèque"
+
+#: main.py:1116
+msgid ""
+"These tracks in this playlist don't match anything in your library — "
+"streamed but never downloaded, a spelling mismatch, or genuinely missing."
+" Exclude to acknowledge one as expected: it stops being flagged here "
+"(this doesn't change what syncs to a device)."
+msgstr ""
+"Ces morceaux de la playlist ne correspondent à rien dans votre "
+"bibliothèque — écoutés en streaming mais jamais téléchargés, une "
+"orthographe différente, ou réellement absents. Excluez-en un pour le "
+"reconnaître comme attendu : il cesse d'être signalé ici (cela ne change "
+"rien à ce qui est synchronisé sur un appareil)."
+
+#: main.py:1120
+msgid "Exclude"
+msgstr "Exclure"
+
+#: main.py:1121
+msgid "Excluded"
+msgstr "Exclu"
+
+#: main.py:1122
+msgid "Exclude all"
+msgstr "Tout exclure"
+
+#: main.py:1128
+msgid "Mirror…"
+msgstr "Refléter…"
+
+#: main.py:1129
+msgid ""
+"Mirroring isn't set up yet — ask an admin to configure a mirror target in"
+" Administration."
+msgstr ""
+"La synchronisation miroir n'est pas encore configurée — demandez à un "
+"administrateur de configurer une cible de reflet dans Administration."
+
+#: main.py:1134
+#, python-brace-format
+msgid "Mirrored to {provider}"
+msgstr "Reflété vers {provider}"
+
+#: main.py:1135
+msgid "Mirror to…"
+msgstr "Refléter vers…"
+
+#: main.py:1125
+msgid "Mirroring"
+msgstr "Reflet actif"
+
+#: main.py:1126
+msgid "Kept in sync as a local .m3u file. Click to stop mirroring."
+msgstr "Synchronisé dans un fichier .m3u local. Cliquez pour arrêter."
+
+#: main.py:1127
+msgid ""
+"Mirror this playlist to a local .m3u file, kept in sync as your library "
+"grows."
+msgstr ""
+"Refléter cette playlist dans un fichier .m3u local, synchronisé au fur et"
+" à mesure que votre bibliothèque s'enrichit."
+
+#: main.py:1133
+#, python-brace-format
+msgid "Mirror folder: {folder}"
+msgstr "Dossier de reflet : {folder}"
+
+#: main.py:1134
+msgid "No mirror folder configured — set one in Administration > Configuration."
+msgstr ""
+"Aucun dossier de reflet configuré — définissez-en un dans Administration "
+"> Configuration."
+
+#: main.py:1135
+#, python-brace-format
+msgid "Last written {when}"
+msgstr "Dernière écriture {when}"
+
+#: main.py:1145
+msgid "Mirror folder isn't writable:"
+msgstr "Le dossier de reflet n'est pas accessible en écriture :"
+
+#: main.py:1146
+msgid "Computed filename is invalid — not writing it:"
+msgstr "Le nom de fichier calculé est invalide — non écrit :"
+
+#: main.py:1147
+msgid "A file already exists that wasn't created by Trobar — not overwriting it:"
+msgstr "Un fichier existe déjà et n'a pas été créé par Trobar — non écrasé :"
+
+#: main.py:1148
+msgid "Failed to write mirror file:"
+msgstr "Échec de l'écriture du fichier reflet :"
+
+#: main.py:1153
+msgid "Mirror to Subsonic…"
+msgstr "Refléter vers Subsonic…"
+
+#: main.py:1154
+msgid "Mirroring to Subsonic"
+msgstr "Reflet Subsonic actif"
+
+#: main.py:1155
+msgid ""
+"Kept in sync with your Subsonic/Navidrome mirror-target server. Click to "
+"stop mirroring."
+msgstr ""
+"Synchronisé avec votre serveur Subsonic/Navidrome cible. Cliquez pour "
+"arrêter."
+
+#: main.py:1156
+msgid ""
+"Mirror this playlist to your Subsonic/Navidrome mirror-target server, "
+"kept in sync as your library grows."
+msgstr ""
+"Refléter cette playlist vers votre serveur Subsonic/Navidrome cible, "
+"synchronisé au fur et à mesure que votre bibliothèque s'enrichit."
+
+#: main.py:1158
+#, python-brace-format
+msgid "Subsonic mirror target: {url}"
+msgstr "Cible du reflet Subsonic : {url}"
+
+#: main.py:1159
+msgid ""
+"No Subsonic mirror target configured — set one in Administration > "
+"Configuration."
+msgstr ""
+"Aucune cible de reflet Subsonic configurée — définissez-en une dans "
+"Administration > Configuration."
+
+#: main.py:1160
+msgid "Could not reach the Subsonic mirror target:"
+msgstr "Impossible de joindre la cible du reflet Subsonic :"
+
+#: main.py:1161
+msgid "Failed to write the Subsonic mirror playlist:"
+msgstr "Échec de l'écriture de la playlist reflet Subsonic :"
+
+#: main.py:1170
+msgid "None of this playlist's tracks were found on the Subsonic mirror target."
+msgstr ""
+"Aucune piste de cette playlist n'a été trouvée sur la cible du reflet "
+"Subsonic."
+
+#: main.py:1176
+msgid "Mirror to Jellyfin…"
+msgstr "Refléter vers Jellyfin…"
+
+#: main.py:1177
+msgid "Mirroring to Jellyfin"
+msgstr "Reflet Jellyfin actif"
+
+#: main.py:1178
+msgid ""
+"Kept in sync with your Jellyfin mirror-target server. Click to stop "
+"mirroring."
+msgstr "Synchronisé avec votre serveur Jellyfin cible. Cliquez pour arrêter."
+
+#: main.py:1179
+msgid ""
+"Mirror this playlist to your Jellyfin mirror-target server, kept in sync "
+"as your library grows."
+msgstr ""
+"Refléter cette playlist vers votre serveur Jellyfin cible, synchronisé au"
+" fur et à mesure que votre bibliothèque s'enrichit."
+
+#: main.py:1181
+#, python-brace-format
+msgid "Jellyfin mirror target: {url}"
+msgstr "Cible du reflet Jellyfin : {url}"
+
+#: main.py:1182
+msgid ""
+"No Jellyfin mirror target configured — set one in Administration > "
+"Configuration."
+msgstr ""
+"Aucune cible de reflet Jellyfin configurée — définissez-en une dans "
+"Administration > Configuration."
+
+#: main.py:1183
+msgid "Could not reach the Jellyfin mirror target:"
+msgstr "Impossible de joindre la cible du reflet Jellyfin :"
+
+#: main.py:1184
+msgid "Failed to write the Jellyfin mirror playlist:"
+msgstr "Échec de l'écriture de la playlist reflet Jellyfin :"
+
+#: main.py:1185
+msgid "None of this playlist's tracks were found on the Jellyfin mirror target."
+msgstr ""
+"Aucune piste de cette playlist n'a été trouvée sur la cible du reflet "
+"Jellyfin."
+
+#: main.py:1188
+msgid "Mirror to Emby…"
+msgstr "Refléter vers Emby…"
+
+#: main.py:1189
+msgid "Mirroring to Emby"
+msgstr "Reflet Emby actif"
+
+#: main.py:1190
+msgid "Kept in sync with your Emby mirror-target server. Click to stop mirroring."
+msgstr "Synchronisé avec votre serveur Emby cible. Cliquez pour arrêter."
+
+#: main.py:1191
+msgid ""
+"Mirror this playlist to your Emby mirror-target server, kept in sync as "
+"your library grows."
+msgstr ""
+"Refléter cette playlist vers votre serveur Emby cible, synchronisé au fur"
+" et à mesure que votre bibliothèque s'enrichit."
+
+#: main.py:1193
+#, python-brace-format
+msgid "Emby mirror target: {url}"
+msgstr "Cible du reflet Emby : {url}"
+
+#: main.py:1194
+msgid ""
+"No Emby mirror target configured — set one in Administration > "
+"Configuration."
+msgstr ""
+"Aucune cible de reflet Emby configurée — définissez-en une dans "
+"Administration > Configuration."
+
+#: main.py:1195
+msgid "Could not reach the Emby mirror target:"
+msgstr "Impossible de joindre la cible du reflet Emby :"
+
+#: main.py:1196
+msgid "Failed to write the Emby mirror playlist:"
+msgstr "Échec de l'écriture de la playlist reflet Emby :"
+
+#: main.py:1197
+msgid "None of this playlist's tracks were found on the Emby mirror target."
+msgstr ""
+"Aucune piste de cette playlist n'a été trouvée sur la cible du reflet "
+"Emby."
+
+#: main.py:1205
+msgid "Request missing albums…"
+msgstr "Demander les albums manquants…"
+
+#: main.py:1206
+msgid "Requesting missing albums"
+msgstr "Demande des albums manquants active"
+
+#: main.py:1207
+msgid ""
+"Missing albums are requested from Lidarr as new gaps appear. Click to "
+"stop."
+msgstr ""
+"Les albums manquants sont demandés à Lidarr à mesure que de nouveaux "
+"manques apparaissent. Cliquez pour arrêter."
+
+#: main.py:1208
+msgid ""
+"Request this playlist's missing albums from your configured Lidarr "
+"instance, monitor-only — Lidarr's own scheduled search finds them later."
+msgstr ""
+"Demander à votre instance Lidarr configurée les albums manquants de cette"
+" playlist, en mode surveillance uniquement — la recherche planifiée de "
+"Lidarr les trouvera ensuite."
+
+#: main.py:1209
+msgid ""
+"Lidarr requests aren't set up yet — ask an admin to configure a Lidarr "
+"connection in Administration."
+msgstr ""
+"Les demandes Lidarr ne sont pas encore configurées — demandez à un "
+"administrateur de configurer une connexion Lidarr dans Administration."
+
+#: main.py:1217
+msgid ""
+"Lidarr is connected, but the root folder and profiles haven't been chosen"
+" yet — ask an admin to finish setup in Administration."
+msgstr ""
+"Lidarr est connecté, mais le dossier racine et les profils n'ont pas "
+"encore été choisis — demandez à un administrateur de terminer la "
+"configuration dans Administration."
+
+#: main.py:1218
+msgid ""
+"This playlist's source doesn't provide album information for unresolved "
+"tracks, so nothing here can be requested."
+msgstr ""
+"La source de cette playlist ne fournit pas d'informations d'album pour "
+"les pistes non résolues, donc rien ne peut être demandé ici."
+
+#: main.py:1219
+#, python-brace-format
+msgid "Requested {n} albums, last run {when}"
+msgstr "{n} albums demandés, dernière exécution {when}"
+
+#: main.py:1228
+msgid "An album was added to Lidarr but couldn't be put on the wanted list:"
+msgstr ""
+"Un album a été ajouté à Lidarr mais n'a pas pu être mis sur la liste des "
+"souhaits :"
+
+#: main.py:1229
+msgid "Failed to request an album from Lidarr:"
+msgstr "Échec de la demande d'un album à Lidarr :"
+
+#: main.py:1232
+#, python-brace-format
+msgid "Lidarr target: {url}"
+msgstr "Cible Lidarr : {url}"
+
+#: main.py:1233
+msgid ""
+"No Lidarr connection configured — set one in Administration > "
+"Configuration."
+msgstr ""
+"Aucune connexion Lidarr configurée — définissez-en une dans "
+"Administration > Configuration."
+
+#: main.py:1235
+msgid "Running"
+msgstr "En cours"
+
+#: main.py:1236
+msgid "Queued"
+msgstr "En attente"
+
+#: main.py:1237
+msgid "Failed"
+msgstr "En échec"
+
+#: main.py:1238
+msgid "Completed"
+msgstr "Terminée"
+
+#: main.py:1239
+msgid "No background jobs yet."
+msgstr "Aucune tâche de fond pour le moment."
+
+#: main.py:1240
+msgid "Nothing running or waiting."
+msgstr "Rien en cours ni en attente."
+
+#: main.py:1241
+msgid "Retry"
+msgstr "Relancer"
+
+#: main.py:1242 templates/index.html:357 templates/index.html:423
+#: templates/index.html:478 templates/index.html:667 templates/index.html:1441
+#: templates/index.html:2924 templates/index.html:2985
+#: templates/index.html:3045 templates/index.html:3123
+#: templates/index.html:3168
+msgid "Cancel"
+msgstr "Annuler"
+
+#: main.py:1243
+msgid "Retrying…"
+msgstr "Relance…"
+
+#: main.py:1244
+#, python-brace-format
+msgid "attempt {n} of {max}"
+msgstr "tentative {n} sur {max}"
+
+#: main.py:1245
+#, python-brace-format
+msgid "started {when}"
+msgstr "démarrée {when}"
+
+#: main.py:1246
+#, python-brace-format
+msgid "finished {when}"
+msgstr "terminée {when}"
+
+#: main.py:1248
+#, python-brace-format
+msgid "{done} of {total} files"
+msgstr "{done} sur {total} fichiers"
+
+#: main.py:1253
+#, python-brace-format
+msgid "{done} of {total} tracks"
+msgstr "{done} sur {total} pistes"
+
+#: main.py:1254
+msgid "counting files…"
+msgstr "comptage des fichiers…"
+
+#: main.py:1260
+msgid "Library scan progress"
+msgstr "Progression du scan de la bibliothèque"
+
+#: main.py:1264
+#, python-brace-format
+msgid "Delete “{username}”?"
+msgstr "Supprimer « {username} » ?"
+
+#: main.py:1265
+msgid "This account can't be deleted yet — it still owns:"
+msgstr "Ce compte ne peut pas encore être supprimé — il possède encore :"
+
+#: main.py:1267
+msgid ""
+"Delete those first. Ownership can't be transferred from here: delegation "
+"lets someone else manage a device without owning it, and a playlist's "
+"owner only changes by re-syncing it."
+msgstr ""
+"Supprimez-les d'abord. La propriété ne peut pas être transférée ici : la "
+"délégation permet à quelqu'un d'autre de gérer un appareil sans le "
+"posséder, et le propriétaire d'une playlist ne change qu'en la "
+"resynchronisant."
+
+#: main.py:1270
+msgid "This permanently deletes the account."
+msgstr "Cette action supprime définitivement le compte."
+
+#: main.py:1272
+msgid ""
+"Their Last.fm, ListenBrainz, Tidal and Spotify connections go with it, "
+"along with any delegations and pending device enrolments."
+msgstr ""
+"Ses connexions Last.fm, ListenBrainz, Tidal et Spotify seront supprimées "
+"avec lui, ainsi que les délégations et les enrôlements d'appareils en "
+"attente."
+
+#: main.py:1274
+msgid "Delete account"
+msgstr "Supprimer le compte"
+
+#: main.py:1275
+msgid "Deleting…"
+msgstr "Suppression…"
+
+#: main.py:1276
+#, python-brace-format
+msgid "{n} device"
+msgstr "{n} appareil"
+
+#: main.py:1276
+#, python-brace-format
+msgid "{n} devices"
+msgstr "{n} appareils"
+
+#: main.py:1277
+#, python-brace-format
+msgid "{n} selection"
+msgstr "{n} sélection"
+
+#: main.py:1277
+#, python-brace-format
+msgid "{n} selections"
+msgstr "{n} sélections"
+
+#: main.py:1278
+#, python-brace-format
+msgid "{n} playlist"
+msgstr "{n} playlist"
+
+#: main.py:1278
+#, python-brace-format
+msgid "{n} playlists"
+msgstr "{n} playlists"
+
+#: main.py:1281
+#, python-brace-format
+msgid "previous attempt: {error}"
+msgstr "tentative précédente : {error}"
+
+#: main.py:1282
+#, python-brace-format
+msgid "{n} checked"
+msgstr "{n} vérifiés"
+
+#: main.py:1283
+#, python-brace-format
+msgid "queued {when}"
+msgstr "en attente depuis {when}"
+
+#: main.py:1284
+msgid "Already started — it can't be cancelled."
+msgstr "Déjà démarrée — impossible de l'annuler."
+
+#: main.py:1285
+msgid "Couldn't load or update — try again."
+msgstr "Échec du chargement ou de la mise à jour — réessayez."
+
+#: main.py:1286
+msgid "Shared"
+msgstr "Partagée"
+
+#: main.py:1287
+msgid "Private"
+msgstr "Privée"
+
+#: main.py:1288
+msgid "Visible to everyone in the household. Click to make it private."
+msgstr "Visible par tout le foyer. Cliquez pour la rendre privée."
+
+#: main.py:1289
+msgid "Only visible to you (and the admin). Click to share it."
+msgstr ""
+"Visible uniquement par vous (et l'administrateur). Cliquez pour la "
+"partager."
+
+#: main.py:1290
+#, python-brace-format
+msgid ""
+"Its tracks closely match a {provider} playlist — likely imported into "
+"Roon from there."
+msgstr ""
+"Ses morceaux correspondent étroitement à une playlist {provider} — "
+"probablement importée dans Roon depuis celle-ci."
+
+#: main.py:1291
+#, python-brace-format
+msgid "shared by {name}"
+msgstr "partagée par {name}"
+
+#: main.py:1292
+msgid "Unknown source"
+msgstr "Source inconnue"
+
+#: main.py:1293
+#, python-brace-format
+msgid "Sync {item} to {device}"
+msgstr "Synchroniser {item} vers {device}"
+
+#: main.py:1294
+#, python-brace-format
+msgid "Roon profile for {name}"
+msgstr "Profil Roon pour {name}"
+
+#: main.py:1295 templates/index.html:1440
+msgid "Save"
+msgstr "Enregistrer"
+
+#: main.py:1296 templates/index.html:934 templates/index.html:1535
+#: templates/index.html:2549 templates/index.html:2638 templates/setup.html:59
+msgid "Loading…"
+msgstr "Chargement…"
+
+#: main.py:1297 templates/index.html:1617 templates/index.html:2646
+#: templates/index.html:2927
+msgid "Refresh"
+msgstr "Rafraîchir"
+
+#: main.py:1298 main.py:1304
+#, python-brace-format
+msgid "suggested: {name}"
+msgstr "suggéré : {name}"
+
+#: main.py:1302
+#, python-brace-format
+msgid "Jellyfin account for {name}"
+msgstr "Compte Jellyfin pour {name}"
+
+#: main.py:1303
+#, python-brace-format
+msgid "Emby account for {name}"
+msgstr "Compte Emby pour {name}"
+
+#: main.py:1305
+msgid "Set password"
+msgstr "Définir le mot de passe"
+
+#: main.py:1306
+#, python-brace-format
+msgid "Seen {time}"
+msgstr "Vu {time}"
+
+#: main.py:1309
+#, python-brace-format
+msgid "Synced {time}"
+msgstr "Synchronisé {time}"
+
+#: main.py:1310
+#, python-brace-format
+msgid "Syncing… {n} track left"
+msgstr "Synchro en cours… {n} piste restante"
+
+#: main.py:1310
+#, python-brace-format
+msgid "Syncing… {n} tracks left"
+msgstr "Synchro en cours… {n} pistes restantes"
+
+#: main.py:1311
+msgid "Nothing synced yet"
+msgstr "Rien de synchronisé pour l'instant"
+
+#: main.py:1314
+msgid "Scanning your library now — browse away, it fills in as it goes."
+msgstr ""
+"Analyse de votre bibliothèque en cours — vous pouvez naviguer, elle se "
+"remplit au fur et à mesure."
+
+#: main.py:1315
+msgid ""
+"Setup saved, but the library scan didn't start. Use Rescan on the Library"
+" tab."
+msgstr ""
+"Configuration enregistrée, mais l'analyse de la bibliothèque n'a pas "
+"démarré. Utilisez Réanalyser dans l'onglet Bibliothèque."
+
+#: main.py:1316
+#, python-brace-format
+msgid "{name} finished syncing"
+msgstr "{name} a terminé sa synchro"
+
+#: main.py:1321
+#, python-brace-format
+msgid "{n} item queued to {devices}"
+msgstr "{n} élément mis en file d'attente vers {devices}"
+
+#: main.py:1322
+#, python-brace-format
+msgid "{n} items queued to {devices}"
+msgstr "{n} éléments mis en file d'attente vers {devices}"
+
+#: main.py:1328
+#, python-brace-format
+msgid "{n} skipped (unrecognized type)"
+msgstr "{n} ignoré(s) (type non reconnu)"
+
+#: main.py:1341
+msgid "In basket"
+msgstr "Dans le panier"
+
+#: main.py:1342 templates/index.html:2963
+msgid "Sync to…"
+msgstr "Synchroniser sur…"
+
+#: main.py:1347
+msgid "Sync entire artist"
+msgstr "Synchroniser tout l'artiste"
+
+#: main.py:1357 templates/index.html:2988
+msgid "Add & keep browsing"
+msgstr "Ajouter et continuer à parcourir"
+
+#: main.py:1358
+msgid "Add & send now"
+msgstr "Ajouter et envoyer maintenant"
+
+#: main.py:1360
+#, python-brace-format
+msgid "Add & send now ({n} item)"
+msgstr "Ajouter et envoyer maintenant ({n} élément)"
+
+#: main.py:1361
+#, python-brace-format
+msgid "Add & send now ({n} items)"
+msgstr "Ajouter et envoyer maintenant ({n} éléments)"
+
+#: main.py:1363
+msgid "Creating…"
+msgstr "Création…"
+
+#: main.py:1368
+msgid "Create device"
+msgstr "Créer l'appareil"
+
+#: main.py:1369
+msgid "+ Add device"
+msgstr "+ Ajouter un appareil"
+
+#: main.py:1370
+msgid "Generate pairing code"
+msgstr "Générer un code de jumelage"
+
+#: main.py:1371
+msgid ""
+"Scan the QR code shown next in the Trobar app, or type the code in by "
+"hand."
+msgstr ""
+"Scannez le QR code qui va s'afficher dans l'application Trobar, ou "
+"saisissez le code manuellement."
+
+#: main.py:1372
+msgid ""
+"Garmin can't scan a QR code — open Garmin Connect Mobile's settings for "
+"this app and enter the code shown next."
+msgstr ""
+"Garmin ne peut pas scanner de QR code — ouvrez les paramètres de cette "
+"application dans Garmin Connect Mobile et saisissez le code qui va "
+"s'afficher."
+
+#: main.py:1373
+msgid "+ Local account"
+msgstr "+ Compte local"
+
+#: main.py:1374
+msgid "+ Delegate"
+msgstr "+ Déléguer"
+
+#: main.py:1375
+#, python-brace-format
+msgid "{used} GB used"
+msgstr "{used} Go utilisés"
+
+#: main.py:1376
+#, python-brace-format
+msgid "{used} / {max} GB"
+msgstr "{used} / {max} Go"
+
+#: main.py:1377
+msgid " — over limit"
+msgstr " — limite dépassée"
+
+#: main.py:1378
+#, python-brace-format
+msgid "Actual free space on device: {free} GB"
+msgstr "Espace libre réel sur l'appareil : {free} Go"
+
+#: main.py:1379
+msgid " — the configured limit exceeds physical capacity!"
+msgstr " — la limite configurée dépasse la capacité physique !"
+
+#: main.py:1380
+#, python-brace-format
+msgid "{used} / {total} GB"
+msgstr "{used} / {total} Go"
+
+#: main.py:1381
+msgid "never"
+msgstr "jamais"
+
+#: main.py:1382
+msgid "just now"
+msgstr "à l'instant"
+
+#: main.py:1383
+#, python-brace-format
+msgid "{n} minute ago"
+msgstr "il y a {n} minute"
+
+#: main.py:1383
+#, python-brace-format
+msgid "{n} minutes ago"
+msgstr "il y a {n} minutes"
+
+#: main.py:1384
+#, python-brace-format
+msgid "{n} hour ago"
+msgstr "il y a {n} heure"
+
+#: main.py:1384
+#, python-brace-format
+msgid "{n} hours ago"
+msgstr "il y a {n} heures"
+
+#: main.py:1385
+msgid "yesterday"
+msgstr "hier"
+
+#: main.py:1386
+#, python-brace-format
+msgid "{n} day ago"
+msgstr "il y a {n} jour"
+
+#: main.py:1386
+#, python-brace-format
+msgid "{n} days ago"
+msgstr "il y a {n} jours"
+
+#: main.py:1387
+#, python-brace-format
+msgid "{n} week ago"
+msgstr "il y a {n} semaine"
+
+#: main.py:1387
+#, python-brace-format
+msgid "{n} weeks ago"
+msgstr "il y a {n} semaines"
+
+#: main.py:1388
+#, python-brace-format
+msgid "{n} month ago"
+msgstr "il y a {n} mois"
+
+#: main.py:1388
+#, python-brace-format
+msgid "{n} months ago"
+msgstr "il y a {n} mois"
+
+#: main.py:1389
+#, python-brace-format
+msgid "{n} year ago"
+msgstr "il y a {n} an"
+
+#: main.py:1389
+#, python-brace-format
+msgid "{n} years ago"
+msgstr "il y a {n} ans"
+
+#: main.py:1390
+#, python-brace-format
+msgid ""
+"Last scan: {added} added, {updated} updated, {removed} removed "
+"({unchanged} unchanged)."
+msgstr ""
+"Dernier scan : {added} ajoutés, {updated} modifiés, {removed} supprimés "
+"({unchanged} inchangés)."
+
+#: main.py:1391
+#, python-brace-format
+msgid ""
+"Permanently delete the account \"{username}\"? Fails if this account "
+"still owns devices, selections, or playlists — delete or reassign those "
+"first."
+msgstr ""
+"Supprimer définitivement le compte \"{username}\" ? Échoue si ce compte "
+"possède encore des appareils, des sélections ou des playlists — "
+"supprimez-les ou réattribuez-les d'abord."
+
+#: main.py:1392 templates/index.html:2769
+msgid "Reset password"
+msgstr "Réinitialiser le mot de passe"
+
+#: main.py:1393
+#, python-brace-format
+msgid "Reset password for \"{username}\""
+msgstr "Réinitialiser le mot de passe de « {username} »"
+
+#: main.py:1394 main.py:3894
+#, python-brace-format
+msgid "Failed ({error})"
+msgstr "Échec ({error})"
+
+#: main.py:1395
+#, python-brace-format
+msgid "{grantee} will no longer be able to manage {target}'s devices. Continue?"
+msgstr "{grantee} ne pourra plus gérer les appareils de {target}. Continuer ?"
+
+#: main.py:1396
+#, python-brace-format
+msgid ""
+"Remove \"{name}\" from your list? You will no longer manage it until you "
+"add it again."
+msgstr ""
+"Retirer \"{name}\" de votre liste ? Vous ne le gérerez plus tant que vous"
+" ne l'aurez pas ajouté à nouveau."
+
+#: main.py:1397
+#, python-brace-format
+msgid ""
+"Regenerate the token for \"{name}\"? The old token will stop working "
+"immediately — the already-paired device will need to rescan the new QR "
+"code."
+msgstr ""
+"Régénérer le token de \"{name}\" ? L'ancien token cessera de fonctionner "
+"immédiatement — l'appareil déjà pairé devra rescanner le nouveau QR code."
+
+#: main.py:1398
+#, python-brace-format
+msgid ""
+"Permanently delete \"{name}\"? Its assigned selections will be unassigned"
+" (not deleted) and its token will stop working immediately."
+msgstr ""
+"Supprimer définitivement \"{name}\" ? Ses sélections assignées seront "
+"détachées (pas supprimées) et son token cessera de fonctionner "
+"immédiatement."
+
+#: main.py:1399
+#, python-brace-format
+msgid ""
+"Change the format for \"{name}\"? Every synced track gets a new file "
+"name, so the next sync re-downloads everything and removes the old files."
+msgstr ""
+"Changer le format pour \"{name}\" ? Chaque morceau synchronisé change de "
+"nom de fichier : la prochaine synchronisation retélécharge tout et "
+"supprime les anciens fichiers."
+
+#: main.py:1400
+msgid "This device replaces…"
+msgstr "Cet appareil remplace…"
+
+#: main.py:1401
+msgid ""
+"Pick the old device this one is taking over from. Its selections and "
+"settings move over, and the old device is deleted. By default its synced "
+"tracks are re-downloaded fresh — check below if this device already has "
+"them."
+msgstr ""
+"Choisissez l'ancien appareil que celui-ci remplace. Ses sélections et ses"
+" réglages sont transférés, et l'ancien appareil est supprimé. Par défaut,"
+" ses morceaux synchronisés sont retéléchargés ; cochez la case ci-dessous"
+" si cet appareil les a déjà."
+
+#: main.py:1402
+msgid "Transfer"
+msgstr "Transférer"
+
+#: main.py:1403
+msgid "This device already has these files (e.g. a cloned card)"
+msgstr "Cet appareil a déjà ces fichiers (par exemple une carte clonée)"
+
+#: main.py:1404
+msgid ""
+"Different device type — the inherited storage limit and auto-fit settings"
+" may not make sense here."
+msgstr ""
+"Type d'appareil différent — la limite de stockage et les réglages d'auto-"
+"remplissage hérités peuvent ne pas convenir ici."
+
+#: main.py:1405
+#, python-brace-format
+msgid ""
+"\"{new}\" will take over everything \"{old}\" currently syncs (tracks, "
+"selections, and settings), and \"{old}\" will be permanently deleted. "
+"Continue?"
+msgstr ""
+"\"{new}\" reprendra tout ce que \"{old}\" synchronise actuellement "
+"(morceaux, sélections et réglages), et \"{old}\" sera définitivement "
+"supprimé. Continuer ?"
+
+#: main.py:1406
+#, python-brace-format
+msgid "Created {created} — last used {used}"
+msgstr "Créé {created} — utilisé pour la dernière fois {used}"
+
+#: main.py:1407
+#, python-brace-format
+msgid ""
+"Revoke \"{name}\"? Anything using this token will stop working "
+"immediately."
+msgstr ""
+"Révoquer « {name} » ? Tout ce qui utilise ce token cessera de fonctionner"
+" immédiatement."
+
+#: main.py:1408
+#, python-brace-format
+msgid "Save failed ({error}) — check the host/port."
+msgstr "Échec de l'enregistrement ({error}) — vérifiez l'hôte/port."
+
+#: main.py:1409
+#, python-brace-format
+msgid "Save failed ({error}) — try again."
+msgstr "Échec de l'enregistrement ({error}) — réessayez."
+
+#: main.py:1410
+#, python-brace-format
+msgid "Refresh after scan failed ({error}) — reload the page."
+msgstr "Échec du rafraîchissement après le scan ({error}) — rechargez la page."
+
+#: main.py:1411
+#, python-brace-format
+msgid "Creation failed ({error}) — try again."
+msgstr "Échec de la création ({error}) — réessayez."
+
+#: main.py:1412
+#, python-brace-format
+msgid "Added {time}"
+msgstr "Ajouté {time}"
+
+#: main.py:1413
+msgid "Recently played"
+msgstr "Écouté récemment"
+
+#: main.py:1414
+#, python-brace-format
+msgid "{n} play"
+msgstr "{n} écoute"
+
+#: main.py:1414
+#, python-brace-format
+msgid "{n} plays"
+msgstr "{n} écoutes"
+
+#: main.py:1415
+msgid "no device"
+msgstr "aucun appareil"
+
+#: main.py:1416
+#, python-brace-format
+msgid "Playlist #{id}"
+msgstr "Playlist #{id}"
+
+#: main.py:1417
+#, python-brace-format
+msgid "{albums} albums · {gb} GB of most-played"
+msgstr "{albums} albums · {gb} Go des plus écoutés"
+
+#: main.py:1418
+msgid "Set up Last.fm on the owner's profile to rank most-played"
+msgstr ""
+"Configurez Last.fm sur le profil du propriétaire pour classer les plus "
+"écoutés"
+
+#: main.py:1419
+msgid "Manual selections already fill the storage limit"
+msgstr "Les sélections manuelles remplissent déjà la limite de stockage"
+
+#: main.py:1420
+msgid "No matching albums found in the library yet"
+msgstr "Aucun album correspondant dans la bibliothèque pour l'instant"
+
+#: main.py:1421
+#, python-brace-format
+msgid "≈ {gb} GB · ≈ {tracks} tracks (estimate)"
+msgstr "≈ {gb} Go · ≈ {tracks} pistes (estimation)"
+
+#: main.py:1422
+#, python-brace-format
+msgid "Fill percentage for {name}"
+msgstr "Pourcentage de remplissage pour {name}"
+
+#: main.py:1423
+msgid "Playlist tracks with no local match"
+msgstr "Pistes de playlist sans correspondance locale"
+
+#: main.py:1424
+msgid "Tracks tagged Unknown Artist/Album"
+msgstr "Pistes marquées Artiste/Album inconnu"
+
+#: main.py:1425
+msgid "Possible duplicate tracks"
+msgstr "Doublons possibles"
+
+#: main.py:1432
+msgid "Tracks the fingerprint pass gave up on"
+msgstr "Pistes que l'empreinte acoustique a abandonnées"
+
+#: main.py:1433
+msgid "Not found in AcoustID/MusicBrainz"
+msgstr "Introuvables sur AcoustID/MusicBrainz"
+
+#: main.py:1435
+msgid ""
+"Fingerprinted successfully, but no match in either database — often just "
+"means the recording isn't indexed there (live recordings, bootlegs, self-"
+"released or local music, much classical). Not necessarily a problem."
+msgstr ""
+"Empreinte calculée avec succès, mais aucune correspondance dans ces bases"
+" — signifie souvent simplement que l'enregistrement n'y est pas indexé "
+"(concerts, enregistrements pirates, autoproductions, musique locale, "
+"beaucoup de musique classique). Pas forcément un problème."
+
+#: main.py:1443
+#, python-brace-format
+msgid ""
+"DATA_DIR is on a network filesystem ({type}). SQLite needs working file "
+"locking, which network shares don't reliably provide — this can corrupt "
+"your database and lose your selections, device pairings and playlists. "
+"Move DATA_DIR to local disk; a network-mounted music library is fine, "
+"Trobar only reads it."
+msgstr ""
+"DATA_DIR se trouve sur un système de fichiers réseau ({type}). SQLite a "
+"besoin d'un verrouillage de fichiers fiable, que les partages réseau ne "
+"garantissent pas — cela peut corrompre votre base de données et faire "
+"perdre vos sélections, appairages d'appareils et playlists. Déplacez "
+"DATA_DIR sur un disque local ; une bibliothèque musicale sur le réseau ne"
+" pose aucun problème, Trobar ne fait que la lire."
+
+#: main.py:1448
+#, python-brace-format
+msgid "Library last scanned {time}"
+msgstr "Bibliothèque analysée pour la dernière fois {time}"
+
+#: main.py:1452
+#, python-brace-format
+msgid ""
+"This instance has been reached directly by {count} different addresses in"
+" the last week while TROBAR_TRUSTED_PROXY is left at its default (\"*\")."
+" If this container's port is only reachable through your reverse proxy, "
+"this just means the proxy's own address changed — otherwise, the per-IP "
+"brute-force rate limiter may not be protecting what you think it is, "
+"since anyone who can reach this port can claim to be any address. See "
+"Networking & Reverse Proxy in the docs."
+msgstr ""
+"Cette instance a été atteinte directement par {count} adresses "
+"différentes au cours de la dernière semaine, alors que "
+"TROBAR_TRUSTED_PROXY est laissé à sa valeur par défaut (« * »). Si ce "
+"port du conteneur n'est accessible que via votre proxy inverse, cela "
+"signifie simplement que l'adresse du proxy a changé — sinon, la "
+"limitation anti-brute-force par IP pourrait ne pas protéger ce que vous "
+"croyez, puisque quiconque peut atteindre ce port peut prétendre être "
+"n'importe quelle adresse. Voir Réseau et proxy inverse dans la "
+"documentation."
+
+#: main.py:1464
+#, python-brace-format
+msgid "{n} distinct address has reached this instance directly in the last week"
+msgstr ""
+"{n} adresse distincte a atteint cette instance directement au cours de la"
+" dernière semaine"
+
+#: main.py:1465
+#, python-brace-format
+msgid ""
+"{n} distinct addresses have reached this instance directly in the last "
+"week"
+msgstr ""
+"{n} adresses distinctes ont atteint cette instance directement au cours "
+"de la dernière semaine"
+
+#: main.py:1470
+#, python-brace-format
+msgid "Next scheduled scan: {when}"
+msgstr "Prochaine analyse planifiée : {when}"
+
+#: main.py:1471
+msgid "Show license"
+msgstr "Afficher la licence"
+
+#: main.py:1472
+msgid "Hide license"
+msgstr "Masquer la licence"
+
+#: main.py:1473
+msgid "Show third-party notices"
+msgstr "Afficher les mentions tierces"
+
+#: main.py:1474
+msgid "Hide third-party notices"
+msgstr "Masquer les mentions tierces"
+
+#: main.py:1476
+#, python-brace-format
+msgid "Update available: {tag} — see the releases page."
+msgstr "Mise à jour disponible : {tag} — voir la page des versions."
+
+#: main.py:1477
+#, python-brace-format
+msgid "You are running the latest release ({tag})."
+msgstr "Vous utilisez la dernière version ({tag})."
+
+#: main.py:1478
+#, python-brace-format
+msgid "Could not reach GitHub ({error}) — try again later."
+msgstr "Impossible de joindre GitHub ({error}) — réessayez plus tard."
+
+#: main.py:1479
+#, python-brace-format
+msgid "Could not load the text ({error})."
+msgstr "Impossible de charger le texte ({error})."
+
+#: main.py:1488
+#, python-brace-format
+msgid "Correct — {winner} has {winner_count} albums, {loser} has {loser_count} albums."
+msgstr "Correct — {winner} a {winner_count} albums, {loser} en a {loser_count}."
+
+#: main.py:1489
+#, python-brace-format
+msgid "Not quite — {winner} actually has {winner_count} albums, {loser} has {loser_count} albums."
+msgstr "Pas tout à fait — {winner} a en réalité {winner_count} albums, {loser} en a {loser_count}."
+
+#: templates/index.html:3159
+msgid "Duel the bard"
+msgstr "Défier le barde"
+
+#: templates/index.html:3160
+msgid "Which artist has more albums in your library?"
+msgstr "Quel artiste a le plus d'albums dans votre bibliothèque ?"
+
+#: templates/index.html:3165
+msgid "Not enough of a library yet for this — sync more music and try again."
+msgstr "Votre bibliothèque n'est pas encore assez grande pour cela — synchronisez plus de musique et réessayez."
+
+#: templates/index.html:3194
+msgid "Play again"
+msgstr "Rejouer"
+
+#: main.py:1707 main.py:2460
+msgid "A library scan is already running."
+msgstr "Un scan de la bibliothèque est déjà en cours."
+
+#: main.py:1749
+msgid "A playlist sync is already running."
+msgstr "Une synchronisation des playlists est déjà en cours."
+
+#: main.py:1913 main.py:1945
+msgid "Playlist not found"
+msgstr "Playlist introuvable"
+
+#: main.py:1915
+msgid "This playlist has no owner to change sharing for."
+msgstr "Cette playlist n'a pas de propriétaire dont modifier le partage."
+
+#: main.py:1917 main.py:1950
+msgid "Unauthorized access to this playlist"
+msgstr "Accès non autorisé à cette playlist"
+
+#: main.py:1920 main.py:2012 main.py:2092
+msgid "Nothing to update."
+msgstr "Rien à mettre à jour."
+
+#: main.py:1984
+msgid "ids must be a list of unresolved-track row ids."
+msgstr "ids doit être une liste d'identifiants de lignes non résolues."
+
+#: main.py:2016
+msgid "Unknown mirror sink."
+msgstr "Destination de reflet inconnue."
+
+#: main.py:2165 main.py:2482
+msgid "Name cannot be empty."
+msgstr "Le nom ne peut pas être vide."
+
+#: main.py:2184
+msgid "Storage limit must be a whole number of bytes, or empty for no limit."
+msgstr ""
+"La limite de stockage doit être un nombre entier d'octets, ou vide pour "
+"aucune limite."
+
+#: main.py:2193
+msgid "Fill percentage must be a whole number between 1 and 100."
+msgstr "Le pourcentage de remplissage doit être un nombre entier entre 1 et 100."
+
+#: main.py:2201
+msgid "Unsupported transcode format."
+msgstr "Format de transcodage non pris en charge."
+
+#: main.py:2208
+msgid "Unsupported artist image setting."
+msgstr "Réglage d'images d'artistes non pris en charge."
+
+#: main.py:2214
+msgid "source_of_truth must be 'server' or 'device'."
+msgstr "source_of_truth doit être « server » ou « device »."
+
+#: main.py:2497
+msgid "Integration token not found."
+msgstr "Token d'intégration introuvable."
+
+#: main.py:2526 main.py:5385 main.py:5429
+msgid "Too many attempts. Please wait a few minutes."
+msgstr "Trop de tentatives. Patientez quelques minutes."
+
+#: main.py:2539
+msgid "Invalid or expired enrollment code."
+msgstr "Code d'inscription invalide ou expiré."
+
+#: main.py:2698
+msgid "A device can't replace itself."
+msgstr "Un appareil ne peut pas se remplacer lui-même."
+
+#: main.py:2702
+msgid "Transferring between different owners requires admin."
+msgstr ""
+"Le transfert entre propriétaires différents nécessite un compte "
+"administrateur."
+
+#: main.py:2740
+msgid "paths must be a list of device paths."
+msgstr "paths doit être une liste de chemins d'appareil."
+
+#: main.py:2927 main.py:3065
+msgid "Unsupported selection type."
+msgstr "Type de sélection non pris en charge."
+
+#: main.py:3070 main.py:3146
+msgid "Choose at least one device."
+msgstr "Choisissez au moins un appareil."
+
+#: main.py:3423
+msgid "Tidal isn't configured yet — ask an admin to set it up in Administration."
+msgstr ""
+"Tidal n'est pas encore configuré — demandez à un administrateur de le "
+"configurer dans Administration."
+
+#: main.py:3532 main.py:3596
+msgid "Spotify is an experimental feature and isn't enabled on this server."
+msgstr ""
+"Spotify est une fonctionnalité expérimentale et n'est pas activée sur ce "
+"serveur."
+
+#: main.py:3535
+msgid ""
+"Spotify isn't configured yet — ask an admin to set it up in "
+"Administration."
+msgstr ""
+"Spotify n'est pas encore configuré — demandez à un administrateur de le "
+"configurer dans Administration."
+
+#: main.py:3630
+msgid "No file received."
+msgstr "Aucun fichier reçu."
+
+#: main.py:3633
+msgid "Unsupported format (JPEG, PNG, or WebP only)."
+msgstr "Format non supporté (JPEG, PNG ou WebP seulement)."
+
+#: main.py:3636
+msgid "Image too large (2 MB max)."
+msgstr "Image trop grande (2 Mo max)."
+
+#: main.py:3901
+msgid "Continue"
+msgstr "Continuer"
+
+#: main.py:3902
+msgid "Testing…"
+msgstr "Test en cours…"
+
+#: main.py:3903
+msgid "Test connection"
+msgstr "Tester la connexion"
+
+#: main.py:3904
+msgid "Finishing…"
+msgstr "Finalisation…"
+
+#: main.py:3905
+msgid "Finish setup"
+msgstr "Terminer la configuration"
+
+#: main.py:3942
+msgid "This folder doesn't exist or isn't readable by the server."
+msgstr "Ce dossier n'existe pas ou n'est pas lisible par le serveur."
+
+#: main.py:3984
+#, python-format
+msgid ""
+"Can't read the music folder %(path)s — check the path and the container's"
+" volume mount, then try again."
+msgstr ""
+"Impossible de lire le dossier de musique %(path)s — vérifiez le chemin et"
+" le montage de volume du conteneur, puis réessayez."
+
+#: main.py:4258
+msgid "Concurrency must be a whole number of 1 or more."
+msgstr "La concurrence doit être un nombre entier supérieur ou égal à 1."
+
+#: main.py:4266
+msgid "Nice level must be a whole number."
+msgstr "Le niveau nice doit être un nombre entier."
+
+#: main.py:4268
+msgid "Nice level must be between 0 and 19."
+msgstr "Le niveau nice doit être compris entre 0 et 19."
+
+#: main.py:4278
+msgid "Retention must be a whole number of days."
+msgstr "La rétention doit être un nombre entier de jours."
+
+#: main.py:4280
+msgid "Retention must be between 1 and 3650 days."
+msgstr "La rétention doit être comprise entre 1 et 3650 jours."
+
+#: main.py:4291
+msgid "Scan interval must be a whole number of hours."
+msgstr "L'intervalle d'analyse doit être un nombre entier d'heures."
+
+#: main.py:4293
+msgid "Scan interval must be between 0 (off) and 8760 hours."
+msgstr ""
+"L'intervalle d'analyse doit être compris entre 0 (désactivé) et 8760 "
+"heures."
+
+#: main.py:4328
+msgid ""
+"The mirror folder can't be inside your music library (MUSIC_ROOT) — "
+"choose a separate folder."
+msgstr ""
+"Le dossier de reflet ne peut pas se trouver dans votre bibliothèque "
+"musicale (MUSIC_ROOT) — choisissez un dossier distinct."
+
+#: main.py:4440
+msgid "Invalid Lidarr profile selection."
+msgstr "Sélection de profil Lidarr invalide."
+
+#: main.py:4603
+msgid "Unknown provider."
+msgstr "Fournisseur inconnu."
+
+#: main.py:4607
+msgid "All fields are required to test the connection."
+msgstr "Tous les champs sont requis pour tester la connexion."
+
+#: main.py:4860 main.py:4910
+msgid "No such job."
+msgstr "Tâche introuvable."
+
+#: main.py:4862
+msgid "Only a failed job can be retried."
+msgstr "Seule une tâche en échec peut être relancée."
+
+#: main.py:4882
+msgid "This job is already queued to run again."
+msgstr "Cette tâche est déjà en attente d'une nouvelle exécution."
+
+#: main.py:4913
+msgid ""
+"This job has already started and can't be cancelled — wait for it to "
+"finish."
+msgstr ""
+"Cette tâche a déjà démarré et ne peut pas être annulée — attendez qu'elle"
+" se termine."
+
+#: main.py:4937
+msgid ""
+"Local passwords are admin-only while AUTH_MODE=oidc — your account is "
+"managed by the identity provider."
+msgstr ""
+"Les mots de passe locaux sont réservés aux administrateurs tant que "
+"AUTH_MODE=oidc — votre compte est géré par le fournisseur d'identité."
+
+#: main.py:4942 main.py:5093
+msgid "Password must be at least 8 characters"
+msgstr "Le mot de passe doit faire au moins 8 caractères"
+
+#: main.py:4970
+msgid ""
+"New local accounts can't be created while AUTH_MODE=oidc — accounts are "
+"provisioned automatically from the identity provider."
+msgstr ""
+"Impossible de créer de nouveaux comptes locaux tant que AUTH_MODE=oidc — "
+"les comptes sont provisionnés automatiquement depuis le fournisseur "
+"d'identité."
+
+#: main.py:4976
+msgid "Username required, password at least 8 characters"
+msgstr "Nom d'utilisateur requis, mot de passe d'au moins 8 caractères"
+
+#: main.py:4984
+msgid "This username already exists"
+msgstr "Ce nom d'utilisateur existe déjà"
+
+#: main.py:5014
+msgid "Cannot delete your own account"
+msgstr "Impossible de supprimer son propre compte"
+
+#: main.py:5020 main.py:5085 main.py:5099 main.py:5299
+msgid "User not found"
+msgstr "Utilisateur introuvable"
+
+#: main.py:5028
+msgid "Cannot delete the last admin account"
+msgstr "Impossible de supprimer le dernier compte administrateur"
+
+#: main.py:5039
+msgid ""
+"This is the only account with a local password — deleting it would lock "
+"everyone out if the identity provider ever becomes unreachable. Give "
+"another admin a local password first if you still want to remove this "
+"one."
+msgstr ""
+"C'est le seul compte disposant d'un mot de passe local — le supprimer "
+"bloquerait tout le monde si le fournisseur d'identité devenait "
+"injoignable. Donnez d'abord un mot de passe local à un autre "
+"administrateur si vous voulez quand même le supprimer."
+
+#: main.py:5061
+msgid ""
+"This account still owns devices, selections or playlists. Delete those "
+"first — ownership can't be transferred from here."
+msgstr ""
+"Ce compte possède encore des appareils, des sélections ou des playlists. "
+"Supprimez-les d'abord — la propriété ne peut pas être transférée ici."
+
+#: main.py:5088
+msgid ""
+"Local passwords are admin-only while AUTH_MODE=oidc — this account is "
+"managed by the identity provider."
+msgstr ""
+"Les mots de passe locaux sont réservés aux administrateurs tant que "
+"AUTH_MODE=oidc — ce compte est géré par le fournisseur d'identité."
+
+#: main.py:5296
+msgid "A user cannot delegate to themselves"
+msgstr "Un utilisateur ne peut pas se déléguer lui-même"
+
+#: main.py:5307
+msgid "This delegation already exists"
+msgstr "Cette délégation existe déjà"
+
+#: main.py:5378 main.py:5426
+msgid "Missing authentication header"
+msgstr "En-tête d'authentification manquant"
+
+#: main.py:5389
+msgid "Invalid or revoked token — re-pair the device"
+msgstr "Token invalide ou révoqué — réassociez l'appareil"
+
+#: main.py:5433
+msgid "Invalid or revoked integration token."
+msgstr "Token d'intégration invalide ou révoqué."
+
+#: main.py:5542
+msgid "paths must be a list of relative paths."
+msgstr "paths doit être une liste de chemins relatifs."
+
+#: main.py:5644
+msgid "after, limit, and computed_after must be whole numbers."
+msgstr "after, limit et computed_after doivent être des nombres entiers."
+
+#: main.py:5646
+msgid "after must be 0 or more and limit at least 1."
+msgstr "after doit être supérieur ou égal à 0 et limit au moins 1."
+
+#: main.py:5708
+msgid "entries must be a list."
+msgstr "entries doit être une liste."
+
+#: main.py:5711
+msgid "Too many entries in one request — push them in smaller pages."
+msgstr ""
+"Trop d'entrées dans une seule requête — envoyez-les par pages plus "
+"petites."
+
+#: main.py:5721
+msgid "Each entry needs a non-empty path and fingerprint."
+msgstr "Chaque entrée doit avoir un path et une fingerprint non vides."
+
+#: main.py:5723
+msgid "track_id must be a whole number when given."
+msgstr "track_id doit être un nombre entier lorsqu'il est fourni."
+
+#: main.py:5766 main.py:5771
+msgid "Track not found (removed from the library?)"
+msgstr "Morceau introuvable (supprimé de la bibliothèque ?)"
+
+#: main.py:5774
+msgid "File not found on the server"
+msgstr "Fichier introuvable sur le serveur"
+
+#: main.py:5781
+msgid "Transcoding is unavailable on the server right now"
+msgstr "Le transcodage n'est pas disponible sur le serveur pour le moment"
+
+#: main.py:5789
+msgid "Transcoding failed to start"
+msgstr "Échec du démarrage du transcodage"
+
+#: main.py:5817
+msgid "No artist image available"
+msgstr "Aucune image d'artiste disponible"
+
+#: templates/index.html:66
+msgid "Home"
+msgstr "Accueil"
+
+#: templates/index.html:118 templates/index.html:136
+msgid "Basket"
+msgstr "Panier"
+
+#: templates/index.html:143
+msgid "Send"
+msgstr "Envoyer"
+
+#: templates/index.html:173
+msgid "Remove"
+msgstr "Retirer"
+
+#: templates/index.html:180
+msgid "Basket is empty."
+msgstr "Le panier est vide."
+
+#: templates/index.html:187
+msgid "Clear"
+msgstr "Vider"
+
+#: templates/index.html:192 templates/index.html:203
+msgid "Profile"
+msgstr "Profil"
+
+#: templates/index.html:207
+msgid "About"
+msgstr "À propos"
+
+#: templates/index.html:209
+msgid "Log out"
+msgstr "Déconnexion"
+
+#: templates/index.html:237
+msgid "Your dashboard is empty — every widget is turned off."
+msgstr "Votre tableau de bord est vide — tous les widgets sont désactivés."
+
+#: templates/index.html:239
+msgid "Choose widgets"
+msgstr "Choisir les widgets"
+
+#: templates/index.html:262
+msgid "artists"
+msgstr "artistes"
+
+#: templates/index.html:263
+msgid "albums"
+msgstr "albums"
+
+#: templates/index.html:275
+msgid "By format"
+msgstr "Par format"
+
+#: templates/index.html:288
+msgid "By decade"
+msgstr "Par décennie"
+
+#: templates/index.html:295
+msgid "View library"
+msgstr "Voir la bibliothèque"
+
+#: templates/index.html:306 templates/index.html:539
+msgid "Manage"
+msgstr "Gérer"
+
+#: templates/index.html:336
+msgid "No devices yet."
+msgstr "Aucun appareil pour l'instant."
+
+#: templates/index.html:360
+msgid "View all"
+msgstr "Voir tout"
+
+#: templates/index.html:364 templates/index.html:516 templates/index.html:2931
+msgid ""
+"Set your Last.fm or ListenBrainz username in the \"Profile\" tab to also "
+"see your most-played tracks and albums."
+msgstr ""
+"Renseignez votre pseudo Last.fm ou ListenBrainz dans l'onglet \"Profil\" "
+"pour aussi voir vos écoutes et albums les plus joués."
+
+#: templates/index.html:399
+msgid "No suggestions yet."
+msgstr "Aucune suggestion pour l'instant."
+
+#: templates/index.html:426 templates/index.html:481
+msgid "within"
+msgstr "depuis"
+
+#: templates/index.html:429 templates/index.html:484
+msgid "Number of months to include"
+msgstr "Nombre de mois à inclure"
+
+#: templates/index.html:431 templates/index.html:486
+msgid "months"
+msgstr "mois"
+
+#: templates/index.html:455
+msgid "Nothing recently added."
+msgstr "Rien d'ajouté récemment."
+
+#: templates/index.html:505
+msgid "Nothing recently released."
+msgstr "Rien de sorti récemment."
+
+#: templates/index.html:527
+msgid "Nothing played yet."
+msgstr "Rien d'écouté pour l'instant."
+
+#: templates/index.html:543
+msgid "users"
+msgstr "utilisateurs"
+
+#: templates/index.html:544
+msgid "active delegations"
+msgstr "délégations actives"
+
+#: templates/index.html:587 templates/index.html:635 templates/index.html:974
+msgid "Artists"
+msgstr "Artistes"
+
+#: templates/index.html:598
+msgid ""
+"Re-read every file (slow) — needed to pick up changed tags, e.g. reissue "
+"year"
+msgstr ""
+"Relire chaque fichier (lent) — nécessaire pour prendre en compte les tags"
+" modifiés, p. ex. l'année de réédition"
+
+#: templates/index.html:600
+msgid "Full rescan"
+msgstr "Rescan complet"
+
+#: templates/index.html:604
+msgid "Search for an artist…"
+msgstr "Rechercher un artiste…"
+
+#: templates/index.html:622
+msgid "No results."
+msgstr "Aucun résultat."
+
+#: templates/index.html:630
+msgid "Choose an artist on the left."
+msgstr "Choisissez un artiste à gauche."
+
+#: templates/index.html:648
+msgid "Similar artists in your library"
+msgstr "Artistes similaires dans votre bibliothèque"
+
+#: templates/index.html:739
+msgid "Hide playlists with no local tracks"
+msgstr "Masquer les playlists sans piste locale"
+
+#: templates/index.html:931 templates/index.html:1496 templates/index.html:1532
+#: templates/index.html:3070 templates/index.html:3090
+#: templates/index.html:3106
+msgid "Close"
+msgstr "Fermer"
+
+#: templates/index.html:937 templates/index.html:1538
+msgid "Nothing to review."
+msgstr "Rien à examiner."
+
+#: templates/index.html:961
+msgid "No synced playlists yet — click \"Refresh playlists\"."
+msgstr "Aucune playlist synchronisée — cliquez sur \"Rafraîchir les playlists\"."
+
+#: templates/index.html:971
+msgid "Albums"
+msgstr "Albums"
+
+#: templates/index.html:986
+msgid "Album"
+msgstr "Album"
+
+#: templates/index.html:1030
+msgid "No albums selected yet."
+msgstr "Aucun album sélectionné pour l'instant."
+
+#: templates/index.html:1033 templates/index.html:1084
+#: templates/index.html:1127
+msgid "Create a device in the \"Profile\" tab to be able to check boxes here."
+msgstr ""
+"Créez un appareil dans l'onglet \"Profil\" pour pouvoir cocher des cases "
+"ici."
+
+#: templates/index.html:1043
+msgid "Artist"
+msgstr "Artiste"
+
+#: templates/index.html:1081
+msgid "No artists selected yet."
+msgstr "Aucun artiste sélectionné pour l'instant."
+
+#: templates/index.html:1094
+msgid "Playlist"
+msgstr "Playlist"
+
+#: templates/index.html:1124
+msgid "No playlists selected yet."
+msgstr "Aucune playlist sélectionnée pour l'instant."
+
+#: templates/index.html:1138
+msgid "Preferences"
+msgstr "Préférences"
+
+#: templates/index.html:1141
+msgid "Accounts"
+msgstr "Comptes"
+
+#: templates/index.html:1147
+msgid "Integrations"
+msgstr "Intégrations"
+
+#: templates/index.html:1155
+msgid "Signed in as"
+msgstr "Connecté en tant que"
+
+#: templates/index.html:1160
+msgid "Profile picture"
+msgstr "Photo de profil"
+
+#: templates/index.html:1175 templates/index.html:1487
+#: templates/index.html:2772
+msgid "Delete"
+msgstr "Supprimer"
+
+#: templates/index.html:1180
+msgid ""
+"Without an image uploaded here, your Authentik photo (Gravatar) is used "
+"by default."
+msgstr ""
+"Sans image envoyée ici, votre photo Authentik (Gravatar) est utilisée par"
+" défaut."
+
+#: templates/index.html:1186
+msgid "Appearance"
+msgstr "Apparence"
+
+#: templates/index.html:1197
+msgid "\"System\" follows your browser or device's light/dark theme."
+msgstr "\"Système\" suit le thème clair/sombre de votre navigateur ou appareil."
+
+#: templates/index.html:1201
+msgid "Show reissue year on albums"
+msgstr "Afficher l'année de réédition sur les albums"
+
+#: templates/index.html:1206
+msgid "Language"
+msgstr "Langue"
+
+#: templates/index.html:1216
+msgid "Home dashboard widgets"
+msgstr "Widgets du tableau de bord"
+
+#: templates/index.html:1217
+msgid ""
+"Choose which cards show on your Home tab. This follows you across "
+"devices/browsers."
+msgstr ""
+"Choisissez les cartes affichées sur votre onglet Accueil. Ce choix vous "
+"suit d'un appareil/navigateur à l'autre."
+
+#: templates/index.html:1252
+msgid "Album covers shown"
+msgstr "Pochettes d'album affichées"
+
+#: templates/index.html:1260 templates/index.html:1288
+#: templates/index.html:1368 templates/index.html:2374
+#: templates/index.html:2407
+msgid "Saved"
+msgstr "Enregistré"
+
+#: templates/index.html:1274 templates/index.html:1834
+#: templates/index.html:2082 templates/login.html:60 templates/setup.html:137
+msgid "Password"
+msgstr "Mot de passe"
+
+#: templates/index.html:1277 templates/index.html:2399
+msgid "New password"
+msgstr "Nouveau mot de passe"
+
+#: templates/index.html:1278 templates/index.html:2400
+msgid "8 characters minimum"
+msgstr "8 caractères minimum"
+
+#: templates/index.html:1281
+msgid ""
+"Local break-glass password, usable even if this installation's normal "
+"login is unavailable."
+msgstr ""
+"Mot de passe de secours local, utilisable même si la connexion normale de"
+" cette installation est indisponible."
+
+#: templates/index.html:1295
+msgid "Your account is managed by your organization's identity provider."
+msgstr "Votre compte est géré par le fournisseur d'identité de votre organisation."
+
+#: templates/index.html:1297
+msgid "Manage your account"
+msgstr "Gérer votre compte"
+
+#: templates/index.html:1303
+msgid "Streaming accounts"
+msgstr "Comptes de streaming"
+
+#: templates/index.html:1318
+msgid "Connect Tidal"
+msgstr "Connecter Tidal"
+
+#: templates/index.html:1321
+msgid "Connecting to Tidal failed. Please try again."
+msgstr "La connexion à Tidal a échoué. Veuillez réessayer."
+
+#: templates/index.html:1340
+msgid "Connect Spotify"
+msgstr "Connecter Spotify"
+
+#: templates/index.html:1343
+msgid "Connecting to Spotify failed. Please try again."
+msgstr "La connexion à Spotify a échoué. Veuillez réessayer."
+
+#: templates/index.html:1347
+msgid "Scrobbler accounts"
+msgstr "Comptes de scrobbling"
+
+#: templates/index.html:1350 templates/index.html:1351
+msgid "Last.fm username"
+msgstr "Pseudo Last.fm"
+
+#: templates/index.html:1355 templates/index.html:1356
+msgid "Last.fm API key"
+msgstr "Clé API Last.fm"
+
+#: templates/index.html:1360 templates/index.html:1361
+msgid "ListenBrainz username"
+msgstr "Pseudo ListenBrainz"
+
+#: templates/index.html:1421 templates/index.html:3008
+msgid "Dedicated audio player (DAP)"
+msgstr "Lecteur audio dédié (DAP)"
+
+#: templates/index.html:1427
+msgid ""
+"Lossless files are converted to MP3 for this device — locally by the "
+"desktop app when syncing an SD card, or streamed pre-converted by the "
+"server otherwise"
+msgstr ""
+"Les fichiers lossless sont convertis en MP3 pour cet appareil — "
+"localement par l'application de bureau lors de la synchronisation d'une "
+"carte SD, ou diffusés déjà convertis par le serveur dans les autres cas"
+
+#: templates/index.html:1428
+msgid "Originals (no transcoding)"
+msgstr "Originaux (sans transcodage)"
+
+#: templates/index.html:1435
+msgid "Clients write an artist.jpg into each artist folder on the device"
+msgstr ""
+"Les clients écrivent un artist.jpg dans chaque dossier d'artiste de "
+"l'appareil"
+
+#: templates/index.html:1436
+msgid "No artist pictures"
+msgstr "Pas d'images d'artistes"
+
+#: templates/index.html:1437
+msgid "Artist pictures (small)"
+msgstr "Images d'artistes (petites)"
+
+#: templates/index.html:1438
+msgid "Artist pictures (full size)"
+msgstr "Images d'artistes (taille réelle)"
+
+#: templates/index.html:1446
+msgid "Limit (GB):"
+msgstr "Limite (Go):"
+
+#: templates/index.html:1448
+msgid "none"
+msgstr "aucune"
+
+#: templates/index.html:1449 templates/index.html:3033
+msgid "Storage limit in GB"
+msgstr "Limite de stockage en Go"
+
+#: templates/index.html:1452
+msgid ""
+"When on, the server never deletes tracks from this device (so it survives"
+" a server database loss). The server can still add new content you "
+"select."
+msgstr ""
+"Quand activé, le serveur ne supprime jamais les morceaux de cet appareil "
+"(il survit ainsi à une perte de la base de données du serveur). Le "
+"serveur peut toujours ajouter le nouveau contenu que vous sélectionnez."
+
+#: templates/index.html:1455
+msgid "Keep device content"
+msgstr "Conserver le contenu de l'appareil"
+
+#: templates/index.html:1471
+msgid "Edit"
+msgstr "Modifier"
+
+#: templates/index.html:1474
+msgid "Regenerate + QR"
+msgstr "Régénérer + QR"
+
+#: templates/index.html:1481
+msgid "Replaces…"
+msgstr "Remplace…"
+
+#: templates/index.html:1484
+msgid "Remove from my list"
+msgstr "Retirer de ma liste"
+
+#: templates/index.html:1501
+msgid "Choose a device…"
+msgstr "Choisir un appareil…"
+
+#: templates/index.html:1589
+msgid "Total device storage (all usage combined):"
+msgstr "Stockage total de l'appareil (tous usages confondus) :"
+
+#: templates/index.html:1604
+msgid "Auto-fill with most-played"
+msgstr "Remplissage auto (les plus écoutés)"
+
+#: templates/index.html:1605
+msgid "set a size limit first"
+msgstr "définissez d'abord une limite de taille"
+
+#: templates/index.html:1611
+msgid "Enable"
+msgstr "Activer"
+
+#: templates/index.html:1621
+msgid "Off"
+msgstr "Désactiver"
+
+#: templates/index.html:1634
+msgid "Fill up to"
+msgstr "Remplir jusqu'à"
+
+#: templates/index.html:1664
+msgid "Available delegated devices"
+msgstr "Appareils délégués disponibles"
+
+#: templates/index.html:1674
+msgid "+ Add to my list"
+msgstr "+ Ajouter à ma liste"
+
+#: templates/index.html:1688
+msgid ""
+"A token for external tools to check device/sync status and trigger a "
+"library rescan. See the documentation for what it can do."
+msgstr ""
+"Un token pour que des outils externes vérifient l'état des "
+"appareils/synchronisations et déclenchent un nouveau scan de la "
+"bibliothèque. Consultez la documentation pour savoir ce qu'il peut faire."
+
+#: templates/index.html:1692
+msgid "Name"
+msgstr "Nom"
+
+#: templates/index.html:1694
+msgid "e.g. Home Assistant"
+msgstr "p. ex. Home Assistant"
+
+#: templates/index.html:1699
+msgid "Create token"
+msgstr "Créer le token"
+
+#: templates/index.html:1704
+msgid "No integration tokens yet."
+msgstr "Aucun token d'intégration pour l'instant."
+
+#: templates/index.html:1714 templates/index.html:2813
+msgid "Revoke"
+msgstr "Révoquer"
+
+#: templates/index.html:1728
+msgid "Configuration"
+msgstr "Configuration"
+
+#: templates/index.html:1731 templates/index.html:2416
+msgid "Library health"
+msgstr "Santé"
+
+#: templates/index.html:1734
+msgid "Playlist mirrors"
+msgstr "Reflets de playlists"
+
+#: templates/index.html:1738
+msgid "Background jobs"
+msgstr "Tâches de fond"
+
+#: templates/index.html:1748
+msgid "Users"
+msgstr "Utilisateurs"
+
+#: templates/index.html:1751
+msgid "Delegations"
+msgstr "Délégations"
+
+#: templates/index.html:1760
+msgid ""
+"Your music library is mounted writable. Trobar only ever reads it — mount"
+" it read-only (add ':ro' to the volume in docker-compose) so a bug or "
+"compromise can't modify or delete your files."
+msgstr ""
+"Votre bibliothèque musicale est montée en écriture. Trobar se contente de"
+" la lire — montez-la en lecture seule (ajoutez « :ro » au volume dans "
+"docker-compose) afin qu'un bug ou une compromission ne puisse pas "
+"modifier ou supprimer vos fichiers."
+
+#: templates/index.html:1764
+msgid "Library source"
+msgstr "Source de la bibliothèque"
+
+#: templates/index.html:1777 templates/setup.html:115
+msgid "Roon host"
+msgstr "Hôte Roon"
+
+#: templates/index.html:1782 templates/setup.html:120
+msgid "Port"
+msgstr "Port"
+
+#: templates/index.html:1790
+msgid "Map Trobar users to Roon profiles"
+msgstr "Associer les utilisateurs Trobar aux profils Roon"
+
+#: templates/index.html:1797
+msgid ""
+"Locally-created Roon playlists belong to one profile. Map a Trobar user "
+"to their Roon profile so their own playlists get synced too, alongside "
+"everything else."
+msgstr ""
+"Les playlists créées localement dans Roon appartiennent à un profil. "
+"Associez un utilisateur Trobar à son profil Roon pour que ses propres "
+"playlists soient aussi synchronisées, comme le reste."
+
+#: templates/index.html:1806 templates/index.html:1930
+#: templates/index.html:1962
+msgid "— none —"
+msgstr "— aucun —"
+
+#: templates/index.html:1817
+msgid "Click Refresh to load Roon profiles."
+msgstr "Cliquez sur Actualiser pour charger les profils Roon."
+
+#: templates/index.html:1822 templates/setup.html:127
+msgid "Subsonic URL"
+msgstr "URL Subsonic"
+
+#: templates/index.html:1828 templates/index.html:1864
+#: templates/index.html:1891 templates/index.html:2076
+#: templates/index.html:2128 templates/index.html:2165
+#: templates/index.html:2740 templates/login.html:55 templates/setup.html:132
+#: templates/setup.html:154 templates/setup.html:171
+msgid "Username"
+msgstr "Nom d'utilisateur"
+
+#: templates/index.html:1852 templates/setup.html:144
+msgid "Jellyfin URL"
+msgstr "URL Jellyfin"
+
+#: templates/index.html:1858 templates/index.html:1885
+#: templates/index.html:2122 templates/index.html:2159
+#: templates/index.html:2199 templates/setup.html:149 templates/setup.html:166
+msgid "API key"
+msgstr "Clé API"
+
+#: templates/index.html:1879 templates/setup.html:161
+msgid "Emby URL"
+msgstr "URL Emby"
+
+#: templates/index.html:1914
+msgid "Map Trobar users to Jellyfin accounts"
+msgstr "Associer les utilisateurs Trobar aux comptes Jellyfin"
+
+#: templates/index.html:1921
+msgid ""
+"Map a Trobar user to their own Jellyfin account so their own playlists "
+"(private ones included) get synced too, alongside everything else."
+msgstr ""
+"Associez un utilisateur Trobar à son propre compte Jellyfin pour que ses "
+"propres playlists (y compris privées) soient aussi synchronisées, comme "
+"le reste."
+
+#: templates/index.html:1941
+msgid "Click Refresh to load Jellyfin accounts."
+msgstr "Cliquez sur Actualiser pour charger les comptes Jellyfin."
+
+#: templates/index.html:1946
+msgid "Map Trobar users to Emby accounts"
+msgstr "Associer les utilisateurs Trobar aux comptes Emby"
+
+#: templates/index.html:1953
+msgid ""
+"Map a Trobar user to their own Emby account so their own playlists "
+"(private ones included) get synced too, alongside everything else."
+msgstr ""
+"Associez un utilisateur Trobar à son propre compte Emby pour que ses "
+"propres playlists (y compris privées) soient aussi synchronisées, comme "
+"le reste."
+
+#: templates/index.html:1973
+msgid "Click Refresh to load Emby accounts."
+msgstr "Cliquez sur Actualiser pour charger les comptes Emby."
+
+#: templates/index.html:1979 templates/setup.html:178
+msgid "Plex URL"
+msgstr "URL Plex"
+
+#: templates/index.html:1985 templates/setup.html:183
+msgid "Plex token"
+msgstr "Token Plex"
+
+#: templates/index.html:2000 templates/setup.html:190
+msgid "LMS URL"
+msgstr "URL LMS"
+
+#: templates/index.html:2006 templates/setup.html:195
+msgid "Username (optional)"
+msgstr "Nom d'utilisateur (facultatif)"
+
+#: templates/index.html:2012 templates/setup.html:200
+msgid "Password (optional)"
+msgstr "Mot de passe (facultatif)"
+
+#: templates/index.html:2026
+msgid ""
+"Reads playlists (.m3u/.m3u8) and artist images (a "
+"folder/cover/poster/artist/thumb image file in the artist's own folder) "
+"directly from the local library — no external server or credentials "
+"needed."
+msgstr ""
+"Lit les playlists (.m3u/.m3u8) et les photos d'artiste (un fichier image "
+"folder/cover/poster/artist/thumb dans le dossier de l'artiste) "
+"directement depuis la bibliothèque locale — aucun serveur externe ni "
+"identifiants requis."
+
+#: templates/index.html:2028
+msgid "Library root:"
+msgstr "Racine de la bibliothèque :"
+
+#: templates/index.html:2032
+msgid "iTunes/Apple Music Library.xml path (optional)"
+msgstr "Chemin du Library.xml iTunes/Apple Music (facultatif)"
+
+#: templates/index.html:2035
+msgid ""
+"Adds playlists from an exported iTunes/Apple Music library alongside .m3u"
+" discovery. A static snapshot — re-export and this path picks up the "
+"change on the next sync."
+msgstr ""
+"Ajoute les playlists d'une bibliothèque iTunes/Apple Music exportée, en "
+"plus de la détection .m3u. Un instantané statique — réexportez le fichier"
+" et ce chemin prendra en compte le changement au prochain sync."
+
+#: templates/index.html:2040
+msgid "Playlist track matching"
+msgstr "Correspondance des morceaux de playlist"
+
+#: templates/index.html:2042
+msgid "AcoustID API key"
+msgstr "Clé API AcoustID"
+
+#: templates/index.html:2043
+msgid "Optional — free key from acoustid.org"
+msgstr "Facultatif — clé gratuite sur acoustid.org"
+
+#: templates/index.html:2051
+msgid ""
+"Audio fingerprinting runs locally after a library scan and needs no key. "
+"It is what lets a device's files be re-identified after a server rebuild "
+"or a re-tag, so it only runs once you have enrolled a device. Nothing "
+"leaves your server."
+msgstr ""
+"L'empreinte audio est calculée localement après une analyse de la "
+"bibliothèque et ne nécessite aucune clé. C'est ce qui permet de "
+"réidentifier les fichiers d'un appareil après une reconstruction du "
+"serveur ou une modification des tags ; elle ne s'exécute donc qu'une fois"
+" un appareil enrôlé. Rien ne quitte votre serveur."
+
+#: templates/index.html:2052
+msgid ""
+"An AcoustID key is optional and adds one thing: each fingerprint is also "
+"sent to acoustid.org, and musicbrainz.org is queried, to recover an ISRC "
+"for poorly-tagged tracks. Only this part talks to the internet. If you "
+"add a key for an existing library, a Full rescan (Library tab) lets "
+"already-ISRC-tagged tracks skip it."
+msgstr ""
+"Une clé AcoustID est facultative et n'ajoute qu'une chose : chaque "
+"empreinte est aussi envoyée à acoustid.org, et musicbrainz.org est "
+"interrogé, afin de récupérer un ISRC pour les pistes mal taguées. Seule "
+"cette partie communique avec Internet. Si vous ajoutez une clé pour une "
+"bibliothèque existante, une analyse complète (onglet Bibliothèque) permet"
+" aux pistes déjà taguées avec un ISRC de la sauter."
+
+#: templates/index.html:2056
+msgid "Playlist mirroring"
+msgstr "Reflet de playlists"
+
+#: templates/index.html:2058
+msgid "Mirror output folder"
+msgstr "Dossier de sortie des reflets"
+
+#: templates/index.html:2061
+msgid ""
+"Optional — lets any user mirror a playlist to a Trobar-managed .m3u file "
+"here (see the \"Mirror to…\" button on the Playlists tab). Must be a "
+"separate folder from your music library, mounted writable."
+msgstr ""
+"Facultatif — permet à n'importe quel utilisateur de refléter une playlist"
+" dans un fichier .m3u géré par Trobar, ici (voir le bouton « Refléter "
+"vers… » dans l'onglet Playlists). Doit être un dossier distinct de votre "
+"bibliothèque musicale, monté en écriture."
+
+#: templates/index.html:2068
+msgid "Subsonic mirror-target URL"
+msgstr "URL de la cible du reflet Subsonic"
+
+#: templates/index.html:2107
+msgid ""
+"Optional — lets any user mirror a playlist to a playlist on this "
+"Subsonic/Navidrome server instead of (or alongside) the .m3u file above. "
+"Matches tracks on the target server by artist/album/title, so it works "
+"best when it indexes the same music library. Clear all three fields and "
+"save to stop mirroring to it entirely."
+msgstr ""
+"Facultatif — permet à n'importe quel utilisateur de refléter une playlist"
+" vers une playlist sur ce serveur Subsonic/Navidrome, en plus (ou à la "
+"place) du fichier .m3u ci-dessus. Les pistes sont associées sur le "
+"serveur cible par artiste/album/titre ; cela fonctionne mieux si ce "
+"serveur indexe la même bibliothèque musicale. Effacez les trois champs et"
+" enregistrez pour arrêter complètement le reflet vers ce serveur."
+
+#: templates/index.html:2114
+msgid "Jellyfin mirror-target URL"
+msgstr "URL de la cible du reflet Jellyfin"
+
+#: templates/index.html:2144
+msgid ""
+"Optional — lets any user mirror a playlist to a playlist on this Jellyfin"
+" server instead of (or alongside) the sinks above. Matches tracks on the "
+"target server by artist/album/title, so it works best when it indexes the"
+" same music library. Clear all three fields and save to stop mirroring to"
+" it entirely."
+msgstr ""
+"Facultatif — permet à n'importe quel utilisateur de refléter une playlist"
+" vers une playlist sur ce serveur Jellyfin, en plus (ou à la place) des "
+"reflets ci-dessus. Les pistes sont associées sur le serveur cible par "
+"artiste/album/titre ; cela fonctionne mieux si ce serveur indexe la même "
+"bibliothèque musicale. Effacez les trois champs et enregistrez pour "
+"arrêter complètement le reflet vers ce serveur."
+
+#: templates/index.html:2151
+msgid "Emby mirror-target URL"
+msgstr "URL de la cible du reflet Emby"
+
+#: templates/index.html:2181
+msgid ""
+"Optional — lets any user mirror a playlist to a playlist on this Emby "
+"server instead of (or alongside) the sinks above. Matches tracks on the "
+"target server by artist/album/title, so it works best when it indexes the"
+" same music library. Clear all three fields and save to stop mirroring to"
+" it entirely."
+msgstr ""
+"Facultatif — permet à n'importe quel utilisateur de refléter une playlist"
+" vers une playlist sur ce serveur Emby, en plus (ou à la place) des "
+"reflets ci-dessus. Les pistes sont associées sur le serveur cible par "
+"artiste/album/titre ; cela fonctionne mieux si ce serveur indexe la même "
+"bibliothèque musicale. Effacez les trois champs et enregistrez pour "
+"arrêter complètement le reflet vers ce serveur."
+
+#: templates/index.html:2191
+msgid "Lidarr URL"
+msgstr "URL Lidarr"
+
+#: templates/index.html:2218
+msgid "Refresh options"
+msgstr "Actualiser les options"
+
+#: templates/index.html:2222
+msgid "Root folder"
+msgstr "Dossier racine"
+
+#: templates/index.html:2225 templates/index.html:2235
+#: templates/index.html:2245
+msgid "— choose —"
+msgstr "— choisir —"
+
+#: templates/index.html:2232
+msgid "Quality profile"
+msgstr "Profil de qualité"
+
+#: templates/index.html:2242
+msgid "Metadata profile"
+msgstr "Profil de métadonnées"
+
+#: templates/index.html:2253
+msgid ""
+"Optional — lets any household member request an unresolved playlist "
+"track's missing album from a Lidarr instance, monitor-only. Save the URL "
+"and API key first, then Refresh options to choose a root folder, quality "
+"profile, and metadata profile from Lidarr's own lists. Clear the URL and "
+"API key and save to disconnect entirely."
+msgstr ""
+"Facultatif — permet à tout membre du foyer de demander l'album manquant "
+"d'une piste de playlist non résolue à une instance Lidarr, en mode "
+"surveillance uniquement. Enregistrez d'abord l'URL et la clé API, puis "
+"utilisez Actualiser les options pour choisir un dossier racine, un profil"
+" de qualité et un profil de métadonnées parmi les listes propres à "
+"Lidarr. Videz l'URL et la clé API puis enregistrez pour déconnecter "
+"entièrement."
+
+#: templates/index.html:2257
+msgid "Listening history"
+msgstr "Historique d'écoute"
+
+#: templates/index.html:2259 templates/setup.html:236
+msgid "Default Last.fm API key"
+msgstr "Clé API Last.fm par défaut"
+
+#: templates/index.html:2260 templates/setup.html:237
+msgid "Used if a user has none of their own"
+msgstr "Utilisée si un utilisateur n'a pas la sienne"
+
+#: templates/index.html:2264
+msgid "TheAudioDB API key (artist images)"
+msgstr "Clé API TheAudioDB (images d'artistes)"
+
+#: templates/index.html:2265
+msgid "If set, artist pictures come from TheAudioDB instead of the provider"
+msgstr ""
+"Si définie, les images d'artistes viennent de TheAudioDB plutôt que du "
+"fournisseur"
+
+#: templates/index.html:2270
+msgid "Tidal (direct playlist provider)"
+msgstr "Tidal (fournisseur de playlists direct)"
+
+#: templates/index.html:2273 templates/index.html:2289
+msgid "Client ID"
+msgstr "ID client"
+
+#: templates/index.html:2278 templates/index.html:2294
+msgid "Client secret"
+msgstr "Secret client"
+
+#: templates/index.html:2283
+msgid ""
+"Register an app at developer.tidal.com to get these. Unlike "
+"Roon/Subsonic/Jellyfin above, this doesn't connect a shared library — "
+"each household member links their own Tidal account individually, in "
+"their own Profile tab."
+msgstr ""
+"Enregistrez une application sur developer.tidal.com pour les obtenir. "
+"Contrairement à Roon/Subsonic/Jellyfin ci-dessus, cela ne connecte pas "
+"une bibliothèque partagée — chaque membre du foyer relie son propre "
+"compte Tidal individuellement, dans son propre onglet Profil."
+
+#: templates/index.html:2286
+msgid "Spotify (direct playlist provider) — experimental"
+msgstr "Spotify (fournisseur de playlists direct) — expérimental"
+
+#: templates/index.html:2299
+msgid ""
+"Register an app at developer.spotify.com to get these, with redirect URI "
+"<this server>/profile/spotify/callback. Like Tidal, each household member"
+" links their own Spotify account in their own Profile tab. Note: the "
+"person who registers the app needs Spotify Premium, and a Dev-Mode app is"
+" limited to 5 linked users."
+msgstr ""
+"Enregistrez une application sur developer.spotify.com pour les obtenir, "
+"avec l'URI de redirection <this server>/profile/spotify/callback. Comme "
+"pour Tidal, chaque membre du foyer connecte son propre compte Spotify "
+"dans son onglet Profil. Remarque : la personne qui enregistre "
+"l'application doit avoir Spotify Premium, et une application en mode Dev "
+"est limitée à 5 utilisateurs liés."
+
+#: templates/index.html:2302
+msgid "Enable Spotify"
+msgstr "Activer Spotify"
+
+#: templates/index.html:2307
+msgid ""
+"This client has never been verified against a live Spotify account — the "
+"maintainer doesn't have Premium. If you enable it and it works (or "
+"doesn't), a comment on github.com/missing-foss/trobar-server/issues/146 "
+"confirming a sync succeeded, or redacted payloads from a failure, is "
+"exactly what's needed to move it out of experimental."
+msgstr ""
+"Ce client n'a jamais été vérifié avec un compte Spotify réel — le "
+"mainteneur n'a pas Premium. Si vous l'activez et que ça fonctionne (ou "
+"non), un commentaire sur github.com/missing-foss/trobar-server/issues/146"
+" confirmant qu'une synchronisation a réussi, ou des données anonymisées "
+"d'un échec, est exactement ce qu'il faut pour sortir cette fonctionnalité"
+" du statut expérimental."
+
+#: templates/index.html:2311
+msgid "Listening history sources"
+msgstr "Sources d'historique d'écoute"
+
+#: templates/index.html:2314
+msgid "Last.fm API base URL"
+msgstr "URL de base de l'API Last.fm"
+
+#: templates/index.html:2315
+msgid "Default: the real Last.fm API"
+msgstr "Par défaut : l'API Last.fm réelle"
+
+#: templates/index.html:2319
+msgid "ListenBrainz API base URL"
+msgstr "URL de base de l'API ListenBrainz"
+
+#: templates/index.html:2320
+msgid "Default: the real ListenBrainz API"
+msgstr "Par défaut : l'API ListenBrainz réelle"
+
+#: templates/index.html:2324
+msgid ""
+"Point suggestions/listening-history reads at a self-hosted alternative "
+"instead of the real services — for example Libre.fm here, or a self-"
+"hosted ListenBrainz instance. Leave blank to use the default. See the "
+"Administration guide for compatibility notes."
+msgstr ""
+"Redirige les lectures de suggestions/historique d'écoute vers une "
+"alternative auto-hébergée plutôt que les services réels — par exemple "
+"Libre.fm ici, ou une instance ListenBrainz auto-hébergée. Laisser vide "
+"pour utiliser la valeur par défaut. Voir le guide d'administration pour "
+"les notes de compatibilité."
+
+#: templates/index.html:2327
+msgid "Transcoding (CPU controls)"
+msgstr "Transcodage (contrôles CPU)"
+
+#: templates/index.html:2330
+msgid "Concurrent transcodes"
+msgstr "Transcodages simultanés"
+
+#: templates/index.html:2335
+msgid "Encoder priority (nice level, 0-19)"
+msgstr "Priorité de l'encodeur (niveau nice, 0-19)"
+
+#: templates/index.html:2340
+msgid ""
+"How many tracks the server may transcode to MP3 at once, and how much CPU"
+" priority ffmpeg gets relative to everything else (higher = more polite, "
+"lower priority)."
+msgstr ""
+"Combien de morceaux le serveur peut transcoder en MP3 à la fois, et "
+"quelle priorité CPU ffmpeg reçoit par rapport au reste (plus haut = plus "
+"poli, priorité plus basse)."
+
+#: templates/index.html:2343
+msgid "Automatic library rescan"
+msgstr "Analyse automatique de la bibliothèque"
+
+#: templates/index.html:2346
+msgid "Rescan every (hours, 0 = off)"
+msgstr "Analyser toutes les (heures, 0 = désactivé)"
+
+#: templates/index.html:2351
+msgid ""
+"Off by default: nothing rescans the library on its own unless this is "
+"set. When enabled, the timer starts from when the previous scan finished,"
+" not a fixed clock time, and scheduled scans never re-read tags that "
+"haven't changed."
+msgstr ""
+"Désactivé par défaut : rien ne réanalyse la bibliothèque de lui-même tant"
+" que ce n'est pas activé. Une fois activé, le décompte démarre à la fin "
+"de l'analyse précédente, pas à une heure fixe, et les analyses planifiées"
+" ne relisent jamais les étiquettes qui n'ont pas changé."
+
+#: templates/index.html:2355
+msgid "Next scheduled scan: due now (the library has never been scanned)."
+msgstr ""
+"Prochaine analyse planifiée : à effectuer maintenant (la bibliothèque n'a"
+" jamais été analysée)."
+
+#: templates/index.html:2359
+msgid "Background job history"
+msgstr "Historique des tâches de fond"
+
+#: templates/index.html:2362
+msgid "Keep full history for (days)"
+msgstr "Conserver l'historique complet pendant (jours)"
+
+#: templates/index.html:2367
+msgid ""
+"Finished jobs older than this collapse to the single most recent run of "
+"their type — so \"did the last backfill succeed?\" always stays "
+"answerable, without a chatty job type (like a device syncing) crowding "
+"out the rare ones. Failed jobs are kept four times as long, since they're"
+" the ones most worth seeing."
+msgstr ""
+"Passé ce délai, les tâches terminées se réduisent à la dernière exécution"
+" de leur type — pour que « la dernière synchronisation a-t-elle réussi ? "
+"» reste toujours une question à laquelle répondre, sans qu'un type de "
+"tâche bavard (comme la synchronisation d'un appareil) n'écrase les plus "
+"rares. Les tâches échouées sont conservées quatre fois plus longtemps, "
+"car ce sont celles qu'il est le plus important de voir."
+
+#: templates/index.html:2378
+msgid "Auth mode:"
+msgstr "Mode d'authentification :"
+
+#: templates/index.html:2379
+msgid "(set via the"
+msgstr "(défini via la variable d'environnement"
+
+#: templates/index.html:2379
+msgid "environment variable, not from this screen)."
+msgstr ", pas depuis cet écran)."
+
+#: templates/index.html:2390
+msgid "Break-glass admin password"
+msgstr "Mot de passe administrateur de secours"
+
+#: templates/index.html:2392
+msgid ""
+"⚠ No break-glass password is set. If your identity provider becomes "
+"unreachable, no one will be able to sign in. Set one now."
+msgstr ""
+"⚠ Aucun mot de passe de secours n'est défini. Si votre fournisseur "
+"d'identité devient injoignable, personne ne pourra se connecter. "
+"Définissez-en un maintenant."
+
+#: templates/index.html:2395
+msgid ""
+"Emergency local login for this admin account, usable if the identity "
+"provider ever becomes unreachable."
+msgstr ""
+"Connexion locale d'urgence pour ce compte administrateur, utilisable si "
+"le fournisseur d'identité devient injoignable."
+
+#: templates/index.html:2419
+msgid "Check"
+msgstr "Vérifier"
+
+#: templates/index.html:2453
+msgid "Library has never been scanned"
+msgstr "La bibliothèque n'a jamais été analysée"
+
+#: templates/index.html:2513
+msgid "Lists are capped; counts are exact."
+msgstr "Les listes sont limitées ; les totaux sont exacts."
+
+#: templates/index.html:2631
+msgid "No mirrored playlists yet."
+msgstr "Aucune playlist reflétée pour l'instant."
+
+#: templates/index.html:2742
+msgid "Password (8+ characters)"
+msgstr "Mot de passe (8+ caractères)"
+
+#: templates/index.html:2751
+msgid ""
+"Useful for break-glass access, or for AUTH_MODE=local, where accounts "
+"aren't created automatically."
+msgstr ""
+"Utile pour un accès de secours, ou pour AUTH_MODE=local, où les comptes "
+"ne sont pas créés automatiquement."
+
+#: templates/index.html:2761
+msgid "admin"
+msgstr "admin"
+
+#: templates/index.html:2762
+msgid "local password"
+msgstr "mot de passe local"
+
+#: templates/index.html:2763
+msgid "break-glass"
+msgstr "secours"
+
+#: templates/index.html:2782 templates/index.html:2783
+msgid "Who manages…"
+msgstr "Qui gère…"
+
+#: templates/index.html:2788
+msgid "the devices of"
+msgstr "les appareils de"
+
+#: templates/index.html:2789 templates/index.html:2790
+msgid "…whom"
+msgstr "…qui"
+
+#: templates/index.html:2802
+msgid ""
+"Lets one user fully manage another's devices (rename, limit, token, "
+"deletion, synced content) — e.g. a parent managing a child's device. "
+"Several people can manage the same person's devices."
+msgstr ""
+"Autorise un utilisateur à gérer entièrement les appareils d'un autre "
+"(renommer, limite, token, suppression, contenu synchronisé) — par exemple"
+" un parent gérant l'appareil d'un enfant. Plusieurs personnes peuvent "
+"gérer les appareils d'une même personne."
+
+#: templates/index.html:2809
+msgid "→ manages the devices of →"
+msgstr "→ gère les appareils de →"
+
+#: templates/index.html:2817
+msgid "No delegations."
+msgstr "Aucune délégation."
+
+#: templates/index.html:2829
+msgid "Self-hosted music library sync"
+msgstr "Synchronisation auto-hébergée de bibliothèque musicale"
+
+#: templates/index.html:2830
+msgid "Server version"
+msgstr "Version du serveur"
+
+#: templates/index.html:2834
+msgid "Check for updates"
+msgstr "Vérifier les mises à jour"
+
+#: templates/index.html:2836
+msgid "Donate using Liberapay"
+msgstr "Faire un don via Liberapay"
+
+#: templates/index.html:2844
+msgid "Links"
+msgstr "Liens"
+
+#: templates/index.html:2847
+msgid "Documentation"
+msgstr "Documentation"
+
+#: templates/index.html:2849
+msgid "Server source code"
+msgstr "Code source du serveur"
+
+#: templates/index.html:2851 templates/index.html:2865
+msgid "Android app"
+msgstr "Application Android"
+
+#: templates/index.html:2853 templates/index.html:2876
+msgid "Desktop app"
+msgstr "Application de bureau"
+
+#: templates/index.html:2855
+msgid "Report an issue or request a feature"
+msgstr "Signaler un problème ou proposer une fonctionnalité"
+
+#: templates/index.html:2857 templates/index.html:2878
+msgid "Releases"
+msgstr "Versions publiées"
+
+#: templates/index.html:2862
+msgid "Get the apps"
+msgstr "Obtenir les applications"
+
+#: templates/index.html:2870
+msgid "Add via Obtainium"
+msgstr "Ajouter via Obtainium"
+
+#: templates/index.html:2884
+msgid "Licenses"
+msgstr "Licences"
+
+#: templates/index.html:2885
+msgid ""
+"The server is AGPL-3.0-or-later; the Android and desktop apps are GPL-3.0"
+"-or-later. Bundled fonts and libraries keep their own licenses."
+msgstr ""
+"Le serveur est sous AGPL-3.0-or-later ; les applications Android et de "
+"bureau sont sous GPL-3.0-or-later. Les polices et bibliothèques intégrées"
+" conservent leurs propres licences."
+
+#: templates/index.html:2910
+msgid "All"
+msgstr "Tout"
+
+#: templates/index.html:2912
+msgid "New"
+msgstr "Nouveautés"
+
+#: templates/index.html:2953
+msgid "No suggestions yet — click \"Refresh\"."
+msgstr "Aucune suggestion pour l'instant — cliquez sur \"Rafraîchir\"."
+
+#: templates/index.html:2975
+msgid "No devices — create one in the \"Profile\" tab first."
+msgstr "Aucun appareil — créez-en un dans l'onglet \"Profil\" d'abord."
+
+#: templates/index.html:3002
+msgid "Add device"
+msgstr "Ajouter un appareil"
+
+#: templates/index.html:3003
+msgid "Device type"
+msgstr "Type d'appareil"
+
+#: templates/index.html:3030
+msgid "Name (e.g. Pixel 9)"
+msgstr "Nom (ex: Pixel 9)"
+
+#: templates/index.html:3033
+msgid "Limit (GB, optional)"
+msgstr "Limite (Go, optionnel)"
+
+#: templates/index.html:3056
+msgid "This token will never be shown again — scan it now or copy it."
+msgstr "Ce token ne sera plus jamais affiché — scannez-le maintenant ou copiez-le."
+
+#: templates/index.html:3063 templates/index.html:3087
+msgid "Copy"
+msgstr "Copier"
+
+#: templates/index.html:3067
+msgid "Download config file (desktop / SD card)"
+msgstr "Télécharger le fichier de configuration (bureau / carte SD)"
+
+#: templates/index.html:3081
+msgid "This token will never be shown again — copy it now."
+msgstr "Ce token ne sera plus jamais affiché — copiez-le maintenant."
+
+#: templates/index.html:3099
+msgid "Add a mobile device"
+msgstr "Ajouter un appareil mobile"
+
+#: templates/index.html:3101
+msgid ""
+"In the Trobar app, scan this QR or enter the code below. It works once "
+"and expires in a few minutes."
+msgstr ""
+"Dans l'application Trobar, scannez ce QR code ou saisissez le code ci-"
+"dessous. Il fonctionne une seule fois et expire dans quelques minutes."
+
+#: templates/index.html:3119
+msgid "New password (8+ characters)"
+msgstr "Nouveau mot de passe (8+ caractères)"
+
+#: templates/login.html:19
+msgid "Trobar — Login"
+msgstr "Trobar — Connexion"
+
+#: templates/login.html:35
+msgid "Create admin account"
+msgstr "Créer le compte administrateur"
+
+#: templates/login.html:35
+msgid "Login"
+msgstr "Connexion"
+
+#: templates/login.html:37
+msgid "First launch — this account will have admin access."
+msgstr "Premier lancement — ce compte aura accès à l'administration."
+
+#: templates/login.html:45
+msgid "Sign in with SSO"
+msgstr "Se connecter via SSO"
+
+#: templates/login.html:49
+msgid "or use a local account"
+msgstr "ou utiliser un compte local"
+
+#: templates/login.html:66
+msgid "Create account"
+msgstr "Créer le compte"
+
+#: templates/login.html:66
+msgid "Log in"
+msgstr "Se connecter"
+
+#: templates/setup.html:19
+msgid "Trobar — Setup"
+msgstr "Trobar — Configuration"
+
+#: templates/setup.html:69
+msgid "Where's your music?"
+msgstr "Où se trouve votre musique ?"
+
+#: templates/setup.html:70
+msgid ""
+"The folder the server should scan for tracks. It must already be "
+"reachable inside the container — see the docker-compose volume mount — "
+"but you can point it at any subfolder of that mount."
+msgstr ""
+"Le dossier dans lequel le serveur doit chercher les morceaux. Il doit "
+"déjà être accessible dans le conteneur — voir le point de montage du "
+"docker-compose — mais vous pouvez pointer vers n'importe quel sous-"
+"dossier de ce point de montage."
+
+#: templates/setup.html:72
+msgid "Music library path"
+msgstr "Chemin de la bibliothèque musicale"
+
+#: templates/setup.html:80
+msgid ""
+"This folder is on a writable mount. Trobar only ever reads your music — "
+"mount it read-only (add ':ro' to the volume in docker-compose) so a bug "
+"or compromise can't modify or delete your files. You can still continue."
+msgstr ""
+"Ce dossier est sur un montage en écriture. Trobar se contente de lire "
+"votre musique — montez-le en lecture seule (ajoutez « :ro » au volume "
+"dans docker-compose) afin qu'un bug ou une compromission ne puisse pas "
+"modifier ou supprimer vos fichiers. Vous pouvez tout de même continuer."
+
+#: templates/setup.html:88
+msgid "Continue anyway"
+msgstr "Continuer quand même"
+
+#: templates/setup.html:96
+msgid "Where's your library metadata coming from?"
+msgstr "D'où viennent les métadonnées de votre bibliothèque ?"
+
+#: templates/setup.html:97
+msgid ""
+"Playlists and artist photos come from whichever of these you pick — "
+"Filesystem needs nothing set up at all, the others need a live server to "
+"talk to."
+msgstr ""
+"Les playlists et photos d'artistes viennent de celui que vous choisissez "
+"— Filesystem ne nécessite aucune configuration, les autres ont besoin "
+"d'un serveur actif avec lequel communiquer."
+
+#: templates/setup.html:110
+msgid ""
+"Nothing to configure — playlists and artist photos are read straight from"
+" the music folder you just set, using conventions from tools like "
+"Jaikoz/Kodi/Jellyfin."
+msgstr ""
+"Rien à configurer — les playlists et photos d'artistes sont lues "
+"directement depuis le dossier musical que vous venez de définir, en "
+"suivant les conventions d'outils comme Jaikoz/Kodi/Jellyfin."
+
+#: templates/setup.html:221 templates/setup.html:241
+msgid "Back"
+msgstr "Retour"
+
+#: templates/setup.html:233
+msgid "Listening history (optional)"
+msgstr "Historique d'écoute (optionnel)"
+
+#: templates/setup.html:234
+msgid ""
+"Powers the Suggestions tab's top-played/recently-played sections, via "
+"Last.fm or ListenBrainz. Each user connects their own account in their "
+"profile; ListenBrainz needs no key at all. The only app-wide setting is "
+"an optional default Last.fm API key below — leave blank to skip, "
+"everything can be set later."
+msgstr ""
+"Alimente les sections les plus joués / écoutés récemment de l'onglet "
+"Suggestions, via Last.fm ou ListenBrainz. Chaque utilisateur connecte son"
+" propre compte dans son profil ; ListenBrainz ne demande aucune clé. Le "
+"seul réglage global est une clé API Last.fm par défaut, optionnelle, ci-"
+"dessous — laisse vide pour passer, tout peut être configuré plus tard."
+
+#~ msgid "Synced albums, by device"
+#~ msgstr "Albums synchronisés, par appareil"
+
+#~ msgid "Selected artists"
+#~ msgstr "Artistes sélectionnés"
+
+#~ msgid "Selected playlists"
+#~ msgstr "Playlists sélectionnées"
+
+#~ msgid "Last.fm (optional)"
+#~ msgstr "Last.fm (optionnel)"
+
+#~ msgid ""
+#~ "Powers the Suggestions tab's top-played"
+#~ "/recently-played sections. Leave blank to"
+#~ " skip — the library still shows "
+#~ "recently-added suggestions either way, "
+#~ "and this can be set later in "
+#~ "Administration."
+#~ msgstr ""
+#~ "Alimente les sections \"les plus "
+#~ "écoutés\"/\"écoutés récemment\" de l'onglet "
+#~ "Suggestions. Laissez vide pour ignorer —"
+#~ " la bibliothèque affichera quand même "
+#~ "les suggestions d'ajouts récents, et "
+#~ "ceci peut être réglé plus tard "
+#~ "dans Administration."
+
+#~ msgid "Synced albums"
+#~ msgstr "Albums synchronisés"
+
+#~ msgid "SD card / USB storage"
+#~ msgstr "Carte SD / stockage USB"
+
+#~ msgid "Add mobile device (QR / code)"
+#~ msgstr "Ajouter un appareil mobile (QR / code)"
+
+#~ msgid "Dashboard"
+#~ msgstr "Tableau de bord"
+
+#~ msgid ""
+#~ "Optional — enables audio fingerprinting "
+#~ "to identify poorly-tagged local tracks"
+#~ msgstr ""
+#~ "Facultatif — active l'empreinte audio "
+#~ "pour identifier les morceaux locaux mal"
+#~ " renseignés"
+
+#~ msgid ""
+#~ "Runs automatically after each library "
+#~ "scan for tracks with no ISRC tag."
+#~ " Free key from acoustid.org."
+#~ msgstr ""
+#~ "S'exécute automatiquement après chaque analyse"
+#~ " de la bibliothèque pour les morceaux"
+#~ " sans tag ISRC. Clé gratuite sur "
+#~ "acoustid.org."
+
+#~ msgid "{added} added, {updated} updated, {removed} removed."
+#~ msgstr "{added} ajoutés, {updated} modifiés, {removed} supprimés."
+
+#~ msgid ""
+#~ "This account owns devices, selections, "
+#~ "or playlists — delete or reassign "
+#~ "those first."
+#~ msgstr ""
+#~ "Ce compte possède des appareils, des "
+#~ "sélections ou des playlists — "
+#~ "supprime-les ou réattribue-les d'abord."
+
+#~ msgid "Account"
+#~ msgstr "Compte"
+
+#~ msgid "You're all set!"
+#~ msgstr "Tout est prêt !"
+
+#~ msgid "Go to your library"
+#~ msgstr "Accéder à ma bibliothèque"
+
+#~ msgid "Mirror error"
+#~ msgstr "Erreur de reflet"
+
+#~ msgid ""
+#~ "Revoke \"{name}\"? Anything using this "
+#~ "token to trigger a rescan will "
+#~ "stop working immediately."
+#~ msgstr ""
+#~ "Révoquer « {name} » ? Tout ce "
+#~ "qui utilise ce token pour déclencher "
+#~ "un scan cessera de fonctionner "
+#~ "immédiatement."
+
+#~ msgid "API token not found."
+#~ msgstr "Token introuvable."
+
+#~ msgid "Invalid or revoked API token."
+#~ msgstr "Token invalide ou révoqué."
+
+#~ msgid "No API tokens yet."
+#~ msgstr "Aucun token pour l'instant."
+
+#~ msgid ""
+#~ "A separate token that lets external "
+#~ "tools trigger a library rescan — "
+#~ "nothing else. Keep it apart from "
+#~ "your read-only token so you can"
+#~ " revoke automation access without breaking"
+#~ " a read-only dashboard."
+#~ msgstr ""
+#~ "Un token distinct qui permet à des"
+#~ " outils externes de déclencher un "
+#~ "scan de la bibliothèque — rien "
+#~ "d'autre. Gardez-le séparé de votre "
+#~ "token en lecture seule afin de "
+#~ "pouvoir révoquer l'accès à l'automatisation"
+#~ " sans casser un tableau de bord "
+#~ "en lecture seule."
+
+#~ msgid ""
+#~ "Optional — lets any user mirror a"
+#~ " playlist to a playlist on this "
+#~ "Subsonic/Navidrome server instead of (or "
+#~ "alongside) the .m3u file above. Matches"
+#~ " tracks on the target server by "
+#~ "file path, so it works best when"
+#~ " it indexes the same library layout."
+#~ msgstr ""
+#~ "Facultatif — permet à n'importe quel "
+#~ "utilisateur de refléter une playlist "
+#~ "vers une playlist sur ce serveur "
+#~ "Subsonic/Navidrome, en plus (ou à la "
+#~ "place) du fichier .m3u ci-dessus. "
+#~ "Les pistes sont associées sur le "
+#~ "serveur cible par chemin de fichier "
+#~ "; cela fonctionne mieux si ce "
+#~ "serveur indexe la même arborescence de"
+#~ " bibliothèque."
+
+#~ msgid ""
+#~ "None of this playlist's tracks were "
+#~ "found on the Subsonic mirror target:"
+#~ msgstr ""
+#~ "Aucune piste de cette playlist n'a "
+#~ "été trouvée sur la cible du reflet"
+#~ " Subsonic :"
+
+#~ msgid ""
+#~ "Optional — lets any user mirror a"
+#~ " playlist to a playlist on this "
+#~ "Subsonic/Navidrome server instead of (or "
+#~ "alongside) the .m3u file above. Matches"
+#~ " tracks on the target server by "
+#~ "artist/album/title, so it works best "
+#~ "when it indexes the same music "
+#~ "library."
+#~ msgstr ""
+#~ "Facultatif — permet à n'importe quel "
+#~ "utilisateur de refléter une playlist "
+#~ "vers une playlist sur ce serveur "
+#~ "Subsonic/Navidrome, en plus (ou à la "
+#~ "place) du fichier .m3u ci-dessus. "
+#~ "Les pistes sont associées sur le "
+#~ "serveur cible par artiste/album/titre ; "
+#~ "cela fonctionne mieux si ce serveur "
+#~ "indexe la même bibliothèque musicale."
+
+#~ msgid "Add to basket"
+#~ msgstr "Ajouter au panier"
+
+#~ msgid "Select"
+#~ msgstr "Sélectionner"
+
+#~ msgid "Confirm"
+#~ msgstr "Confirmer"
+

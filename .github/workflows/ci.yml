@@ -1,0 +1,268 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Server CI: the pre-merge verify gate. Runs on every push/PR.
+# No release keystore, no deploy, read-only token. Actions pinned to major
+# tags; consider sha-pinning before enabling org-wide.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Pip lockfile drift guard (#195)
+        # app/requirements.txt is a compiled, hash-pinned lockfile generated
+        # from app/requirements.in — a stale lockfile would still install
+        # fine (pip only checks that present hashes match, not that
+        # they're current), so this recompiles against the exact base image
+        # Dockerfile ships and fails if the committed file disagrees.
+        # Comparing only non-comment/non-blank lines so this doesn't care
+        # about header wording, just the actual pinned package==hash lines.
+        #
+        # Seeded from the committed lockfile (review feedback): pip-compile
+        # only anchors on an *existing* output file to keep already-pinned
+        # versions stable. Compiling straight to a file that doesn't exist
+        # yet (the original version of this step) does a fresh "latest
+        # compatible" resolution every run instead of a true drift check —
+        # every open PR, including docs-only ones, would go red the moment
+        # any dependency published a new release, and it would re-resolve
+        # dependencies rather than verify the pins that are actually
+        # committed. pip-tools itself is version-pinned too — a
+        # tool that verifies nothing enters the build unverified shouldn't
+        # itself be installed unverified.
+        run: |
+          image=$(grep -m1 '^FROM ' Dockerfile | awk '{print $2}')
+          cp app/requirements.txt app/fresh.txt
+          # Output goes to the mounted /work (== app/ on the runner), not the
+          # container's own /tmp — that filesystem is gone the moment this
+          # `docker run` exits, so the host-side diff below would silently
+          # compare against nothing (caught locally before this shipped).
+          docker run --rm -v "$PWD/app:/work" -w /work "$image" \
+            bash -c "pip install --quiet pip-tools==7.6.0 && pip-compile --generate-hashes --no-header --output-file=fresh.txt requirements.in"
+          grep -vE '^\s*#|^\s*$' app/fresh.txt > /tmp/fresh.body
+          grep -vE '^\s*#|^\s*$' app/requirements.txt > /tmp/committed.body
+          rm -f app/fresh.txt
+          if ! diff -u /tmp/committed.body /tmp/fresh.body; then
+            echo "::error::app/requirements.txt is out of date — regenerate it from requirements.in (see the header comment in requirements.txt for the exact command)"
+            exit 1
+          fi
+      - name: Tailwind CSS drift guard (#306)
+        # app/static/css/tailwind.css is a committed build artifact generated
+        # from the templates, and a stale one ships an UNSTYLED UI. #285 added
+        # `border-emerald-300 text-emerald-700 hover:bg-emerald-50` for the
+        # "Mirroring" toggle and never rebuilt, so that state rendered with no
+        # styling at all from the moment it merged until #305 happened to
+        # rebuild and notice.
+        #
+        # Nothing else could have caught it: the classes are perfectly VALID
+        # (theme.extend.colors merges with Tailwind's defaults, so off-palette
+        # utilities like emerald generate happily), no other step builds CSS,
+        # and nothing in CI renders a page. The template diff looked correct in
+        # review — because it was.
+        #
+        # Version pinned AND checksummed, and the pin is load-bearing rather
+        # than hygiene: this artifact has already flip-flopped 3.4.17 -> 3.4.19
+        # -> 3.4.17 across machines with the version pinned nowhere. An unpinned
+        # generator would make this guard fail on tool updates instead of on
+        # real drift — the same trap the pip lockfile guard above documents.
+        # (Empirically 3.4.17 and 3.4.19 differ only in the version banner for
+        # this project, which is precisely why the failures would look
+        # inexplicable.)
+        #
+        # MUST build from app/: tailwind.config.js's `content` glob is relative
+        # to the working directory, so running from the repo root matches no
+        # templates and emits a purged ~4.7 KB stylesheet instead of ~18 KB —
+        # a "drift" failure that is really this check misconfigured. Verified
+        # both directions locally before this shipped.
+        run: |
+          v=3.4.19
+          sha=4af3198c015616ea7d6617974ec3d70d987ecc00c1ca8463b0a30fd65cc7c06e
+          # -f matters for the DIAGNOSTIC, not for safety: without it curl saves
+          # an HTTP error body and exits 0, so a 404 or a network blip would be
+          # reported below as a checksum mismatch and suggest "you bumped the
+          # version" — blaming the wrong thing. It still failed closed either
+          # way (an error page can't match the pinned hash).
+          curl -fsSL -o /tmp/tailwindcss \
+            "https://github.com/tailwindlabs/tailwindcss/releases/download/v${v}/tailwindcss-linux-x64"
+          if ! echo "${sha}  /tmp/tailwindcss" | sha256sum -c - >/dev/null 2>&1; then
+            echo "::error::tailwindcss v${v} checksum mismatch (expected ${sha}, got $(sha256sum /tmp/tailwindcss | awk '{print $1}')). If you intentionally bumped the version, update the sha alongside it."
+            exit 1
+          fi
+          chmod +x /tmp/tailwindcss
+          cd app
+          /tmp/tailwindcss -c tailwind.config.js -i tailwind-input.css -o /tmp/fresh.css --minify
+          if diff -q static/css/tailwind.css /tmp/fresh.css >/dev/null; then
+            exit 0
+          fi
+          # The artifact is minified onto a couple of very long lines, so a raw
+          # diff is unreadable. Report the class-level delta instead — that's
+          # the actionable part: what you used in a template but didn't build.
+          grep -o '\.[a-zA-Z0-9\\:_-]*{' static/css/tailwind.css | sort -u > /tmp/committed.classes
+          grep -o '\.[a-zA-Z0-9\\:_-]*{' /tmp/fresh.css | sort -u > /tmp/fresh.classes
+          echo "Used in templates but missing from the committed CSS:"
+          comm -13 /tmp/committed.classes /tmp/fresh.classes | head -20 | sed 's/^/  /'
+          echo "In the committed CSS but no longer used:"
+          comm -23 /tmp/committed.classes /tmp/fresh.classes | head -20 | sed 's/^/  /'
+          echo "::error::app/static/css/tailwind.css is out of date — rebuild it (see the header comment in app/tailwind.config.js for the exact command) and commit the result"
+          exit 1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # #196: test on the same major the image ships. The Docker base is
+          # moving to python:3.14-slim (#191); CI must exercise 3.14 so a
+          # transitive dep that lacks a 3.14 wheel or changes behavior fails
+          # here rather than shipping green.
+          python-version: "3.14"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "20"
+      - name: Install node dev tooling
+        # Needed before the inline-JS check below (its eslint pass shells out
+        # to node_modules/.bin/eslint) — also covers the e2e job's Playwright
+        # dependency, installed once here for both.
+        run: npm ci
+      - name: Compile check
+        run: python -m py_compile app/*.py
+      - name: Install test dependencies
+        # py_compile above doesn't execute imports, so it doesn't need this —
+        # but the unit tests below import real app modules (lastfm.py etc.
+        # pull in requests), so they do.
+        #
+        # Two separate installs, not one `-r a -r b` (#195 follow-up): pip
+        # auto-enables hash-checking mode for the WHOLE invocation the moment
+        # any requirement anywhere in it has a hash. requirements.txt is now
+        # fully hashed; requirements-dev.txt deliberately isn't (dev-only
+        # tooling, out of scope for the pin). Combined into one command, that
+        # made every fresh-runner CI run fail with "Hashes are required in
+        # --require-hashes mode, but they are missing from some requirements"
+        # the moment it hit mypy/coverage/reuse — caught only by reproducing
+        # in a genuinely fresh venv, since an already-populated dev venv
+        # short-circuits already-satisfied packages and never triggers it.
+        run: |
+          pip install -r app/requirements.txt
+          # --constraint (review feedback): without it, an unconstrained dev
+          # tool (reuse pulls a reasonably wide tree) could silently pull a
+          # newer version of something requirements.txt just installed and
+          # hash-verified — confirmed a real, not just theoretical, risk:
+          # click/jinja2/markupsafe are in both trees. This makes a version
+          # conflict a resolution error instead of a quiet substitution.
+          #
+          # Can't pass app/requirements.txt directly as the constraint file:
+          # pip's hash-checking mode also activates when a *constraint* file
+          # carries hashes, and requirements-dev.txt itself isn't hashed —
+          # same class of failure the split above exists to avoid. Strip the
+          # hashes into a throwaway constraints file instead (constraint
+          # files don't support the trailing-backslash continuation syntax,
+          # so this also collapses each pinned entry to one line).
+          grep -E '^[A-Za-z0-9_.-]+==' app/requirements.txt | sed 's/ *\\$//' > /tmp/constraints-nohash.txt
+          pip install -r app/requirements-dev.txt --constraint /tmp/constraints-nohash.txt
+      - name: Unit tests (with coverage)
+        # PYTHONPATH=app, not `cd app`: coverage.py only auto-discovers a
+        # config file in the current directory, unlike mypy below which
+        # walks up to find pyproject.toml from the repo root. Report only,
+        # no enforced threshold (#41) — visibility into the untested-code
+        # gap, not a gate on it.
+        #
+        # unittest discover (not a hardcoded module list, per dev/verify.sh's
+        # matching comment): #252/#253 each shipped a test_*.py that was
+        # invisible here until manually added to an explicit list, in three
+        # places, twice in a row — discovery removes the recurring gap.
+        run: |
+          PYTHONPATH=app coverage run -m unittest discover -s app -p 'test_*.py' -v
+          coverage report
+      - name: Type check (mypy)
+        # Config in pyproject.toml (auto-discovered from the repo root).
+        run: mypy
+      - name: Inline JS checks (templates)
+        # A rendered template can still hold broken JS that blanks the page in
+        # the browser (syntax) or throws at runtime on a path nothing else
+        # exercises (lint) — nothing else catches either.
+        run: python dev/check_inline_js.py
+      - name: Translations (FR catalog complete, #187)
+        # Fails on any untranslated/fuzzy FR entry or placeholder mismatch, so a
+        # new _() string can't silently ship English-only. babel is installed
+        # via app/requirements.txt above.
+        run: python dev/check_translations.py
+      - name: Secret scan
+        # Download the binary rather than use gitleaks-action: the org Actions
+        # policy only allows GitHub-owned + verified-creator actions, and a
+        # run step isn't subject to that allowlist.
+        run: |
+          v=8.24.3
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks git --no-banner .
+      - name: REUSE lint (per-file SPDX licensing, #122)
+        # reuse is installed via app/requirements-dev.txt above.
+        run: reuse lint
+      - name: Docker build
+        run: docker build .
+      - name: Install Playwright browser
+        # Plain run step (not a uses: microsoft/playwright-github-action@...
+        # like Playwright's own docs suggest) — same org Actions policy as
+        # the gitleaks step above. --with-deps needs apt, fine on GitHub's
+        # runners (unlike this project's own dev host, which has no sudo).
+        run: npx playwright install --with-deps chromium
+      - name: Start Last.fm mock for e2e
+        # #281: same mock dev/'s docker-compose uses for Suggestions/auto-fit,
+        # run directly (no Docker) against dev/testlib.json's real path — so
+        # the Most Played chart (#267) has real data to render during the
+        # accessibility scan below, not just its empty-state hint. Flask is
+        # already installed via app/requirements.txt above.
+        env:
+          TESTLIB_PATH: dev/testlib.json
+          PORT: "8080"
+        run: |
+          python dev/lastfm-mock/app.py &
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/healthz) || true
+            [ "$code" = "200" ] && exit 0
+            sleep 1
+          done
+          echo "::error::lastfm mock never became ready"; exit 1
+      - name: Start server for e2e
+        env:
+          AUTH_MODE: local
+          SESSION_COOKIE_SECURE: "0"
+          DATA_DIR: ${{ runner.temp }}/trobar-e2e-data
+          MUSIC_ROOT: ${{ runner.temp }}/trobar-e2e-music
+          # #281: points at the mock started above — the module-level
+          # LASTFM_API_KEY/API_BASE lastfm.py reads at import time, so these
+          # have to be set before `python main.py` starts, not per-request.
+          LASTFM_API_BASE: http://localhost:8080/2.0/
+          LASTFM_API_KEY: e2e-mock-key
+        run: |
+          mkdir -p "$DATA_DIR" "$MUSIC_ROOT"
+          cd app && python main.py &
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/login) || true
+            [ "$code" = "200" ] && exit 0
+            sleep 1
+          done
+          echo "::error::server never became ready"; exit 1
+      - name: e2e tests (Playwright)
+        env:
+          TROBAR_BASE_URL: http://localhost:5000
+          MUSIC_ROOT: ${{ runner.temp }}/trobar-e2e-music
+          # #281: tells global-setup.js to seed this username (via the mock
+          # above) so Suggestions/Most Played render real data during the
+          # a11y scans — unset when running e2e any other way (e.g. against
+          # a real dev sandbox per e2e/README.md), so a real, unmocked
+          # profile.lastfm_username is never silently overwritten.
+          LASTFM_MOCK_USERNAME: e2e-mock-user
+        run: npx playwright test --config=e2e/playwright.config.js
+      - name: Upload e2e failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: playwright-report
+          path: |
+            test-results/
+          retention-days: 7

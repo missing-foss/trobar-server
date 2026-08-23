@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Build the MkDocs Material site and deploy it to GitHub Pages (Source =
+# "GitHub Actions"). Also validates with `mkdocs build --strict` on docs PRs
+# (#437) -- broken links, missing nav entries and dead anchors now fail the
+# PR itself instead of only being caught on the push-to-main run that
+# deploys, where the failure previously landed on the site quietly going
+# stale. Actions are SHA-pinned with a version comment, matching
+# ci.yml/scorecard.yml; all are actions/* (GitHub-authored), already covered by
+# the org allowlist.
+#
+# Deliberately NOT a required status check: path-filtered workflows report
+# nothing on non-docs PRs, and GitHub treats a required check that never
+# reports as permanently unsatisfied -- every code-only PR would sit
+# blocked. A red X here is still visible on the pull request, so a docs
+# failure is caught; it is advisory rather than gating.
+name: docs
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - mkdocs.yml
+      - docs/requirements.txt
+      - .github/workflows/docs.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - docs/**
+      - mkdocs.yml
+      - docs/requirements.txt
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+# Push keeps the shared "pages" group so deploys still serialize and never
+# cancel each other (#437). PR runs get their own group keyed on the ref,
+# so a docs PR's validation can't queue behind an unrelated production
+# deploy -- and CAN cancel-in-progress, since nothing there is deploying
+# anything; only the newest push to a PR need finish.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pages-pr-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+      - run: pip install -r docs/requirements.txt
+      # NEVER add -q here: it suppresses the warnings --strict promotes to
+      # errors, so the check exits 0 -- appearing to run while silently
+      # validating nothing. #437.
+      - run: mkdocs build --strict
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.event_name != 'pull_request'
+        with:
+          path: site/
+
+  # Runs on push only -- a PR has nothing to deploy, just validate (#437).
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

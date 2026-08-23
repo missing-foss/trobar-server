@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+
+<g style="color:#F9EFDF"><g id="tbBardSil" fill="currentColor" stroke="currentColor">
+    <line x1="38" y1="18" x2="156" y2="168" stroke-width="20" stroke-linecap="round"></line>
+    <path d="M56 214 Q50 152 74 128 Q86 118 100 128 Q118 150 112 214 Z"></path>
+    <path d="M152 116 C120 116 104 148 110 174 C114 198 132 210 152 210 C172 210 190 198 194 174 C200 148 184 116 152 116 Z"></path>
+    <circle cx="86" cy="100" r="25"></circle>
+    <path d="M60 84 Q68 54 102 66 Q116 71 112 86 Q96 76 86 82 Q70 74 64 90 Z"></path>
+    <path d="M108 64 Q130 42 128 24 Q114 40 102 60 Z"></path>
+  </g></g>
+</svg>

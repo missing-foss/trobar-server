@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[tool.mypy]
+python_version = "3.12"
+files = ["app"]
+exclude = ["app/translations/"]
+# Most of the codebase already carries real annotations (return types,
+# Optional params) — check_untyped_defs makes mypy verify the *bodies* of
+# functions too, not just skip anything without a full signature.
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+# No stubs/py.typed published for these — everything else (flask, requests,
+# tinytag, Pillow, flask_compress) ships its own or has typeshed stubs, so
+# this stays scoped instead of a blanket ignore_missing_imports.
+[[tool.mypy.overrides]]
+module = ["flask_babel", "authlib.*", "roonapi", "roonapi.*", "waitress", "acoustid"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+# Visibility tool only (#41) — no enforced threshold, deliberately. Coverage
+# is reported on every CI run so gaps stay visible, but gating on a number
+# tends to produce tests written for the number rather than for the risk.
+# Raise the bar by adding tests worth having, not by setting a floor.
+#
+# Unlike the unit-test step, this runs from the repo root (PYTHONPATH=app
+# so the test modules' bare `import sync_state`-style imports still
+# resolve) rather than `cd app` — coverage.py only auto-discovers a config
+# file in the current directory, it doesn't walk up like mypy/pytest do, so
+# cd-ing into app/ would silently pick up no config at all.
+source = ["app"]
+omit = ["app/test_*.py", "app/translations/*"]
+
+[tool.coverage.report]
+skip_covered = false
+show_missing = true
+precision = 1

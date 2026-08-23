@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+
+<!--
+SPDX-FileCopyrightText: 2026 missing-foss
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<html lang="{{ get_locale() }}" class="h-full" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script>
+  (function () {
+    var pref = localStorage.getItem('trobar-theme') || 'auto';
+    var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.setAttribute('data-theme', pref === 'auto' ? (systemDark ? 'dark' : 'light') : pref);
+  })();
+</script>
+<title>{{ _("Trobar — Login") }}</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/favicon.svg') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/fonts.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/logo.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tailwind.css') }}">
+</head>
+<body class="h-full ss-app-bg font-sans text-gray-900 flex items-center justify-center p-4">
+  <main class="w-full max-w-sm">
+    <div class="flex flex-col items-center gap-3 mb-6">
+      <div class="ss-mark" style="width:64px;height:64px;">
+        <img class="ss-bard" src="{{ url_for('static', filename='img/bard-mark.svg') }}" alt="">
+      </div>
+      <span class="font-display font-semibold text-xl">Trob<span class="text-accent">ar</span></span>
+    </div>
+    <div class="bg-panel rounded-lg border border-gray-300/30 p-5">
+      <h1 class="font-semibold mb-3">{{ _("Create admin account") if bootstrap else _("Login") }}</h1>
+      {% if bootstrap %}
+      <p class="text-xs text-gray-400 mb-3">{{ _("First launch — this account will have admin access.") }}</p>
+      {% endif %}
+      {% if error %}
+      <p class="text-sm text-red-500 mb-3">{{ error }}</p>
+      {% endif %}
+      {% if auth_mode == 'oidc' %}
+      <a href="{{ url_for('oidc_login') }}"
+        class="block w-full text-center text-sm px-3 py-2 rounded bg-burgundy text-white hover:bg-burgundy-lo">
+        {{ _("Sign in with SSO") }}
+      </a>
+      <div class="flex items-center gap-2 my-4">
+        <div class="flex-1 h-px bg-gray-300/30"></div>
+        <span class="text-xs text-gray-400">{{ _("or use a local account") }}</span>
+        <div class="flex-1 h-px bg-gray-300/30"></div>
+      </div>
+      {% endif %}
+      <form method="post" class="space-y-3">
+        <div>
+          <label for="username" class="block text-xs text-gray-400 mb-1">{{ _("Username") }}</label>
+          <input id="username" name="username" required {% if auth_mode != 'oidc' %}autofocus{% endif %}
+            class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm bg-transparent">
+        </div>
+        <div>
+          <label for="password" class="block text-xs text-gray-400 mb-1">{{ _("Password") }}</label>
+          <input id="password" name="password" type="password" required
+            class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm bg-transparent">
+        </div>
+        <button type="submit"
+          class="w-full text-sm px-3 py-2 rounded {% if auth_mode == 'oidc' %}border border-gray-300 hover:bg-gray-100/10{% else %}bg-burgundy text-white hover:bg-burgundy-lo{% endif %}">
+          {{ _("Create account") if bootstrap else _("Log in") }}
+        </button>
+      </form>
+    </div>
+    <div class="flex justify-center gap-3 mt-3 text-xs text-gray-400">
+      <a href="{{ url_for('set_language', lang='en') }}" class="hover:underline">English</a>
+      <span>·</span>
+      <a href="{{ url_for('set_language', lang='fr') }}" class="hover:underline">Français</a>
+    </div>
+  </main>
+</body>
+</html>

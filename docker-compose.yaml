@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Reference deployment for Trobar.
+#
+# Minimum setup:
+#   cp .env.example .env    # set MUSIC_VOLUME, ADMIN_USERNAME at least
+#   docker compose up -d --build
+#
+# Run it behind your own TLS-terminating reverse proxy — do not expose
+# port 5000 to the internet directly (see the docs site — Operations →
+# Networking — and SECURITY.md).
+
+services:
+  trobar:
+    build: .
+    container_name: trobar
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+      # Optional (#301) — DEBUG/INFO/WARNING/ERROR/CRITICAL, default WARNING.
+      # Applies to Trobar's own logging only, never the HTTP libraries
+      # underneath, so DEBUG can't write provider credentials into your logs.
+      LOG_LEVEL: ${LOG_LEVEL:-WARNING}
+      DATA_DIR: /data
+      MUSIC_ROOT: /music
+      # Optional (#285 playlist mirroring) — only meaningful if MIRROR_VOLUME
+      # is set below; unused otherwise. Writable, unlike /music above.
+      MIRROR_ROOT: /mirrors
+      AUTH_MODE: ${AUTH_MODE:-local}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:?set ADMIN_USERNAME in .env}
+      # Security-relevant — see .env.example and docs Operations > Networking.
+      TROBAR_TRUSTED_PROXY: ${TROBAR_TRUSTED_PROXY:-*}
+      # Only for AUTH_MODE=oidc — see README "Auth modes".
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      # Optional integrations — all also configurable later from the
+      # Administration panel.
+      LASTFM_API_KEY: ${LASTFM_API_KEY:-}
+    volumes:
+      # Database, caches, avatars — persistent, back it up.
+      - ${DATA_VOLUME:-./data}:/data
+      # Your music library, read-only. Trobar never writes to it.
+      - ${MUSIC_VOLUME:?set MUSIC_VOLUME in .env to your music folder}:/music:ro
+      # Optional (#285 playlist mirroring) — writable, unlike the music
+      # mount above. Defaults to a local ./mirrors folder so this line
+      # doesn't require MIRROR_VOLUME to be set; harmless and unused
+      # unless you also set a mirror folder in Administration >
+      # Configuration.
+      - ${MIRROR_VOLUME:-./mirrors}:/mirrors
+    ports:
+      # Bind to localhost and put your reverse proxy in front.
+      - "127.0.0.1:5000:5000"

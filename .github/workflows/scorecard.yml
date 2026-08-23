@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# OpenSSF Scorecard (#123): scores repo security posture (Branch-Protection,
+# Dependency-Update-Tool, SAST, Token-Permissions, Pinned-Dependencies, …) and
+# publishes the result to the Security tab + the public Scorecard API (the
+# badge). Weekly + on push to main. Treat the score as a punch-list, not a
+# vanity metric.
+#
+# NOTE (org Actions allowlist): ossf/scorecard-action and github/codeql-action
+# must be allowlisted in the org's Actions policy or this workflow will
+# startup_failure (same policy that makes gitleaks run as a plain `run:` step).
+# Branch-Protection scoring is left inconclusive on purpose: reporting it
+# fully needs a classic PAT with repo scope, and a long-lived credential
+# on a public repository is not worth one line of a score.
+name: Scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "27 6 * * 1" # Mondays, 06:27 UTC
+  push:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload the SARIF result to code scanning
+      id-token: write # publish results to the Scorecard API (badge)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        with:
+          sarif_file: results.sarif

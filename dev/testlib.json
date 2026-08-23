@@ -1,0 +1,27 @@
+{
+  "_comment": "Single source of truth for the dev environment's fake library. Both dev/gen (generates tagged FLACs) and dev/lastfm-mock (canned Last.fm responses) read this, so the mock's top-albums / similar-artists always reference music that actually exists. All names are invented — no real artists/albums, nothing copyrighted.",
+  "user": { "name": "devlistener", "playcount": 4531 },
+  "artists": [
+    { "name": "Aphelion", "similar": ["Nebula Drift", "Glass Meridian", "Paper Cartographer"],
+      "albums": [
+        { "title": "Event Horizon", "year": 2019, "playcount": 142, "tracks": ["Singularity", "Redshift", "Tidal Lock"] },
+        { "title": "Parallax", "year": 2022, "playcount": 40, "tracks": ["Apoapsis", "Perigee"] }
+      ] },
+    { "name": "Nebula Drift", "similar": ["Aphelion", "Cinder & Ash"],
+      "albums": [
+        { "title": "Slow Collapse", "year": 2020, "playcount": 98, "tracks": ["Ion Trail", "Halo", "Event Boundary"] }
+      ] },
+    { "name": "Glass Meridian", "similar": ["Aphelion", "Paper Cartographer"],
+      "albums": [
+        { "title": "Latitude", "year": 2021, "playcount": 71, "tracks": ["Meridian", "Solstice"] }
+      ] },
+    { "name": "Cinder & Ash", "similar": ["Nebula Drift"],
+      "albums": [
+        { "title": "Emberwake", "year": 2018, "playcount": 55, "tracks": ["Kindling", "Smoulder", "Ashfall"] }
+      ] },
+    { "name": "Paper Cartographer", "similar": ["Glass Meridian", "Aphelion"],
+      "albums": [
+        { "title": "Foldlines", "year": 2023, "playcount": 22, "tracks": ["Contour", "Isobar"] }
+      ] }
+  ]
+}

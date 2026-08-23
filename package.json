@@ -1,0 +1,17 @@
+{
+  "name": "trobar-server-dev-tools",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Node-based dev tooling for trobar-server: Playwright e2e tests, ESLint for the inline template JS",
+  "scripts": {
+    "test:e2e": "playwright test --config=e2e/playwright.config.js",
+    "lint:inline-js": "python3 dev/check_inline_js.py"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.62.1",
+    "eslint": "10.8.0",
+    "globals": "17.8.0"
+  }
+}

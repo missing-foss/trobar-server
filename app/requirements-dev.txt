@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Dev/CI-only tooling — not needed at runtime, so kept out of requirements.txt
+# (which the Docker image installs from).
+mypy==2.3.0
+coverage==7.15.2
+reuse==6.2.0

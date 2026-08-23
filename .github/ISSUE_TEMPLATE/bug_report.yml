@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+name: Bug report
+description: Something broke or behaves wrongly
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Server version/commit, and app version if a client is involved (e.g. v2.4.0)
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Deployment auth mode
+      options: [local, oidc, forward]
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Active provider
+      options: [filesystem, roon, jellyfin, subsonic]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "`docker logs trobar` around the failure, or the client's error line. Redact tokens."
+      render: text
