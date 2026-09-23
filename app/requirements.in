@@ -20,3 +20,9 @@ waitress>=3.0.2
 # shells out to the ffmpeg already installed for transcode.py), not the
 # fpcalc CLI — verified directly, see the #200 plan.
 pyacoustid>=1.3.1
+# Public YouTube Music playlist import (ytmusic_client.py). Unofficial: it
+# talks to YouTube Music's internal endpoints, which is the whole of what
+# made this feature a decision rather than a task — see that module's
+# docstring and docs/providers/youtube-music.md. Imported lazily, so an
+# install without it loses that one feature and nothing else.
+ytmusicapi>=1.12.1

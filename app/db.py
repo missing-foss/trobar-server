@@ -175,6 +175,50 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_playlist_tracks_playlist
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_playlist_tracks_identity
     ON unresolved_playlist_tracks(playlist_id, artist, title, album);
 
+-- One row per public playlist URL a user has subscribed to. Deliberately
+-- NOT a provider connection: there is nothing to authenticate, so there is
+-- no credential column here and no entry in app_config -- a subscription IS
+-- the whole configuration. Per-user rather than instance-wide, matching how
+-- a linked Tidal/Spotify account is scoped, so the playlists it produces
+-- get owner_user_id set and start unshared.
+--
+-- external_id is the playlist id parsed out of the URL and is what is
+-- actually fetched; `url` is kept verbatim purely so the UI can show the
+-- user what they pasted. The unique index is on the id rather than the URL,
+-- because the same playlist has several URL spellings (music. vs www., a
+-- /watch?v=..&list=.. address-bar copy) and re-pasting one of them must
+-- update the existing subscription rather than create a rival second one
+-- pointing at the same playlist.
+--
+-- last_error is the sticky "this stopped working" state, not a log: a fetch
+-- that fails leaves the already-synced playlist rows alone (playlist_sync's
+-- prune protection) and records why here, so the failure is visible in the
+-- UI instead of showing up as a playlist that mysteriously stopped
+-- changing. It is cleared on the next successful fetch.
+--
+-- last_track_count/last_matched_count exist for one specific bad outcome:
+-- a playlist of hour-long mix videos parses fine and matches nothing, and
+-- without the pair of numbers the result is indistinguishable from a
+-- successful import of a playlist you happen to own none of.
+--
+-- STRICT (#298): a new table, so this costs nothing.
+CREATE TABLE IF NOT EXISTS playlist_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT,
+    last_synced_at TEXT,
+    last_error TEXT,
+    last_error_at TEXT,
+    last_track_count INTEGER,
+    last_matched_count INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_playlist_subscriptions_identity
+    ON playlist_subscriptions(owner_user_id, provider, external_id);
+
 -- #494: one row per (artist, album) Lidarr has ever been asked about, on
 -- behalf of ANY playlist's "Request missing albums" toggle -- deliberately
 -- NOT scoped per-playlist (no playlist_id here at all) and NOT stored on
@@ -635,6 +679,19 @@ _MIGRATIONS = [
     ("devices", "reported_free_bytes", "INTEGER"),
     ("devices", "reported_total_bytes", "INTEGER"),
     ("devices", "free_bytes_reported_at", "TEXT"),
+    # Bytes of music already in the sync folder that Trobar did not put
+    # there. "Max music size" is the total a user allows in that folder, so
+    # this has to come off the budget -- without it the real footprint can
+    # exceed the configured limit from the first sync, which is what a fresh
+    # install pointed at an existing folder does.
+    #
+    # NULL is "never reported", NOT zero, and the two must stay
+    # distinguishable: every device enrolled before the client learned to
+    # report this has NULL, and reading that as "no foreign content" would
+    # silently claim a measurement nobody made. The timestamp is what says
+    # which of the two a NULL is, and how stale a number is.
+    ("devices", "reported_foreign_bytes", "INTEGER"),
+    ("devices", "foreign_bytes_reported_at", "TEXT"),
     ("tracks", "year", "INTEGER"),
     # original release year stays in `year` (what the album list
     # sorts by); reissue_year is the file's own date/pressing year, shown
@@ -906,6 +963,19 @@ _MIGRATIONS = [
     # how the other Playlists/Library view preferences already persist.
     # 0 = today's behaviour (every playlist shown, unchanged).
     ("users", "hide_zero_match_playlists", "INTEGER NOT NULL DEFAULT 0"),
+    # Re-pairing: which existing device this enrollment code re-attaches to.
+    # NULL is the original behaviour and the common case -- redeeming mints a
+    # brand-new device. Non-NULL means "this code hands the caller back the
+    # device it names", so an app reinstalled on the same phone recovers its
+    # selections, track state and settings instead of orphaning them.
+    #
+    # Nullable and additive on purpose: every existing row and every code minted
+    # by the ordinary "Add device" flow keeps meaning exactly what it meant.
+    # ON DELETE CASCADE so deleting a device also drops any outstanding code
+    # pointing at it, which would otherwise be a grant that can never be
+    # satisfied.
+    ("enrollment_grants", "device_id",
+     "INTEGER REFERENCES devices(id) ON DELETE CASCADE"),
     # #189 second sink: a Subsonic/Navidrome API mirror, parallel to the
     # mirror_* filesystem columns above rather than a shared/normalized
     # shape — each sink's "where did we last write, and under what id"
@@ -1517,6 +1587,33 @@ def get_mirror_folder() -> Path | None:
     finally:
         conn.close()
     path_str = override or os.environ.get("MIRROR_ROOT")
+    return Path(path_str) if path_str else None
+
+
+def get_extra_playlist_folder() -> Path | None:
+    """One extra folder walked for `.m3u`/`.m3u8` alongside MUSIC_ROOT,
+    for players that keep their playlists in a directory of their own
+    rather than inside the music library — and equally for a folder the
+    user exports playlists into by hand.
+
+    Same override-over-env-var precedence and same "unset means not
+    configured" contract as get_mirror_folder() above — this is the read
+    side of the pair that one is the write side of. Read side only:
+    filesystem_client never writes here.
+
+    One folder rather than a list: it keeps the playlist id derived from
+    the folder-relative path alone, which stays stable across an admin
+    edit in a way an index into a list would not. Two players are handled
+    by mounting both under this one folder.
+
+    get_conn() per call, like get_mirror_folder() — an admin edit takes
+    effect on the next sync with no restart."""
+    conn = get_conn()
+    try:
+        override = get_config(conn, "extra_playlist_folder")
+    finally:
+        conn.close()
+    path_str = override or os.environ.get("EXTRA_PLAYLIST_ROOT")
     return Path(path_str) if path_str else None
 
 

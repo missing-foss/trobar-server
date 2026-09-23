@@ -36,18 +36,31 @@ is ready the moment that happens —.
 
 ## YouTube Music
 
-Won't build. There's no official API for the YouTube *Music* library
-specifically — only the general YouTube Data API, which lists YouTube
-playlists of videos ("Artist – Song (Official Video)"), not clean
-artist/title/album data our matcher needs. The only route that reaches the
-actual YT Music library is `ytmusicapi` and similar, which talk to YouTube
-Music's internal, unofficial endpoints — reverse-engineered, not sanctioned,
-regardless of how the session is authenticated. Access here is also
-tightening rather than opening (Google removed YT Music's own OAuth support
-in late 2024).
+**This entry is about a YouTube Music *provider* — your library, your own
+playlists, a signed-in session. That is still won't-build.** Importing a
+*public* playlist by link is a different and much smaller thing, it needs
+no account at all, and it is supported: see
+[YouTube Music](youtube-music.md).
 
-**What would change this:** nothing on the horizon — this is the one entry
-on this page without a plausible reopening. See.
+Why the provider stays out. There is no official API for the YouTube
+*Music* library — only the general YouTube Data API, which lists YouTube
+playlists of videos ("Artist – Song (Official Video)") rather than the
+clean artist/title data our matcher needs. The only route that reaches the
+YouTube Music library is `ytmusicapi` and similar, talking to internal,
+unofficial endpoints — reverse-engineered, not sanctioned, regardless of
+how the session is authenticated. Access there is tightening rather than
+opening (Google removed YT Music's own OAuth support in late 2024), and a
+provider is the shape that would depend on all of it staying put: linked
+accounts, stored credentials, a whole integration to keep working.
+
+The link importer leans on the same unofficial endpoints, and its own page
+says so before it says anything else. What it does not do is build a
+provider on them — nothing is stored, nothing is written, no account is
+involved, and the day the endpoint changes you lose an import rather than
+an integration. Read that page before relying on it.
+
+**What would change this entry:** a genuine, sanctioned API for the YouTube
+Music library. Nothing on the horizon suggests one.
 
 ## Apple Music
 

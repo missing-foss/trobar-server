@@ -58,6 +58,13 @@ produced them. Your library, selections, users, and devices are untouched.
 - [Spotify](spotify.md) — per-user OAuth linking (**validation pending** — see
   the page).
 
+## Public playlists by link
+
+- [YouTube Music](youtube-music.md) — paste the link to a public playlist and
+  its tracks are matched against your library. No account and no credentials,
+  for you or for the server. Built on an **unofficial** interface, which the
+  page explains before anything else — read it before relying on this.
+
 ### Services with no direct integration (Roon only)
 
 Two services Roon supports as backends — **KKBOX** and **Qobuz** — have no

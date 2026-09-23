@@ -114,14 +114,26 @@ for (const theme of ["dark", "light"]) {
   test(`playlists mirror picker has no WCAG A/AA violations (${theme})`, async ({ page }) => {
     await page.goto("/#/home");
     await setTheme(page, theme);
-    // goToTab('playlists') kicks off its own loadPlaylists() fetch against
-    // the real (empty) backend — setting the mock array in the SAME
-    // evaluate() call raced that fetch's resolution and lost, clobbering
-    // the seeded row back to [] a few hundred ms later (caught via the
-    // failing click's page-snapshot still showing the "No synced
-    // playlists yet" empty state). Two separate evaluate() calls, with the
-    // tab switch's own fetch given a moment to land first, same ordering
-    // gotoPlaylists() in playlists.spec.js already relies on.
+    // Two separate evaluate() calls, not one: the seeded array raced a
+    // loadPlaylists() response and lost, clobbering the seeded row back to
+    // [] a few hundred ms later (caught via the failing click's
+    // page-snapshot still showing the "No synced playlists yet" empty
+    // state).
+    //
+    // The race is real; an earlier version of this comment named the wrong
+    // cause and is corrected here (#40). goToTab('playlists') does NOT
+    // issue a fetch of its own: it calls applyHistoryState({tab:
+    // 'playlists', selectedArtist: null, ...}), which reaches loadAlbumsFor
+    // only when selectedArtist is set and loadSuggestions only when the tab
+    // is 'lastfm'. Neither fires here and nothing on that path reaches
+    // loadPlaylists().
+    //
+    // What this ordering actually waits out is init()'s OWN start-up load,
+    // which init() starts without awaiting -- the same in-flight response
+    // that gotoPlaylists() in playlists.spec.js counts rather than sleeps
+    // through. Naming the wrong mechanism mattered because the fix for the
+    // real one is different: you cannot avoid a fetch that was never
+    // issued, you can only wait for the one that was.
     await page.evaluate(() => {
       window.Alpine.$data(document.querySelector("[x-data]")).goToTab("playlists");
     });

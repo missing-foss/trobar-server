@@ -68,7 +68,10 @@ monitoring/automation surface rather than a sync target.
 - It is **not** a general-purpose public API. The device API
  (`/api/device/*`) is for the sync clients and is a different, unrelated
   contract — a different credential, different rate-limit bucket, and not
-  meant for external tools at all.
+  meant for external tools at all. The same is true of the
+  [App API](app-api.md) (`/api/app/*`), which the phone calls with its
+  device token to browse, stage and send — a contract for the sync
+  clients' own screens, not for external tools either.
 
 ## Creating and revoking a token
 
@@ -129,6 +132,8 @@ what an admin session already sees):
 | `reported_free_bytes` | integer or `null` | See [null semantics](#null-semantics) below. |
 | `reported_total_bytes` | integer or `null` | Same caveat as `reported_free_bytes`. |
 | `free_bytes_reported_at` | string or `null` | Timestamp of the last storage report; `null` alongside the two fields above. |
+| `reported_foreign_bytes` | integer or `null` | Bytes of music already in the device's sync folder that Trobar did not put there. It **counts against `max_size_bytes`**, which is a limit on the folder rather than on Trobar's own share of it — so a device can be at its limit while Trobar holds very little of it. `null` ≠ `0` — see [null semantics](#null-semantics). |
+| `foreign_bytes_reported_at` | string or `null` | Timestamp of the last such report — the only way to tell a current figure from a stale one. `null` alongside the field above. |
 | `created_at` | string | |
 | `last_seen_at` | string or `null` | |
 | `source_of_truth` | string | `"server"` or `"device"` — which side's manifest wins on a mismatch. |
@@ -178,6 +183,14 @@ bucket by mistake:
   reports no storage data at all, ever. Treat this as **unavailable by
   design**, not as data that hasn't arrived yet — a consumer that waits
   for it will wait forever.
+- **`reported_foreign_bytes` / `foreign_bytes_reported_at` both `null`** — the
+  device has never told the server what else is in its music folder. Two
+  causes with the same shape: an app older than the feature, and any client
+  that does not report it at all (the Garmin watch, again by design). `null`
+  is **not** zero: zero would mean the folder was measured and holds nothing
+  but Trobar's own files, and the server's own budget keeps the two apart
+  rather than assuming an unmeasured folder is empty. A consumer that
+  substitutes zero shows a full folder as empty.
 - **`unknown_track_count: null`** — the count only exists once a device
   has completed the re-enrollment manifest handshake, in which it uploads
   a list of what's actually on it. The desktop and Android clients both do

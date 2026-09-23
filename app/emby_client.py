@@ -507,8 +507,10 @@ def mirror_create_or_replace_playlist(
       from GET .../Items, not the track's own `Id` — Emby's response
       carries both and they're genuinely different values (confirmed live:
       deleting by the track Id silently removed nothing). Jellyfin's
-      equivalent response has no such second id, so that sink uses the
-      track Id directly; this one cannot.
+      equivalent response does carry a `PlaylistItemId`, but it comes back
+      equal to the item's own Id — measured on both 10.11.11 and 12.0.0 —
+      so it identifies the track rather than the entry, and that sink uses
+      the track Id directly. This one cannot.
 
     A stale/nonexistent remote_id does NOT surface cleanly from the replace
     path itself the way Jellyfin's does — GET .../Items for a bad playlist

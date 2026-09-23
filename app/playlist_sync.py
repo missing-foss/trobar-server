@@ -46,6 +46,7 @@ import roon_client
 import spotify_client
 import sync_state
 import tidal_client
+import ytmusic_client
 
 _log = logging.getLogger(__name__)
 
@@ -119,11 +120,133 @@ def start_sync(provider, provider_id: str) -> dict:
     return {"status": "started", "job_id": job_id}
 
 
+_SUBSCRIPTION_CLIENTS = {ytmusic_client.PROVIDER_ID: ytmusic_client}
+
+
+def subscription_playlist_key(sub_id: int) -> str:
+    """The `playlists.source_playlist_id` a subscription's row carries.
+
+    The subscription's own primary key, NOT the external playlist id, and
+    that is deliberate. _sync_one_playlist() finds a row by
+    (source_provider, source_playlist_id) with no owner in the lookup, so
+    two household members who subscribe to the same public URL would
+    otherwise land on one shared row that changes hands on every sync --
+    each run reassigning owner_user_id to whoever synced last, and resetting
+    the other's sharing choice with it (see the owner_changed branch
+    there). Keyed on the subscription instead, each subscriber gets their
+    own playlist, which is also what the per-user ownership model already
+    promises everywhere else."""
+    return str(sub_id)
+
+
+def sync_one_subscription(conn, sub, *, subsonic_mirror_cache: dict | None = None,
+                          jellyfin_mirror_cache: dict | None = None,
+                          emby_mirror_cache: dict | None = None) -> dict:
+    """Fetches one URL subscription and syncs it, recording the outcome on
+    the subscription row either way.
+
+    Returns {"status", "title", "tracks", "matched"} -- `status` is "ok",
+    "unavailable" (the remote playlist is gone, private, or never existed)
+    or "error" (anything else, including the unofficial endpoint changing
+    shape). On a non-ok status NOTHING about the already-synced playlist is
+    touched: no rows deleted, no tracks cleared, the previous import left
+    exactly as it was. That is the whole contract of this function, and the
+    caller's prune protection is its other half -- a playlist somebody has
+    already synced onto a device must not evaporate because a
+    reverse-engineered endpoint had a bad afternoon.
+
+    `tracks`/`matched` are recorded on the row as well as returned. A
+    playlist of hour-long mix videos parses perfectly and matches nothing,
+    and 0-of-79 is the only thing that tells a user that apart from a
+    successful import of music they simply do not own."""
+    client = _SUBSCRIPTION_CLIENTS[sub["provider"]]
+    fetched = client.get_playlist_tracks(sub["title"] or "", sub["external_id"])
+    if fetched["status"] != "ok":
+        status = "unavailable" if fetched["status"] in ("unavailable", "not_found") else "error"
+        conn.execute(
+            "UPDATE playlist_subscriptions SET last_error = ?, "
+            "last_error_at = datetime('now') WHERE id = ?",
+            (status, sub["id"]),
+        )
+        conn.commit()
+        return {"status": status, "title": sub["title"], "tracks": 0, "matched": 0}
+
+    # The title is the remote playlist's, re-read on every sync so a rename
+    # at the source follows through -- the same thing an id-keyed row gets
+    # from any other provider.
+    title = fetched.get("playlist") or sub["title"] or sub["external_id"]
+    outcome = _sync_one_playlist(
+        conn, client, sub["provider"], title,
+        source_playlist_id=subscription_playlist_key(sub["id"]),
+        owner_user_id=sub["owner_user_id"], prefetched=fetched,
+        subsonic_mirror_cache=subsonic_mirror_cache,
+        jellyfin_mirror_cache=jellyfin_mirror_cache,
+        emby_mirror_cache=emby_mirror_cache,
+    )
+    tracks, matched = outcome if outcome is not None else (0, 0)
+    conn.execute(
+        "UPDATE playlist_subscriptions SET title = ?, last_synced_at = datetime('now'), "
+        "last_error = NULL, last_error_at = NULL, last_track_count = ?, "
+        "last_matched_count = ? WHERE id = ?",
+        (title, tracks, matched, sub["id"]),
+    )
+    conn.commit()
+    return {"status": "ok", "title": title, "tracks": tracks, "matched": matched}
+
+
+def delete_subscription(conn, sub_id: int) -> None:
+    """Removes a subscription and the playlist it produced.
+
+    Unlike a fetch failure -- which must leave everything alone -- this is
+    the user saying "take it away", so the playlist row goes through the
+    same removal path a source-side deletion would, devices included."""
+    row = conn.execute(
+        "SELECT id, provider FROM playlist_subscriptions WHERE id = ?", (sub_id,)
+    ).fetchone()
+    if row is None:
+        return
+    pl = conn.execute(
+        "SELECT id FROM playlists WHERE source_provider = ? AND source_playlist_id = ?",
+        (row["provider"], subscription_playlist_key(sub_id)),
+    ).fetchone()
+    if pl is not None:
+        _remove_playlist_row(conn, pl["id"])
+    conn.execute("DELETE FROM playlist_subscriptions WHERE id = ?", (sub_id,))
+    conn.commit()
+
+
+def _remove_playlist_row(conn, playlist_id: int) -> None:
+    """Deletes one playlists row and everything that must go with it.
+
+    Any playlist-type selection targeting it goes through the normal
+    delete_selection() path so affected devices are actually told to remove
+    the files, same as an explicit user deletion -- not just silently
+    orphaned to resolve to nothing on the next sync. #285/#189: every
+    sink's mirror is deleted BEFORE the row itself goes away, so a removed
+    golden source doesn't leave an orphaned mirror file or remote playlist
+    behind.
+
+    Extracted so the stale-cleanup pass and the deliberate removal of a URL
+    subscription share one definition of "and everything that goes with
+    it". They had drifted apart in every previous provider addition; the
+    subscription case is the first where a user, not a source, triggers the
+    removal."""
+    for sel in conn.execute(
+        "SELECT id FROM selections WHERE type = 'playlist' AND target = ?", (str(playlist_id),)
+    ).fetchall():
+        sync_state.delete_selection(conn, sel["id"])
+    mirror.delete_mirror(conn, playlist_id)
+    mirror_subsonic.delete_mirror(conn, playlist_id)
+    mirror_jellyfin.delete_mirror(conn, playlist_id)
+    mirror_emby.delete_mirror(conn, playlist_id)
+    conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+
+
 def _sync_one_playlist(
     conn, provider, provider_id: str, title: str, source_playlist_id: str | None = None,
     owner_user_id: int | None = None, subsonic_mirror_cache: dict | None = None,
     jellyfin_mirror_cache: dict | None = None, emby_mirror_cache: dict | None = None,
-    **provider_kwargs
+    prefetched: dict | None = None, **provider_kwargs
 ) -> tuple[int, int] | None:
     """Syncs a single playlist's tracks from `provider` into
     playlists/playlist_tracks. Returns (track_count, matched_count), or None
@@ -156,8 +279,19 @@ def _sync_one_playlist(
     creates ONCE per run and passes to every one of its
     _sync_one_playlist() calls, so N mirrored playlists share one target
     tag-index build per sink instead of each triggering their own full
-    library walk against that sink's mirror target."""
-    result = provider.get_playlist_tracks(title, source_playlist_id, **provider_kwargs)
+    library walk against that sink's mirror target.
+
+    `prefetched` is the provider's get_playlist_tracks() response, already
+    obtained by the caller, used instead of calling it again. Only the
+    URL-subscription source passes it, and for a specific reason: a
+    subscription is one playlist rather than a listing, so its TITLE only
+    becomes known by fetching it -- and the title is an argument here.
+    Without this the caller would have to fetch once to learn the title and
+    this function would then fetch the same playlist a second time to get
+    the tracks, against an unofficial endpoint, for every playlist on every
+    sync."""
+    result = prefetched if prefetched is not None else \
+        provider.get_playlist_tracks(title, source_playlist_id, **provider_kwargs)
     if result["status"] != "ok":
         return None
 
@@ -518,6 +652,10 @@ def sync_playlists(provider, provider_id: str) -> dict:
     tidal_failed_user_ids: set[int] = set()
     # #10 Part B: same per-owner protection for Spotify (see the Spotify block).
     spotify_failed_user_ids: set[int] = set()
+    # Same protection for URL subscriptions, keyed on the subscription
+    # rather than on a user: one subscription failing must not remove the
+    # playlist it produced, and a user may hold several.
+    ytmusic_failed_ids: set[str] = set()
     # #128: only providers we authoritatively listed this run are eligible for
     # stale-cleanup. The primary joins only when its listing succeeded;
     # filesystem/tidal add themselves below on their own success.
@@ -848,6 +986,47 @@ def sync_playlists(provider, provider_id: str) -> dict:
             if linked:
                 provider_ids.add("spotify")
 
+        # Public playlists subscribed to by URL. Unlike the two blocks
+        # above there is no credential to refresh, nothing to link and no
+        # admin configuration to gate on -- a subscription row IS the whole
+        # configuration -- so this runs whenever one exists, under whatever
+        # provider is active. With none, not a single external call is
+        # made: the query returns nothing and the client module is never
+        # even imported (its own import of ytmusicapi is function-local).
+        #
+        # Each subscription is ONE playlist, so there is no listing step
+        # and no listing failure to distinguish from an empty listing --
+        # the fetch either produces the playlist or reports why not, and
+        # sync_one_subscription records that on the row.
+        subscriptions = conn.execute(
+            "SELECT id, owner_user_id, provider, external_id, title "
+            "FROM playlist_subscriptions ORDER BY id"
+        ).fetchall()
+        for sub in subscriptions:
+            if sub["provider"] not in _SUBSCRIPTION_CLIENTS:
+                continue  # a row from a newer version, or a removed source
+            provider_ids.add(sub["provider"])
+            src_id = subscription_playlist_key(sub["id"])
+            # Named apart from the `outcome` the provider blocks above use:
+            # that one is a (tracks, matched) tuple-or-None, this one is a
+            # summary dict, and they are in the same function scope.
+            sub_outcome = sync_one_subscription(
+                conn, sub, subsonic_mirror_cache=subsonic_mirror_cache,
+                jellyfin_mirror_cache=jellyfin_mirror_cache,
+                emby_mirror_cache=emby_mirror_cache)
+            if sub_outcome["status"] != "ok":
+                # #71's lesson, and the one this source is most exposed to:
+                # an unofficial endpoint refusing us today must not read as
+                # "the user deleted this playlist". Not listing its key
+                # leaves the row unprotected by the pass below, so protect
+                # it explicitly instead.
+                ytmusic_failed_ids.add(src_id)
+                continue
+            listed_keys.add(_playlist_key(sub["provider"], src_id, sub_outcome["title"]))
+            playlist_count += 1
+            track_count += sub_outcome["tracks"]
+            matched_count += sub_outcome["matched"]
+
         # #26: only meaningful once this run has actually populated both
         # sides — a Roon sync (this pass, or the per-profile merge above)
         # and at least one linked Tidal account's playlists (the block
@@ -883,18 +1062,11 @@ def sync_playlists(provider, provider_id: str) -> dict:
             # #10: same per-owner protection for Spotify rows.
             if row["source_provider"] == "spotify" and row["owner_user_id"] in spotify_failed_user_ids:
                 continue
-            for sel in conn.execute(
-                "SELECT id FROM selections WHERE type = 'playlist' AND target = ?", (str(row["id"]),)
-            ).fetchall():
-                sync_state.delete_selection(conn, sel["id"])
-            # #285/#189: delete every sink's mirror BEFORE the row itself
-            # goes away, so a removed golden source doesn't leave an
-            # orphaned mirror file or remote playlist behind.
-            mirror.delete_mirror(conn, row["id"])
-            mirror_subsonic.delete_mirror(conn, row["id"])
-            mirror_jellyfin.delete_mirror(conn, row["id"])
-            mirror_emby.delete_mirror(conn, row["id"])
-            conn.execute("DELETE FROM playlists WHERE id = ?", (row["id"],))
+            # Same for a subscription whose fetch failed this run.
+            if row["source_provider"] in _SUBSCRIPTION_CLIENTS \
+                    and row["source_playlist_id"] in ytmusic_failed_ids:
+                continue
+            _remove_playlist_row(conn, row["id"])
             removed_count += 1
         # #93: reclaim orphaned NULL-source_provider ghosts the scan above
         # can't see (selection-safe — see the helper).

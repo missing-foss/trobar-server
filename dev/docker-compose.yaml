@@ -83,8 +83,16 @@ services:
   # Jellyfin for testing the Jellyfin provider. First-run: complete the setup
   # wizard at http://localhost:8096, add /music as a Music library, mint an API
   # key, then wire it into Trobar's Administration panel (see dev/README.md).
+  #
+  # Pinned, not floating. `latest` moved to the 12.x major on 2026-09-08; it had
+  # resolved to 10.11.11 since June, so that is what an existing jellyfin-config
+  # volume holds. Jellyfin 12's first boot rewrites the database schema in place
+  # with no way back but a manual backup, so a floating tag turns an ordinary
+  # `docker compose pull` into a one-way migration nobody asked for. Pinning to
+  # what those volumes already contain changes nothing for anyone.
+  # Changing this pin is a deliberate act — read dev/README.md first.
   jellyfin:
-    image: jellyfin/jellyfin:latest
+    image: jellyfin/jellyfin:10.11.11
     volumes:
       - music:/music:ro
       - jellyfin-config:/config

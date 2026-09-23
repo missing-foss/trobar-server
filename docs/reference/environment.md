@@ -46,6 +46,7 @@ reference.
 |---|---|---|
 | `ROON_HOST` / `ROON_PORT` | *(unset)* / `9330` | Roon Core address — can also be set later in the admin UI ([Roon](../providers/roon.md)) |
 | `LASTFM_API_KEY` | *(unset)* | App-wide fallback Last.fm key; each user can set their own in their profile ([Suggestions](../using/suggestions.md)) |
+| `EXTRA_PLAYLIST_ROOT` | *(unset)* | Container path to one folder outside `MUSIC_ROOT` that is also walked for `.m3u`/`.m3u8` playlists — read-only, and only meaningful with a matching volume mount; the `app_config` extra playlist folder set in Administration overrides this, the same override-over-env-var relationship `MUSIC_ROOT` has ([Filesystem — Playlists your player keeps somewhere else](../providers/filesystem.md#playlists-your-player-keeps-somewhere-else)) |
 | `MIRROR_ROOT` | *(unset)* | Container path for playlist mirroring's `.m3u` output — only meaningful with a matching writable volume mount; the `app_config` mirror folder set in Administration overrides this, same override-over-env-var relationship `MUSIC_ROOT` has ([Playlists — Mirroring](../using/playlists.md#mirroring-to-a-local-folder-a-subsonicnavidrome-server-a-jellyfin-server-or-an-emby-server)) |
 
 ## Deployment (optional)

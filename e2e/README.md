@@ -8,7 +8,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 Browser-level regression tests for things `dev/check_inline_js.py` structurally
 can't catch — it only verifies the inline `<script>` blocks *parse*, not that
-they *behave* correctly at runtime. See `image-error-recovery.spec.js` (#30):
+they *behave* correctly at runtime. See `image-error-recovery.spec.js`:
 an `<img>` bound to `@error` without a matching `@load` looks fine to every
 server-side check and still leaves the image stuck hidden in the browser after
 one failed load.
@@ -19,7 +19,7 @@ This suite doesn't start the server — point it at one with `TROBAR_BASE_URL`.
 
 `.github/workflows/ci.yml` starts a fresh instance directly (`python
 app/main.py`, `AUTH_MODE=local`), plus a mock Last.fm API on `localhost:8080`
-(#281 — see below) so the Most Played chart has real data during the
+(see below) so the Most Played chart has real data during the
 accessibility scan, and runs `npx playwright install --with-deps chromium`
 as a plain `run:` step — GitHub's runners have sudo, so that's fine there.
 
@@ -35,14 +35,30 @@ both join a dedicated bridge network — **never run the trobar container with
 5000 directly (no way to remap it away, unlike `-p`), which on this
 machine is the actual production instance's port.
 
+Two host-specific things the commands below depend on:
+
+- **Ports.** Every account has its own non-overlapping port band, stated in
+  its `~/CLAUDE.md`. Pick the published port from *your* band — the commands
+  below take it from `$E2E_PORT` rather than hardcoding one, because a port
+  that is inside one account's band is inside nobody else's.
+- **Named volumes, not bind mounts.** Docker here is rootless and the image
+  runs as uid 10001, which cannot write into a bind-mounted host directory
+  you own. The container then dies at startup with
+  `PermissionError: [Errno 13] Permission denied: '/data/flask_secret_key'`
+  before serving anything — which looks like the harness failing to come up,
+  not like a permissions problem. Named volumes are owned by the container
+  and avoid it entirely.
+
 ```bash
-# 0. A dedicated network so the two containers can resolve each other by name
+export E2E_PORT=<a port from your own band>   # see ~/CLAUDE.md
+
+# 0. A dedicated network so the containers can resolve each other by name
 #    (the default bridge network doesn't do this) — and so trobar's own port
 #    stays safely remapped via -p below, never bound to the host directly.
 docker network create trobar-e2e-net
 
-# 1. The mock Last.fm API (#281) — same one dev/'s docker-compose uses for
-#    Suggestions/auto-fit, so the Most Played chart (#267) has real data to
+# 1. The mock Last.fm API — same one dev/'s docker-compose uses for
+#    Suggestions/auto-fit, so the Most Played chart has real data to
 #    render during the scan, not just its empty-state hint.
 docker build -t lastfm-mock:e2e ./dev/lastfm-mock
 docker run --rm -d --name lastfm-mock-e2e --network trobar-e2e-net \
@@ -56,33 +72,49 @@ docker run --rm -d --name lastfm-mock-e2e --network trobar-e2e-net \
 #    fine but serves outdated app code against the current test suite,
 #    producing confusing early-test failures (e.g. a JS method the tests
 #    expect that an older template genuinely doesn't have yet) that look
-#    exactly like "the harness itself won't come up" (#244).
+#    exactly like "the harness itself won't come up".
+#
+#    -p is only so you can poke the instance from the host yourself; step 3
+#    does not need it, and you can drop it if you don't want the port at all.
 docker build -t trobar:dev .
-mkdir -p /tmp/trobar-e2e-data /tmp/trobar-e2e-music
-docker run --rm -d --name trobar-e2e-test --network trobar-e2e-net -p 5099:5000 \
+docker volume create trobar-e2e-data
+docker volume create trobar-e2e-music
+docker run --rm -d --name trobar-e2e-test --network trobar-e2e-net -p "$E2E_PORT":5000 \
   -e AUTH_MODE=local -e SESSION_COOKIE_SECURE=0 -e MUSIC_ROOT=/music -e DATA_DIR=/data \
   -e LASTFM_API_BASE=http://lastfm-mock-e2e:8080/2.0/ -e LASTFM_API_KEY=e2e-mock-key \
-  -v /tmp/trobar-e2e-data:/data -v /tmp/trobar-e2e-music:/music \
+  -v trobar-e2e-data:/data -v trobar-e2e-music:/music \
   trobar:dev
 
 # 3. Run the suite from the repo root, against it, via the Playwright image.
-#    Keep the image tag in step with package.json's @playwright/test version
-#    (currently 1.62.0) or you'll hit a "please update docker image" error.
+#    The image tag must match package.json's @playwright/test version or you
+#    get a "please update docker image" error — read it from there rather
+#    than copying a number that goes stale.
+#
+#    Joining the same bridge network and addressing the instance by container
+#    name means this needs no host networking and no published port: the two
+#    containers talk to each other directly.
+#
 #    LASTFM_MOCK_USERNAME tells global-setup.js to seed it — omit this var
 #    entirely (see the dev-sandbox note below) if you don't want that.
-docker run --rm --network host \
+pw=$(node -p "require('./package.json').devDependencies['@playwright/test']")
+docker run --rm --network trobar-e2e-net \
   -v "$(pwd)":/work -w /work \
-  -e TROBAR_BASE_URL=http://localhost:5099 \
+  -e TROBAR_BASE_URL=http://trobar-e2e-test:5000 \
   -e MUSIC_ROOT=/music \
   -e LASTFM_MOCK_USERNAME=e2e-mock-user \
-  mcr.microsoft.com/playwright:v1.62.0-noble \
+  "mcr.microsoft.com/playwright:v${pw}-noble" \
   bash -c "npm ci && npx playwright test --config=e2e/playwright.config.js"
 
 # 4. Clean up
 docker rm -f trobar-e2e-test lastfm-mock-e2e
+docker volume rm trobar-e2e-data trobar-e2e-music
 docker network rm trobar-e2e-net
-rm -rf /tmp/trobar-e2e-data /tmp/trobar-e2e-music e2e/.auth test-results
+rm -rf e2e/.auth test-results
 ```
+
+Between runs, remove `e2e/.auth` and recreate the data volume: `global-setup.js`
+bootstraps the admin account through the very first `/login` POST, so a second
+run against a volume that already has a user takes a different path.
 
 Note on `dev/docker-compose.yaml`'s own instance: `global-setup.js` bootstraps
 the admin account via the very first `/login` POST (see `login()` in

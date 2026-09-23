@@ -85,6 +85,7 @@ nav:
       - iTunes / Apple Music: providers/itunes.md
       - Tidal: providers/tidal.md
       - Spotify: providers/spotify.md
+      - YouTube Music: providers/youtube-music.md
       - Providers we don't support: providers/other.md
   - Using Trobar:
       - Library & Selections: using/library-selections.md
@@ -109,6 +110,7 @@ nav:
       - Environment Variables: reference/environment.md
       - Architecture & Sync Protocol: reference/architecture.md
       - Integration API: reference/integration-api.md
+      - App API: reference/app-api.md
       - Home Assistant Integration: reference/home-assistant.md
   - Project:
       - Why "Trobar": project/why-trobar.md

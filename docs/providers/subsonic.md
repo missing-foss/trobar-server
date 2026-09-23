@@ -43,8 +43,14 @@ Enter the connection details in the setup wizard, or later under
 (editable live, no restart):
 
 - **Server URL** — your server's base URL.
-- **Username** and **Password** — a Subsonic account on that server. Trobar
-  reads playlists only.
+- **Username** and **Password** — a Subsonic account on that server. These
+  credentials are read-only: Trobar uses them to read playlists.
+
+Trobar *can* write to a Subsonic server, as a **mirror target** — a separate
+connection you configure yourself. Mirroring creates and updates playlists on
+that server. It is off until you enable it, and never touches a playlist it did
+not create. See
+[Playlists](../using/playlists.md#mirroring-to-a-local-folder-a-subsonicnavidrome-server-a-jellyfin-server-or-an-emby-server).
 
 !!! tip
     If your server exposes more than one API dialect, use its **Subsonic**

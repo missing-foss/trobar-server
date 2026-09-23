@@ -19,15 +19,6 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 missing-foss"
 SPDX-License-Identifier = "AGPL-3.0-or-later"
 
-# dev/forbidden-terms.txt carries its own comment header explaining the format,
-# and an SPDX block on top of that would read as more preamble than content in a
-# file whose body is three lines of regex (#313).
-[[annotations]]
-path = "dev/forbidden-terms.txt"
-precedence = "aggregate"
-SPDX-FileCopyrightText = "2026 missing-foss"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
-
 # --- Third-party: bundled fonts (Google Fonts, SIL Open Font License) ---------
 [[annotations]]
 path = "app/static/fonts/**"

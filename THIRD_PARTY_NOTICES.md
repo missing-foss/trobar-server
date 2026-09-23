@@ -126,6 +126,7 @@ the Docker image:
 | roonapi | Apache-2.0 |
 | Authlib | BSD-3-Clause |
 | pyacoustid | MIT |
+| ytmusicapi | MIT |
 | audioread | MIT |
 | audioop-lts, standard-aifc, standard-chunk, standard-sunau (audioread's own dependencies — Python's `audioop`/`aifc`/`chunk`/`sunau` stdlib modules, removed in 3.13+, republished standalone) | Python Software Foundation License Version 2 |
 
@@ -177,12 +178,12 @@ below.
 The server Docker image installs **libchromaprint1** and
 **libchromaprint-tools** (via `apt-get`, Debian's own build) — the
 audio-fingerprinting shared library `app/fingerprint.py`'s `pyacoustid`
-dependency binds to, plus the `fpcalc` command-line tool it invokes, for #200's
-local-library ISRC backfill and #239's device provenance.
+dependency binds to, plus the `fpcalc` command-line tool it invokes, for the
+local-library ISRC backfill and for device provenance.
 
 `libchromaprint-tools` (`fpcalc`) is required rather than optional: the decode
 runs in that subprocess deliberately, because a malformed file can make the
-in-process path fail a native assertion and `abort()` the whole server (#329).
+in-process path fail a native assertion and `abort()` the whole server.
 Both packages come from the same chromaprint source and the same license applies. Chromaprint's own code is MIT-licensed, but it embeds parts of the
 FFmpeg library (LGPL 2.1) — per chromaprint's own `LICENSE.md`: "As a whole,
 Chromaprint should be therefore considered to be licensed under the LGPL 2.1

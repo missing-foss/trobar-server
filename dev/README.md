@@ -17,7 +17,7 @@ nothing needs root or the docker group.
 | **trobar** | http://localhost:5000 | the app, in `local` auth mode |
 | **navidrome** | http://localhost:4533 | Subsonic-API server (test the Subsonic provider) |
 | **jellyfin** | http://localhost:8096 | Jellyfin (test the Jellyfin provider) |
-| **lidarr** | http://localhost:8686 | Lidarr (test #494's "request missing albums") |
+| **lidarr** | http://localhost:8686 | Lidarr (test the "request missing albums" feature) |
 | lastfm-mock | (internal) | fake Last.fm — Suggestions / similar-artists / auto-fit with no key |
 | music-seed | (one-shot) | generates the test library, then exits |
 
@@ -64,7 +64,43 @@ These need a one-time account setup in each server, then wiring into Trobar's
 (Trobar reaches them by service name on the compose network — `navidrome` /
 `jellyfin` — not `localhost`.)
 
-## Testing Lidarr album requests (#494, optional)
+### Changing the Jellyfin version
+
+`jellyfin` is pinned to an explicit version in `dev/docker-compose.yaml` rather
+than floating on `latest`, and moving that pin is not a routine bump.
+
+Jellyfin 12.0's first boot **rewrites the existing database in place**. A manual
+backup is the only way back, and a full library scan is needed afterwards.
+Nothing prompts before it happens: starting a 12.x image against a
+`jellyfin-config` volume that a 10.11 server wrote performs the migration on
+startup, so a `docker compose pull` that quietly crosses the major is enough to
+do it.
+
+If it has already happened, remove Jellyfin's own two volumes and let it start
+fresh — `docker compose down`, then
+`docker volume rm trobar-dev_jellyfin-config trobar-dev_jellyfin-cache`, then
+`docker compose up -d`. Those two are mounted by the `jellyfin` service and by
+nothing else, so the seeded `music` library and Trobar's own data survive.
+`docker compose down -v` also clears it but destroys every volume in the
+project, including the seeded library — there is no reason to reach for it for
+a fault confined to Jellyfin.
+
+Either way Jellyfin comes back as a **new server** at its setup wizard, so the
+API key Trobar has stored no longer works: mint a fresh one and re-wire the
+provider connection.
+
+To exercise another major, add a **second** service with its own
+`jellyfin-config` / `jellyfin-cache` volumes and its own `${…_PORT:-…}` instead
+of retagging this one. They are separate instances and each needs its own
+first-run setup.
+
+One trap when picking a tag: on the 12.x line the version a server reports is
+not a tag you can pull. A server whose `/System/Info/Public` says `12.0.0` comes
+from `jellyfin/jellyfin:12.0.20260908-012347` — `jellyfin/jellyfin:12.0.0` does
+not resolve at all. Measurements are still labelled with the reported version,
+so anyone reproducing one needs the date-stamped tag as well.
+
+## Testing Lidarr album requests (optional)
 
 Lidarr is an *acquisition* target, not a library source or a mirror — it's
 never seeded from `/music`, and the whole point is requesting albums Trobar's
@@ -72,7 +108,7 @@ library doesn't have.
 
 - Open http://localhost:8686, complete the setup wizard, then Settings →
   General → Security → mint an API key. Add a root folder (any writable
-  path under `/config` works — #494's requests are monitor-only, nothing
+  path under `/config` works — Trobar's album requests are monitor-only, nothing
   actually needs to download).
 - In Trobar's admin panel, connect **Lidarr** with URL `http://lidarr:8686`
   and that API key, click "Refresh options", then pick the root

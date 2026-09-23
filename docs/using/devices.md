@@ -15,8 +15,19 @@ token — see [Clients overview](../clients/index.md#device-tokens).
 - **Type** — phone, tablet, watch, DAP, or SD card / USB storage. Mostly
   cosmetic; SD card / USB storage is what the [desktop app](../clients/desktop.md)
   targets.
-- **Storage limit** — a cap in GB. The usage bar counts what is **actually** on
-  the device (real reported sizes, including transcoded ones).
+- **Storage limit** — a cap in GB on the device's **music folder**, not on
+  Trobar's own share of it. The usage bar counts what is **actually** on the
+  device (real reported sizes, including transcoded ones), and music that was
+  already in that folder before Trobar ever synced to it counts too — it
+  appears as a separate grey slice, and Trobar fills only the space left over.
+
+    That last part needs the app to have told the server what else is in the
+    folder, which it does on sync. Until it has, the panel says so rather than
+    drawing an empty folder: a device that has never reported cannot be
+    distinguished from an empty one otherwise, and only one of those means the
+    limit is being enforced against everything there. An older app that never
+    reports it keeps the previous behaviour — the limit applies to Trobar's
+    own files alone.
 - **Auto-fit** — optionally fills the device with the owner's Last.fm
   most-played albums, whole albums at a time, frozen until refreshed. A **fill
   percentage** (default 100%, i.e. fill it all) caps auto-fit's own share of

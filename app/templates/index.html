@@ -233,7 +233,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
   <section x-show="tab==='home'" x-cloak class="grid gap-4 md:grid-cols-2">
 
     <!-- Empty state: every widget this user could see is turned off -->
-    <div x-show="visibleDashboardWidgets().length===0" class="bg-panel rounded-lg border border-gray-200 p-3 md:col-span-2 text-center">
+    <div x-show="dashboardWidgetCatalog.length>0 && visibleDashboardWidgets().length===0" class="bg-panel rounded-lg border border-gray-200 p-3 md:col-span-2 text-center">
       <p class="text-sm text-gray-600 mb-2">{{ _("Your dashboard is empty — every widget is turned off.") }}</p>
       <button @click="goToProfileSection('prefs')" class="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50">
         {{ _("Choose widgets") }}
@@ -748,6 +748,52 @@ SPDX-License-Identifier: AGPL-3.0-or-later
         <span x-text="loadingPlaylists ? t('syncing') : t('refreshPlaylists')"></span>
       </button>
     </div>
+    <!-- Public playlists subscribed to by URL. Yours only: what a
+         subscription produces is an ordinary playlist, and that playlist's
+         own sharing toggle is where a housemate gets access — so there is
+         nothing here for anyone but the person who added it.
+         The state line under each row is the point of the whole panel: a
+         playlist of hour-long mix videos imports perfectly and matches
+         nothing, and its URL is indistinguishable from a good one's, so
+         "0 of 79" has to be visible rather than inferred from a playlist
+         that looks empty. -->
+    <div class="mb-3 pb-3 border-b border-gray-100">
+      <label for="playlist-subscription-url" class="block text-xs text-gray-600 mb-1">
+        {{ _("Add a public playlist by link") }}</label>
+      <div class="flex flex-col sm:flex-row gap-2">
+        <input id="playlist-subscription-url" x-model="subscriptionUrl" type="url"
+          @keydown.enter.prevent="addPlaylistSubscription()"
+          placeholder="https://music.youtube.com/playlist?list=…"
+          class="flex-1 min-w-0 border border-gray-300 rounded px-2 py-1 text-sm">
+        <button @click="addPlaylistSubscription()"
+          :disabled="subscriptionBusy || !subscriptionUrl.trim()"
+          class="shrink-0 text-xs px-3 py-1 rounded bg-metal text-white hover:bg-metal-hi disabled:opacity-50">
+          <span x-text="subscriptionBusy ? t('syncing') : '{{ _('Add') }}'"></span>
+        </button>
+      </div>
+      <p class="mt-1 text-xs text-gray-500">
+        {{ _("Public YouTube Music playlists only — no account and no sign-in. Trobar reads the playlist and matches its tracks against your own library; nothing is sent to YouTube and nothing is downloaded from it.") }}
+      </p>
+      <p x-show="subscriptionError" class="mt-1 text-xs text-red-600" x-text="subscriptionError"></p>
+      <template x-for="sub in playlistSubscriptions" :key="sub.id">
+        <div class="mt-2 flex flex-col sm:flex-row sm:items-center gap-2">
+          <div class="flex-1 min-w-0">
+            <div class="text-sm text-gray-800 truncate" x-text="sub.title || sub.url"></div>
+            <div class="text-xs truncate"
+              :class="sub.last_error ? 'text-red-600' : (sub.track_count > 0 && sub.matched_count === 0 ? 'text-amber-700' : 'text-gray-500')"
+              x-text="subscriptionStateText(sub)"></div>
+          </div>
+          <div class="shrink-0 flex gap-2">
+            <button @click="refreshPlaylistSubscription(sub)" :disabled="subscriptionBusy"
+              class="text-xs px-2 py-1 rounded border border-gray-300 hover:bg-gray-50 disabled:opacity-50">
+              {{ _("Refresh") }}</button>
+            <button @click="removePlaylistSubscription(sub)"
+              class="text-xs px-2 py-1 rounded border border-gray-300 text-red-600 hover:bg-red-50">
+              {{ _("Remove") }}</button>
+          </div>
+        </div>
+      </template>
+    </div>
     <div class="divide-y divide-gray-100">
       <template x-for="p in sortedPlaylists()" :key="p.id">
         <div>
@@ -772,7 +818,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
               <div class="text-sm text-gray-800 flex items-center gap-1.5 min-w-0">
                 <!-- #89: NULL/unrecognized source_provider falls back to a neutral music glyph instead of a blank SVG -->
                 <span class="inline-flex shrink-0"
-                  :title="({roon: 'Roon', subsonic: 'Subsonic', jellyfin: 'Jellyfin', emby: 'Emby', plex: 'Plex', lms: 'Lyrion Music Server', filesystem: 'Filesystem', tidal: 'Tidal', spotify: 'Spotify'}[p.source_provider] || p.source_provider || t('unknownProvider'))">
+                  :title="({roon: 'Roon', subsonic: 'Subsonic', jellyfin: 'Jellyfin', emby: 'Emby', plex: 'Plex', lms: 'Lyrion Music Server', filesystem: 'Filesystem', tidal: 'Tidal', spotify: 'Spotify', ytmusic: 'YouTube Music'}[p.source_provider] || p.source_provider || t('unknownProvider'))">
                   <svg viewBox="0 0 24 24" class="w-3.5 h-3.5 text-gray-400" x-html="ICONS['provider-' + p.source_provider] || ICONS['source-recent']"></svg>
                 </span>
                 <!-- #95: the golden "shared by <owner>" badge is the stronger, owner-attributed signal — suppress the weaker #72 inferred-origin icon when it's present -->
@@ -1477,6 +1523,13 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                 <button @click="regenerateAndShowQr(d)" class="text-pill-active hover:bg-indigo-50 rounded px-1.5 py-0.5">
                   {{ _("Regenerate + QR") }}
                 </button>
+                <!-- The mobile counterpart of the button above. That one shows a
+                     raw device token, which is what trobar-desktop pairs with; the
+                     Trobar app's wizard only reads enrollment codes, so a
+                     reinstalled app had no way back to its own device. -->
+                <button @click="repairDevice(d)" class="text-pill-active hover:bg-indigo-50 rounded px-1.5 py-0.5">
+                  {{ _("Re-pair in app") }}
+                </button>
                 <!-- #440: only meaningful once there's a second device to
                      pull state from -- hidden rather than disabled so a
                      single-device household never sees a button that can
@@ -1568,6 +1621,11 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                 <template x-if="storageBreakdown(d)">
                   <div class="h-1.5 bg-gray-100 rounded-full overflow-hidden flex" role="img"
                     :aria-label="storageBreakdownLabel(d)">
+                    <!-- Music already in the folder that Trobar did not put
+                         there. Drawn first and in a neutral grey: it is part
+                         of the limit but not part of what Trobar chose. -->
+                    <div class="h-full bg-gray-400" x-show="storageBreakdown(d).foreignBytes > 0"
+                      :style="'width:' + (100 * storageBreakdown(d).foreignBytes / storageBreakdown(d).maxBytes) + '%'"></div>
                     <div class="h-full bg-indigo-500"
                       :style="'width:' + (100 * storageBreakdown(d).manualBytes / storageBreakdown(d).maxBytes) + '%'"></div>
                     <div class="h-full bg-[var(--c-chart-1)]" x-show="storageBreakdown(d).autofitBytes > 0"
@@ -1583,6 +1641,14 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                 <div class="text-[11px] mt-0.5" :class="usage[d.id].over_limit ? 'text-red-600' : 'text-gray-400'"
                   x-text="usageSummary(d.id)">
                 </div>
+                <!-- Said in words, not left to a missing slice. An
+                     unmeasured folder and an empty one look identical on the
+                     bar, and only one of them means the limit is being
+                     enforced against everything in the folder. -->
+                <div x-show="usage[d.id].reported_foreign_bytes == null" class="text-[11px] mt-0.5 text-gray-400"
+                  x-text="t('foreignBytesUnmeasured')"></div>
+                <div x-show="usage[d.id].folder_over_limit" class="text-[11px] mt-0.5 text-red-600"
+                  x-text="t('folderOverLimit', {used: formatGB(usage[d.id].folder_used_bytes), max: formatGB(usage[d.id].max_size_bytes)})"></div>
                 <div x-show="usage[d.id].reported_free_bytes != null" class="text-[11px] mt-0.5"
                   :class="usage[d.id].limit_exceeds_physical_capacity ? 'text-red-600' : 'text-gray-400'"
                   x-text="t('realFreeSpace', {free: formatGB(usage[d.id].reported_free_bytes)}) + (usage[d.id].limit_exceeds_physical_capacity ? t('limitExceedsCapacitySuffix') : '')">
@@ -2032,7 +2098,26 @@ SPDX-License-Identifier: AGPL-3.0-or-later
               <span class="font-medium">{{ _("Library root:") }}</span>
               <span x-text="adminConfig.filesystem_root"></span>
             </p>
-            <div class="pt-2 mt-2 border-t border-gray-100">
+          </div>
+        </div>
+        <!-- These two are NOT gated on the filesystem provider being
+             the active one, unlike the block above. Both are merged into
+             whichever provider is active (playlist_sync.py merges
+             filesystem_client's listing unconditionally), which is what
+             the docs have always promised — the iTunes field moved out
+             here because sitting inside that block made it unreachable
+             for exactly the admins it works for. -->
+        <div class="bg-panel-b rounded-lg border border-gray-200 p-3">
+          <h3 class="text-sm font-semibold text-gray-900 mb-2">{{ _("Local playlist sources") }}</h3>
+          <p class="text-xs text-gray-500 mb-2">{{ _("Extra playlists read straight off disk and merged in alongside your provider's own, whichever provider is active. Both are optional.") }}</p>
+          <div class="text-xs text-gray-500 space-y-3">
+            <div>
+              <label for="cfg-extra-playlist-folder" class="block text-gray-500 mb-1">{{ _("Extra playlist folder (optional)") }}</label>
+              <input id="cfg-extra-playlist-folder" x-model="adminConfig.extra_playlist_folder" placeholder="/playlists"
+                class="border border-gray-300 rounded px-2 py-1 text-sm text-gray-900 w-full max-w-xs">
+              <p class="mt-1">{{ _(".m3u/.m3u8 files anywhere under your music folder are always picked up. Set this as well when a player keeps its playlists in a folder of their own outside the music library, or point it somewhere you export playlists to by hand. Read-only: Trobar never writes here. It must not overlap your music folder or the mirror output folder.") }}</p>
+            </div>
+            <div>
               <label for="cfg-itunes-library-path" class="block text-gray-500 mb-1">{{ _("iTunes/Apple Music Library.xml path (optional)") }}</label>
               <input id="cfg-itunes-library-path" x-model="adminConfig.itunes_library_path" placeholder="/music/Library.xml"
                 class="border border-gray-300 rounded px-2 py-1 text-sm text-gray-900 w-full max-w-xs">
@@ -3236,10 +3321,10 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 <div x-show="enrollModal.open" x-cloak class="fixed inset-0 bg-black/40 flex items-center justify-center z-40 p-4"
      @click.self="enrollModal.open=false">
   <div class="bg-panel rounded-lg p-4 w-full max-w-sm text-center">
-    <h3 class="font-semibold text-gray-900 mb-1">{{ _("Add a mobile device") }}</h3>
-    <p class="text-xs text-gray-500 mb-3">
-      {{ _("In the Trobar app, scan this QR or enter the code below. It works once and expires in a few minutes.") }}
-    </p>
+    <h3 class="font-semibold text-gray-900 mb-1"
+        x-text="enrollModal.deviceName ? t('repairDeviceTitle', {name: enrollModal.deviceName}) : t('addMobileDevice')"></h3>
+    <p class="text-xs text-gray-500 mb-3"
+       x-text="enrollModal.deviceName ? t('repairDeviceHelp') : t('enrollHelp')"></p>
     <canvas x-ref="enrollQrCanvas" class="mx-auto mb-3"></canvas>
     <div class="text-2xl font-mono tracking-widest mb-3" x-text="enrollModal.code"></div>
     <button @click="enrollModal.open=false" class="text-sm px-3 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700">
@@ -3528,6 +3613,11 @@ function app() {
     libraryView: 'artists',
     playlists: [],
     loadingPlaylists: false,
+    playlistSubscriptions: [],
+    subscriptionUrl: '',
+    subscriptionBusy: false,
+    subscriptionError: '',
+    subscriptionResult: null,
     loadingScan: false,
     scanResult: null,
     scanError: '',
@@ -3617,18 +3707,12 @@ function app() {
               spotify_connected: false, spotify_display_name: '', spotify_experimental_enabled: false,
               auth_mode: 'local', oidc_issuer: null, hide_zero_match_playlists: false,
               dashboard_widgets: {disabled: [], order: [], settings: {}}},
-    // The dashboard's widget registry — new widgets (e.g. #159) register here
-    // plus a matching card in the home section; nothing else needs to change.
-    // Kept in sync by hand with ADMIN_ONLY_WIDGETS in main.py.
-    dashboardWidgetCatalog: [
-      {id: 'library', adminOnly: false},
-      {id: 'devices', adminOnly: false},
-      {id: 'suggestions', adminOnly: false},
-      {id: 'recently_added', adminOnly: false},
-      {id: 'recently_released', adminOnly: false},
-      {id: 'most_played', adminOnly: false},
-      {id: 'administration', adminOnly: true},
-    ],
+    // The dashboard's widget registry, served by /api/dashboard/catalog
+    // (DASHBOARD_WIDGET_CATALOG in main.py is the one copy; the phone reads
+    // the same list). A new widget registers there plus a matching card in
+    // the home section; nothing here needs to change. Empty until
+    // loadWidgetCatalog() has answered, which init() awaits.
+    dashboardWidgetCatalog: [],
     savingProfile: false,
     profileSaved: false,
     profileError: '',
@@ -3642,7 +3726,7 @@ function app() {
     savingPassword: false,
     passwordSaved: false,
     passwordError: '',
-    adminConfig: {provider: 'roon', roon_host: '', roon_port: null, subsonic_url: '', subsonic_username: '', subsonic_password: '', jellyfin_url: '', jellyfin_api_key: '', jellyfin_username: '', emby_url: '', emby_api_key: '', emby_username: '', plex_url: '', plex_token: '', lms_url: '', lms_username: '', lms_password: '', filesystem_root: '', itunes_library_path: '', mirror_folder: '', mirror_subsonic_url: '', mirror_subsonic_username: '', mirror_subsonic_password: '', mirror_subsonic_state: 'disconnected', mirror_jellyfin_url: '', mirror_jellyfin_api_key: '', mirror_jellyfin_username: '', mirror_jellyfin_state: 'disconnected', mirror_emby_url: '', mirror_emby_api_key: '', mirror_emby_username: '', mirror_emby_state: 'disconnected', lidarr_url: '', lidarr_api_key: '', lidarr_state: 'disconnected', lidarr_root_folder_path: '', lidarr_quality_profile_id: '', lidarr_metadata_profile_id: '', tidal_client_id: '', tidal_client_secret: '', spotify_client_id: '', spotify_client_secret: '', experimental_spotify_enabled: false, lastfm_api_key_default: '', audiodb_api_key: '', acoustid_api_key: '', lastfm_api_base: '', listenbrainz_api_base: '', auth_mode: '', transcode_concurrency: 1, transcode_nice_level: 10, job_retention_days: 7, scan_interval_hours: 0, next_scheduled_scan_at: null, break_glass_set: true},
+    adminConfig: {provider: 'roon', roon_host: '', roon_port: null, subsonic_url: '', subsonic_username: '', subsonic_password: '', jellyfin_url: '', jellyfin_api_key: '', jellyfin_username: '', emby_url: '', emby_api_key: '', emby_username: '', plex_url: '', plex_token: '', lms_url: '', lms_username: '', lms_password: '', filesystem_root: '', itunes_library_path: '', extra_playlist_folder: '', mirror_folder: '', mirror_subsonic_url: '', mirror_subsonic_username: '', mirror_subsonic_password: '', mirror_subsonic_state: 'disconnected', mirror_jellyfin_url: '', mirror_jellyfin_api_key: '', mirror_jellyfin_username: '', mirror_jellyfin_state: 'disconnected', mirror_emby_url: '', mirror_emby_api_key: '', mirror_emby_username: '', mirror_emby_state: 'disconnected', lidarr_url: '', lidarr_api_key: '', lidarr_state: 'disconnected', lidarr_root_folder_path: '', lidarr_quality_profile_id: '', lidarr_metadata_profile_id: '', tidal_client_id: '', tidal_client_secret: '', spotify_client_id: '', spotify_client_secret: '', experimental_spotify_enabled: false, lastfm_api_key_default: '', audiodb_api_key: '', acoustid_api_key: '', lastfm_api_base: '', listenbrainz_api_base: '', auth_mode: '', transcode_concurrency: 1, transcode_nice_level: 10, job_retention_days: 7, scan_interval_hours: 0, next_scheduled_scan_at: null, break_glass_set: true},
     // #494: populated by loadLidarrOptions() — Lidarr's own live lists for the three admin-config dropdowns above.
     lidarrOptions: {root_folders: [], quality_profiles: [], metadata_profiles: []},
     // #509 item 3: {subsonic: {status: 'checking'|'ok'|'invalid_url'|'error'}, ...} —
@@ -3684,7 +3768,7 @@ function app() {
     newIntegrationTokenName: '',
     creatingIntegrationToken: false,
     integrationTokenError: '',
-    enrollModal: {open: false, code: ''},
+    enrollModal: {open: false, code: '', deviceName: null},
     enrolling: false,
     addDeviceModal: {open: false},
     resetPasswordModal: {open: false, user: null, password: ''},
@@ -3724,7 +3808,7 @@ function app() {
       this.announceFirstScan();  // #309: before the awaits, so it shows at once
       await Promise.all([
         this.loadArtists(), this.loadDevices(), this.loadSelections(),
-        this.loadProviderStatus(), this.loadProfile(), this.$store.basket.load(),
+        this.loadProviderStatus(), this.loadProfile(), this.loadWidgetCatalog(), this.$store.basket.load(),
       ]);
       this.loadPlaylists();
       this.loadUsage();
@@ -3925,6 +4009,20 @@ function app() {
       if (this.quiz[side].artist === this.quizWinner().artist) return 'border-green-600 bg-green-50';
       if (this.quiz.guess === side) return 'border-red-500 bg-red-50';
       return 'border-gray-200 opacity-60';
+    },
+
+    async loadWidgetCatalog() {
+      // A failed fetch leaves the dashboard empty (the empty-state card
+      // waits on the catalog too) but must not abort init(): everything
+      // after the Promise.all -- playlists, usage, the lazy widget loads --
+      // still has to run, and the other tabs do not depend on this list.
+      try {
+        const catalog = await (await fetch('/api/dashboard/catalog')).json();
+        this.dashboardWidgetCatalog = catalog.map(w => ({id: w.id, adminOnly: w.admin_only}));
+      } catch (e) {
+        console.warn('widget catalog unavailable', e);
+        this.dashboardWidgetCatalog = [];
+      }
     },
 
     async loadProfile() {
@@ -4409,14 +4507,31 @@ function app() {
     // one id to an arbitrary target index and persists the resulting order,
     // so both reorder paths write through the exact same logic rather than
     // risking the two drifting apart.
+    // Widget preferences go through their own narrow route, never the
+    // whole-profile PUT: the phone app edits the same preferences, and a
+    // whole-profile write from either side would overwrite whatever the
+    // other had just changed elsewhere in the profile. The server answers
+    // with the stored, normalized preferences, which replace ours.
+    async patchDashboardWidgets(patch) {
+      this.profileError = '';
+      try {
+        const resp = await fetch('/api/profile/dashboard-widgets', {
+          method: 'PATCH', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(patch),
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        this.profile.dashboard_widgets = await resp.json();
+      } catch (e) {
+        this.profileError = t('saveFailedRetry', {error: e.message});
+      }
+    },
     async reorderDashboardWidget(id, toIndex) {
       const ids = this.orderedWidgetCatalog().map(w => w.id);
       const fromIndex = ids.indexOf(id);
       if (fromIndex === -1 || toIndex < 0 || toIndex >= ids.length || fromIndex === toIndex) return;
       const [moved] = ids.splice(fromIndex, 1);
       ids.splice(toIndex, 0, moved);
-      this.profile.dashboard_widgets = {...this.profile.dashboard_widgets, order: ids};
-      await this.saveProfile();
+      await this.patchDashboardWidgets({order: ids});
     },
     async moveDashboardWidget(id, direction) {
       const ids = this.orderedWidgetCatalog().map(w => w.id);
@@ -4427,8 +4542,7 @@ function app() {
       const disabled = new Set(this.profile.dashboard_widgets?.disabled || []);
       const enabling = disabled.has(id);
       if (enabling) disabled.delete(id); else disabled.add(id);
-      this.profile.dashboard_widgets = {...this.profile.dashboard_widgets, disabled: [...disabled]};
-      await this.saveProfile();
+      await this.patchDashboardWidgets({disabled: [...disabled]});
       // #87: a widget hidden at init() had its data fetch skipped — load it now
       // that it's being shown, so it isn't blank until the next reload.
       if (enabling) {
@@ -4444,9 +4558,7 @@ function app() {
     },
     async setWidgetMonths(id, value) {
       const months = Math.max(1, Math.min(24, parseInt(value, 10) || 3));
-      const settings = {...(this.profile.dashboard_widgets?.settings || {}), [id]: {months}};
-      this.profile.dashboard_widgets = {...this.profile.dashboard_widgets, settings};
-      await this.saveProfile();
+      await this.patchDashboardWidgets({settings: {[id]: {months}}});
       if (id === 'recently_added') this.loadRecentlyAdded();
       if (id === 'recently_released') this.loadRecentlyReleased();
     },
@@ -4459,9 +4571,7 @@ function app() {
     async setCoverLimit(value) {
       const n = parseInt(value, 10);
       const cover_limit = COVER_LIMIT_OPTIONS.includes(n) ? n : DEFAULT_COVER_LIMIT;
-      const settings = {...(this.profile.dashboard_widgets?.settings || {}), cover_limit};
-      this.profile.dashboard_widgets = {...this.profile.dashboard_widgets, settings};
-      await this.saveProfile();
+      await this.patchDashboardWidgets({settings: {cover_limit}});
     },
     async loadRecentlyAdded() {
       this.recentlyAdded = await (await fetch(
@@ -4869,6 +4979,65 @@ function app() {
     },
     async loadPlaylists() {
       this.playlists = await (await fetch('/api/provider/playlists')).json();
+      await this.loadPlaylistSubscriptions();
+    },
+    async loadPlaylistSubscriptions() {
+      try {
+        const data = await (await fetch('/api/playlist-subscriptions')).json();
+        this.playlistSubscriptions = data.subscriptions || [];
+      } catch {
+        // A failure here must not blank the playlist list that just loaded.
+      }
+    },
+    // The import runs server-side while this awaits, rather than being
+    // queued for the next sync: the counts it returns are the answer to
+    // "did that work", and a playlist of hour-long mix videos looks
+    // exactly like a good one until you see 0 of 79 matched.
+    async addPlaylistSubscription() {
+      if (this.subscriptionBusy || !this.subscriptionUrl.trim()) return;
+      this.subscriptionBusy = true;
+      this.subscriptionError = '';
+      this.subscriptionResult = null;
+      try {
+        const resp = await fetch('/api/playlist-subscriptions', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({url: this.subscriptionUrl.trim()}),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          this.subscriptionError = data.error || data.description || t('subscriptionAddFailed');
+          return;
+        }
+        this.subscriptionUrl = '';
+        this.subscriptionResult = data.subscription;
+        await this.loadPlaylists();
+      } catch {
+        this.subscriptionError = t('subscriptionAddFailed');
+      } finally {
+        this.subscriptionBusy = false;
+      }
+    },
+    async refreshPlaylistSubscription(sub) {
+      if (this.subscriptionBusy) return;
+      this.subscriptionBusy = true;
+      try {
+        await fetch('/api/playlist-subscriptions/' + sub.id + '/refresh', {method: 'POST'});
+        await this.loadPlaylists();
+      } finally {
+        this.subscriptionBusy = false;
+      }
+    },
+    async removePlaylistSubscription(sub) {
+      if (!confirm(t('subscriptionRemoveConfirm', {title: sub.title || sub.url}))) return;
+      await fetch('/api/playlist-subscriptions/' + sub.id, {method: 'DELETE'});
+      await this.loadPlaylists();
+    },
+    subscriptionStateText(sub) {
+      if (sub.last_error === 'unavailable') return t('subscriptionUnavailable');
+      if (sub.last_error) return t('subscriptionFetchFailed');
+      if (sub.track_count === null || sub.track_count === undefined) return '';
+      if (sub.track_count > 0 && sub.matched_count === 0) return t('subscriptionNoMatches');
+      return t('subscriptionMatchCount', {matched: sub.matched_count, total: sub.track_count});
     },
     async syncPlaylists() {
       // #138: the sync now runs in the background (202) instead of blocking
@@ -5082,19 +5251,35 @@ function app() {
     // keeps the plain red bar rather than a breakdown with negative headroom).
     storageBreakdown(d) {
       const u = this.usage[d.id];
-      if (!u || !u.max_size_bytes || u.over_limit) return null;
+      // folder_over_limit, not just over_limit: the limit is on the folder,
+      // so a folder already past it gets the plain red bar for the same
+      // reason Trobar's own overrun does — a breakdown with negative
+      // headroom draws nothing useful.
+      if (!u || !u.max_size_bytes || u.over_limit || u.folder_over_limit) return null;
       const autofitBytes = (d.autofit && d.autofit.enabled) ? d.autofit.bytes : 0;
       const manualBytes = Math.max(0, u.used_bytes - autofitBytes);
-      return {manualBytes, autofitBytes, maxBytes: u.max_size_bytes};
+      // null means this device has never measured its folder, which is not
+      // the same claim as an empty one — drawn as no slice, and said in
+      // words below rather than shown as a zero-width nothing.
+      const foreignBytes = u.reported_foreign_bytes || 0;
+      return {manualBytes, autofitBytes, foreignBytes, maxBytes: u.max_size_bytes,
+              foreignKnown: u.reported_foreign_bytes != null};
     },
     storageBreakdownLabel(d) {
       const b = this.storageBreakdown(d);
       if (!b) return '';
-      const parts = [t('storageManualShare', {gb: this.formatGB(b.manualBytes)})];
+      const parts = [];
+      // First, because it is the share the user did not choose and the one
+      // that explains why the rest is smaller than the limit suggests.
+      if (b.foreignBytes > 0) {
+        parts.push(t('storageForeignShare', {gb: this.formatGB(b.foreignBytes)}));
+      }
+      parts.push(t('storageManualShare', {gb: this.formatGB(b.manualBytes)}));
       if (b.autofitBytes > 0) {
         parts.push(t('storageAutofitShare', {gb: this.formatGB(b.autofitBytes), pct: d.autofit.percent}));
       }
-      parts.push(t('storageFreeShare', {gb: this.formatGB(Math.max(0, b.maxBytes - b.manualBytes - b.autofitBytes))}));
+      parts.push(t('storageFreeShare', {gb: this.formatGB(
+        Math.max(0, b.maxBytes - b.foreignBytes - b.manualBytes - b.autofitBytes))}));
       return parts.join(', ');
     },
     formatGB(bytes) {
@@ -5341,10 +5526,20 @@ function app() {
       const resp = await fetch(`/api/devices/${device.id}/autofit/preview`);
       if (resp.ok) this.autofitFillBasis[device.id] = await resp.json();
     },
+    // The same min(share, limit - foreign) - manual bound refresh_autofit
+    // applies server-side. Kept in one helper so the slider preview and the
+    // breakdown below cannot drift apart from each other or from the real
+    // fill — three copies of this arithmetic is how a preview starts
+    // promising space the sync will not use.
+    autofitBudgetBytes(basis, device) {
+      const share = Math.floor(basis.max_size_bytes * this.autofitPercentFor(device) / 100);
+      const leftInFolder = basis.max_size_bytes - (basis.foreign_bytes || 0);
+      return Math.max(0, Math.min(share, leftInFolder) - basis.manual_bytes);
+    },
     autofitPreviewSummary(device) {
       const basis = this.autofitFillBasis[device.id];
       if (!basis) return '';
-      const budgetBytes = Math.max(0, Math.floor(basis.max_size_bytes * this.autofitPercentFor(device) / 100) - basis.manual_bytes);
+      const budgetBytes = this.autofitBudgetBytes(basis, device);
       const tracks = basis.avg_track_bytes ? Math.floor(budgetBytes / basis.avg_track_bytes) : 0;
       return t('autofitFillPreview', {gb: this.formatGB(budgetBytes), tracks});
     },
@@ -5356,17 +5551,27 @@ function app() {
     autofitPreviewBreakdown(device) {
       const basis = this.autofitFillBasis[device.id];
       if (!basis || !basis.max_size_bytes) return null;
-      const autofitBytes = Math.max(0, Math.floor(basis.max_size_bytes * this.autofitPercentFor(device) / 100) - basis.manual_bytes);
-      return {manualBytes: basis.manual_bytes, autofitBytes, maxBytes: basis.max_size_bytes};
+      const autofitBytes = this.autofitBudgetBytes(basis, device);
+      return {
+        manualBytes: basis.manual_bytes, autofitBytes, maxBytes: basis.max_size_bytes,
+        foreignBytes: basis.foreign_bytes || 0,
+        foreignKnown: !!basis.foreign_bytes_known,
+      };
     },
     autofitPreviewBreakdownLabel(device) {
       const b = this.autofitPreviewBreakdown(device);
       if (!b) return '';
-      return [
-        t('storageManualShare', {gb: this.formatGB(b.manualBytes)}),
-        t('storageAutofitShare', {gb: this.formatGB(b.autofitBytes), pct: this.autofitPercentFor(device)}),
-        t('storageFreeShare', {gb: this.formatGB(Math.max(0, b.maxBytes - b.manualBytes - b.autofitBytes))}),
-      ].join(', ');
+      const parts = [];
+      // Listed first because it is the share the user did not choose, and
+      // the one that explains a smaller-than-expected auto-fit figure.
+      if (b.foreignKnown && b.foreignBytes > 0) {
+        parts.push(t('storageForeignShare', {gb: this.formatGB(b.foreignBytes)}));
+      }
+      parts.push(t('storageManualShare', {gb: this.formatGB(b.manualBytes)}));
+      parts.push(t('storageAutofitShare', {gb: this.formatGB(b.autofitBytes), pct: this.autofitPercentFor(device)}));
+      parts.push(t('storageFreeShare', {gb: this.formatGB(
+        Math.max(0, b.maxBytes - b.foreignBytes - b.manualBytes - b.autofitBytes))}));
+      return parts.join(', ');
     },
     async disableAutofit(device) {
       this.autofitBusy = device.id;
@@ -5532,7 +5737,7 @@ function app() {
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const grant = await resp.json();
         this.addDeviceModal.open = false; // #233: same reasoning as createDevice() above
-        this.enrollModal = {open: true, code: grant.code};
+        this.enrollModal = {open: true, code: grant.code, deviceName: null};
         this.$nextTick(async () => {
           try { await window.ensureQRCode(); } catch { return; }
           QRCode.toCanvas(this.$refs.enrollQrCanvas, JSON.stringify({
@@ -5566,6 +5771,28 @@ function app() {
       a.download = 'trobar-device.json';
       a.click();
       URL.revokeObjectURL(a.href);
+    },
+    // Re-pairing hands the app back an EXISTING device rather than making a
+    // new one, so the selections, track state and settings that survived the
+    // uninstall are still there. The code is the same 8-char shape the wizard
+    // already reads -- the difference is entirely server-side, in what
+    // redeeming it does.
+    async repairDevice(device) {
+      if (!confirm(t('confirmRepairDevice', {name: device.name}))) return;
+      const resp = await fetch('/api/devices/' + device.id + '/repair-code', {method: 'POST'});
+      if (!resp.ok) {
+        this.deviceError = t('repairFailed', {
+          error: (await resp.json().catch(() => ({}))).error || ('HTTP ' + resp.status)});
+        return;
+      }
+      const grant = await resp.json();
+      this.enrollModal = {open: true, code: grant.code, deviceName: device.name};
+      this.$nextTick(async () => {
+        try { await window.ensureQRCode(); } catch { return; }
+        QRCode.toCanvas(this.$refs.enrollQrCanvas, JSON.stringify({
+          server_url: location.origin, enroll_code: grant.code,
+        }), {width: 200});
+      });
     },
     async regenerateAndShowQr(device) {
       if (!confirm(t('confirmRegenerateToken', {name: device.name}))) {
@@ -5933,7 +6160,45 @@ function app() {
     // device is already implied by which section it's in).
     openDevicePicker(type, target, surface = null) {
       const remembered = surface ? (this.profile.basket_last_destinations || {})[surface] : null;
-      this.picker = {open: true, type, target, surface, deviceIds: remembered ? [...remembered] : []};
+      // A remembered id whose device is gone -- deleted, or no longer
+      // manageable after a delegation was revoked -- renders no checkbox
+      // in this dialog, because the list below is x-for over `devices`.
+      // It was still copied into deviceIds, where it could not be seen or
+      // unchecked, and every add/send from this surface then failed
+      // wholesale on _require_device_access ("Device not found"). So
+      // intersect with what the dialog actually offers: whatever arrives
+      // pre-selected is now always something the user can also unselect.
+      //
+      // This is the self-healing half of the fix -- the server prunes on
+      // deletion, but an install that deleted a device before that existed
+      // still carries the dead id. _rememberPickerDestination() saves
+      // picker.deviceIds as-is, so the first completed pick from this
+      // surface writes the filtered list back and the poison is gone for
+      // good.
+      // Compared as numbers on both sides, deliberately. This list holds
+      // numbers when it came from the profile, but STRINGS once x-model has
+      // written to it -- a checkbox's x-model pushes el.value, and
+      // :value="d.id" renders as an attribute. Alpine's own checked binding
+      // loose-compares, so both types have always rendered identically;
+      // a strict Set.has() here would not, and would silently discard every
+      // id the user had just picked by hand. The filter keeps the elements
+      // as they were, so nothing downstream sees a type it didn't before.
+      //
+      // Only filter once we actually know what the devices are. init()
+      // fetches devices and profile in one Promise.all, so they land
+      // independently, and Alpine renders while those awaits are still
+      // pending -- open the picker in that window and `devices` is [], which
+      // is indistinguishable here from "every remembered device was
+      // deleted". The whole remembered set would be dropped, and the user,
+      // seeing nothing pre-selected, would tick a subset and have THAT
+      // saved over it. A user with genuinely zero devices has nothing to
+      // pick and no send to protect, so skipping the filter for an empty
+      // array costs nothing and closes the window.
+      const live = new Set(this.devices.map((d) => Number(d.id)));
+      const preselected = (remembered && live.size)
+        ? remembered.filter((id) => live.has(Number(id)))
+        : (remembered ? [...remembered] : []);
+      this.picker = {open: true, type, target, surface, deviceIds: preselected};
     },
     // The items THIS picker action concerns — one for a single pick,
     // several for a multi-select batch (picker.target is an array in that

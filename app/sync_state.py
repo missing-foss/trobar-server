@@ -35,6 +35,8 @@ class AutofitSummary(TypedDict):
     bytes: int
     budget_bytes: int
     used_by_manual_bytes: int
+    used_by_foreign_bytes: int
+    foreign_bytes_known: bool
     reason: str | None
     percent: int
 
@@ -110,16 +112,24 @@ def create_device(conn: sqlite3.Connection, owner_user_id: int, name: str,
     return _new_id(cur), raw_token
 
 
-def regenerate_token(conn: sqlite3.Connection, device_id: int) -> str:
+def regenerate_token(conn: sqlite3.Connection, device_id: int, *,
+                     commit: bool = True) -> str:
     """Issues a brand-new token for an existing device (invalidating the
-    old one) — used when the QR/token needs to be shown again (lost,
-    app reinstalled) since the raw token is never stored, only its hash."""
+    old one), since the raw token is never stored -- only its hash.
+
+    This is the DESKTOP pairing path: trobar-desktop consumes the resulting
+    {server_url, token} payload directly, as a pasted config or as
+    .trobar/device.json on the card. It is not a re-pairing path for the
+    Android app, whose wizard reads enrollment codes and ignores a `token`
+    key entirely -- that case is create_enrollment_grant(device_id=...),
+    which hands back the same device through the code flow the app speaks."""
     raw_token = secrets.token_urlsafe(32)
     conn.execute(
         "UPDATE devices SET api_token_hash = ? WHERE id = ?",
         (hash_token(raw_token), device_id),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return raw_token
 
 
@@ -144,11 +154,19 @@ def _generate_enrollment_code() -> str:
     return "".join(secrets.choice(_ENROLL_ALPHABET) for _ in range(8))
 
 
-def create_enrollment_grant(conn: sqlite3.Connection, owner_user_id: int) -> str:
+def create_enrollment_grant(conn: sqlite3.Connection, owner_user_id: int,
+                            device_id: int | None = None) -> str:
     """#163: mint a short-lived, single-use, owner-scoped enrollment code. The
     web UI presents it as a QR + human code; a mobile client redeems it via
     redeem_enrollment_grant to create its own device — the app never holds user
-    credentials (#162). Returns the raw code; only its hash is stored."""
+    credentials (#162). Returns the raw code; only its hash is stored.
+
+    device_id names an EXISTING device to re-attach to instead of creating a
+    new one — the reinstall case, where the app is gone but the device's
+    selections, track state and settings are not. Default None is the original
+    behaviour, unchanged. The caller is responsible for checking that the
+    owner may manage that device; redeem re-checks ownership regardless,
+    because ten minutes is long enough for a device to be deleted."""
     # #166: purge-on-mint. This ephemeral table (10-min TTL, single-use) is only
     # ever appended to and marked consumed, never cleaned — so drop the dead rows
     # (expired, or already redeemed) before adding a new one. Self-limiting, no
@@ -161,9 +179,10 @@ def create_enrollment_grant(conn: sqlite3.Connection, owner_user_id: int) -> str
         code = _generate_enrollment_code()
         try:
             conn.execute(
-                "INSERT INTO enrollment_grants (code_hash, owner_user_id, expires_at) "
-                "VALUES (?, ?, datetime('now', ?))",
-                (hash_token(code), owner_user_id, f"+{ENROLLMENT_TTL_SECONDS} seconds"),
+                "INSERT INTO enrollment_grants (code_hash, owner_user_id, device_id, expires_at) "
+                "VALUES (?, ?, ?, datetime('now', ?))",
+                (hash_token(code), owner_user_id, device_id,
+                 f"+{ENROLLMENT_TTL_SECONDS} seconds"),
             )
             conn.commit()
             return code
@@ -189,9 +208,35 @@ def redeem_enrollment_grant(conn: sqlite3.Connection, code: str, name: str,
     if cur.rowcount != 1:
         conn.commit()
         return None
-    owner = conn.execute(
-        "SELECT owner_user_id FROM enrollment_grants WHERE code_hash = ?", (code_hash,)
-    ).fetchone()["owner_user_id"]
+    grant = conn.execute(
+        "SELECT owner_user_id, device_id FROM enrollment_grants WHERE code_hash = ?",
+        (code_hash,),
+    ).fetchone()
+    owner = grant["owner_user_id"]
+
+    if grant["device_id"] is not None:
+        # Re-pairing an existing device. Ownership is re-checked here rather
+        # than trusted from mint time: the grant lives for ten minutes, and a
+        # device can be deleted or change hands inside that window. A code
+        # whose device is gone is spent (consumed above) and refused, which is
+        # the same answer the caller gets for any other invalid code -- it must
+        # not fall through to creating a device, or "re-pair" would silently
+        # become "enrol a stranger" at the moment it is least expected.
+        owned = conn.execute(
+            "SELECT id FROM devices WHERE id = ? AND owner_user_id = ?",
+            (grant["device_id"], owner),
+        ).fetchone()
+        if owned is None:
+            conn.commit()
+            return None
+        # Name, type and limits are deliberately NOT taken from the caller.
+        # The device already has them and they are the reason to re-pair at
+        # all; letting a fresh install overwrite them with its defaults would
+        # quietly undo the thing being recovered.
+        raw_token = regenerate_token(conn, grant["device_id"], commit=False)
+        conn.commit()
+        return grant["device_id"], raw_token
+
     device_id, raw_token = create_device(
         conn, owner, name, device_type, max_size_bytes, transcode_format=transcode_format)
     conn.commit()
@@ -517,6 +562,38 @@ def unstage_basket_item_device(conn: sqlite3.Connection, user_id: int, item_id: 
         conn.commit()
 
 
+def prune_linkless_basket_items(conn: sqlite3.Connection, item_ids: list[int], *,
+                                commit: bool = True) -> None:
+    """Removes basket_items rows left with no device links by a cascade.
+
+    basket_item_devices cascades on device_id, so DELETE FROM devices takes
+    the link rows out with no application code in the path -- and an item
+    whose only staged destination was that device is left behind with zero
+    links. That state is the one this table's SCHEMA comment says never
+    happens: the basket panel renders per device, so a link-less item is not
+    merely stale but unreachable, impossible to see, act on or clear through
+    the UI, and one more accumulates per delete.
+
+    Takes the candidate ids rather than sweeping every link-less row, and
+    the caller collects them BEFORE the cascade removes the links. A blanket
+    "delete every item with no links" in a request path would also quietly
+    clear rows orphaned by some other cause -- convenient, and it would hide
+    the next producer of this state instead of surfacing it. The migration
+    that sweeps globally is a one-off repair with no such caller to mask.
+
+    `commit=False` keeps this inside the caller's own transaction, so the
+    device and the items it orphaned go together or not at all -- same
+    convention as prune_device_from_last_destinations."""
+    for item_id in item_ids:
+        remaining = conn.execute(
+            "SELECT 1 FROM basket_item_devices WHERE basket_item_id = ?", (item_id,)
+        ).fetchone()
+        if remaining is None:
+            conn.execute("DELETE FROM basket_items WHERE id = ?", (item_id,))
+    if commit:
+        conn.commit()
+
+
 def remove_basket_item(conn: sqlite3.Connection, user_id: int, item_id: int) -> None:
     conn.execute("DELETE FROM basket_items WHERE id = ? AND user_id = ?", (item_id, user_id))
     conn.commit()
@@ -526,6 +603,109 @@ def clear_basket(conn: sqlite3.Connection, user_id: int, *, commit: bool = True)
     conn.execute("DELETE FROM basket_items WHERE user_id = ?", (user_id,))
     if commit:
         conn.commit()
+
+
+# --- Remembered picker destinations ------------------------------
+# users.basket_last_destinations maps a surface name to the device ids last
+# chosen for a pick from it -- the device picker's smart-default. It is a
+# JSON column, so a device row disappearing does NOT cascade into it the way
+# selection_devices and device_track_state cascade. Every path that removes a
+# device therefore has to say what happens to the memory of it, and the two
+# paths want different answers: an outright delete prunes, a transfer remaps.
+#
+# These live here rather than in main.py because transfer_device() needs them
+# inside its own transaction, and it cannot import main (main imports this).
+
+
+def basket_last_destinations_dict(raw: str | None) -> dict:
+    """Parses the users.basket_last_destinations JSON column, tolerating
+    NULL/missing/malformed text (a fresh column, or a hand-edited DB) and
+    dropping any entry that isn't a surface name mapped to a list of ints —
+    same tolerate-garbage shape as _dashboard_widgets_dict."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    result = {}
+    for surface, device_ids in parsed.items():
+        if isinstance(surface, str) and isinstance(device_ids, list) \
+                and all(isinstance(d, int) for d in device_ids):
+            result[surface] = device_ids
+    return result
+
+
+def _rewrite_last_destinations(conn: sqlite3.Connection, rewrite, *,
+                               commit: bool = True) -> None:
+    """Applies `rewrite` (a list of ids -> a list of ids) to every surface of
+    every user's remembered destinations, writing back only the rows it
+    actually changed.
+
+    Every user, not just whoever triggered this: an admin or a delegate can
+    have remembered a device they do not own, and would otherwise be left
+    holding the stale id while the person who acted never sees a problem."""
+    rows = conn.execute(
+        "SELECT id, basket_last_destinations FROM users "
+        "WHERE basket_last_destinations IS NOT NULL"
+    ).fetchall()  # fetchall, not a live cursor: the UPDATE below writes the
+                  # same table this is iterating.
+    for row in rows:
+        current = basket_last_destinations_dict(row["basket_last_destinations"])
+        updated = {surface: rewrite(ids) for surface, ids in current.items()}
+        if updated == current:
+            continue
+        conn.execute(
+            "UPDATE users SET basket_last_destinations = ? WHERE id = ?",
+            (json.dumps(updated), row["id"]),
+        )
+    if commit:
+        conn.commit()
+
+
+def prune_device_from_last_destinations(conn: sqlite3.Connection, device_id: int, *,
+                                        commit: bool = True) -> None:
+    """Drops a deleted device's id from every user's remembered destinations.
+
+    Call with the DELETE that removes the device, in the same transaction. A
+    leftover id is invisible in the picker, which only renders checkboxes for
+    devices that still exist -- so it cannot be unchecked, while still being
+    re-injected into every pick from that surface and 404ing the whole send.
+
+    Surfaces whose list empties keep the key as an empty list: the picker
+    already treats "remembered nothing" and "never used" identically, so
+    there is nothing to gain from reasoning about which surface names are
+    still live."""
+    _rewrite_last_destinations(
+        conn, lambda ids: [d for d in ids if d != device_id], commit=commit)
+
+
+def remap_device_in_last_destinations(conn: sqlite3.Connection, old_device_id: int,
+                                      new_device_id: int, *, commit: bool = True) -> None:
+    """Points a transferred device's remembered destinations at its
+    replacement, rather than forgetting them.
+
+    Transfer is a swap, not a removal: transfer_device() deliberately MOVES
+    selection_devices onto the new device instead of dropping them, and the
+    remembered destination is the same kind of state -- "where picks from
+    this surface go" is still true after the hardware behind it changed.
+    Pruning here would be correct but lossy, silently resetting a
+    smart-default the user never asked to lose.
+
+    A user who remembered both devices collapses to one entry rather than
+    ending up with the new id twice; order is otherwise preserved, since it
+    is the order the checkboxes were ticked in."""
+    def rewrite(ids: list[int]) -> list[int]:
+        out: list[int] = []
+        for d in ids:
+            mapped = new_device_id if d == old_device_id else d
+            if mapped not in out:
+                out.append(mapped)
+        return out
+
+    _rewrite_last_destinations(conn, rewrite, commit=commit)
 
 
 def _resolve_selection_track_ids(conn: sqlite3.Connection, sel_type: str, target: str,
@@ -744,7 +924,8 @@ def refresh_autofit(conn: sqlite3.Connection, selection_id: int,
     conn.execute("DELETE FROM autofit_tracks WHERE selection_id = ?", (selection_id,))
     summary: AutofitSummary = {
         "albums": 0, "tracks": 0, "bytes": 0, "budget_bytes": 0,
-        "used_by_manual_bytes": 0, "reason": None, "percent": 100,
+        "used_by_manual_bytes": 0, "used_by_foreign_bytes": 0,
+        "foreign_bytes_known": False, "reason": None, "percent": 100,
     }
 
     dev = conn.execute(
@@ -757,7 +938,8 @@ def refresh_autofit(conn: sqlite3.Connection, selection_id: int,
     device_id = dev["device_id"]
 
     dev_row = conn.execute(
-        "SELECT max_size_bytes, transcode_format, autofit_percent FROM devices WHERE id = ?", (device_id,)
+        "SELECT max_size_bytes, transcode_format, autofit_percent, reported_foreign_bytes "
+        "FROM devices WHERE id = ?", (device_id,)
     ).fetchone()
     max_size_bytes = dev_row["max_size_bytes"]
     fmt = dev_row["transcode_format"]
@@ -773,7 +955,39 @@ def refresh_autofit(conn: sqlite3.Connection, selection_id: int,
     manual_ids = required_track_ids_for_device(conn, device_id, exclude_autofit=True)
     manual_bytes = _sum_device_bytes(conn, manual_ids, device_id, fmt)
     summary["used_by_manual_bytes"] = manual_bytes
-    remaining = budget - manual_bytes
+
+    # Music already in the sync folder that Trobar did not put there. The
+    # limit is what the user allows in that FOLDER, so this is a third
+    # claim on it alongside manual selections and auto-fit's own share.
+    #
+    # It bounds the fill in a different way from `percent`, and both apply:
+    #
+    #   budget          auto-fit's own share, a percentage of the whole
+    #                   limit -- unchanged, still not a percentage of a
+    #                   shifting remainder (see this function's docstring)
+    #   max - foreign   what is actually left in the folder for Trobar
+    #
+    # so what auto-fit may add is min(budget, max - foreign) - manual. The
+    # cap that binds is whichever is lower, which is the only way to keep
+    # BOTH promises: auto-fit never exceeds its share, and the folder never
+    # exceeds the limit. Subtracting foreign from `budget` alone would
+    # refuse to fit anything into a mostly-foreign folder that still has
+    # room under the limit; subtracting it before applying `percent` would
+    # make the reserved headroom move whenever a file appeared in the
+    # folder from somewhere else, which is the objection `percent` exists
+    # to answer.
+    #
+    # NULL means never reported, not zero. Treated as zero HERE, so a
+    # device enrolled before the client could report this behaves exactly
+    # as it does today rather than having auto-fit stop working on
+    # upgrade -- but `foreign_bytes_known` carries the difference out to
+    # the caller so the UI can say the folder has not been measured instead
+    # of implying it is empty. Silent would be the wrong half of that.
+    foreign_bytes = dev_row["reported_foreign_bytes"]
+    summary["foreign_bytes_known"] = foreign_bytes is not None
+    summary["used_by_foreign_bytes"] = foreign_bytes or 0
+
+    remaining = min(budget, max_size_bytes - summary["used_by_foreign_bytes"]) - manual_bytes
     if remaining <= 0:
         conn.commit()
         summary["reason"] = "budget_full"
@@ -839,14 +1053,16 @@ def autofit_fill_basis(conn: sqlite3.Connection, device_id: int) -> dict | None:
     mp3_128 a device holds roughly 2.5x the tracks it holds at Originals —
     so the average is computed per-device, never a global constant."""
     dev_row = conn.execute(
-        "SELECT max_size_bytes, transcode_format FROM devices WHERE id = ?", (device_id,)
+        "SELECT max_size_bytes, transcode_format, reported_foreign_bytes "
+        "FROM devices WHERE id = ?", (device_id,)
     ).fetchone()
     if dev_row is None:
         return None
     max_size_bytes = dev_row["max_size_bytes"]
     fmt = dev_row["transcode_format"]
     if not max_size_bytes:
-        return {"max_size_bytes": 0, "manual_bytes": 0, "avg_track_bytes": 0}
+        return {"max_size_bytes": 0, "manual_bytes": 0, "avg_track_bytes": 0,
+                "foreign_bytes": 0, "foreign_bytes_known": False}
 
     manual_ids = required_track_ids_for_device(conn, device_id, exclude_autofit=True)
     manual_bytes = _sum_device_bytes(conn, manual_ids, device_id, fmt)
@@ -864,6 +1080,13 @@ def autofit_fill_basis(conn: sqlite3.Connection, device_id: int) -> dict | None:
         "max_size_bytes": max_size_bytes,
         "manual_bytes": manual_bytes,
         "avg_track_bytes": avg_track_bytes,
+        # The preview has to apply the same min(budget, max - foreign)
+        # bound refresh_autofit does, or the slider promises space the real
+        # fill will not use. `foreign_bytes_known` is carried alongside for
+        # the same reason it is there: an unmeasured folder must read as
+        # unmeasured, not as an empty one.
+        "foreign_bytes": dev_row["reported_foreign_bytes"] or 0,
+        "foreign_bytes_known": dev_row["reported_foreign_bytes"] is not None,
     }
 
 
@@ -967,6 +1190,11 @@ def transfer_device(conn: sqlite3.Connection, old_device_id: int, new_device_id:
     # above read from, never touched directly -- plus device_unknown_tracks
     # and device_pins, neither of which has anywhere meaningful to move to).
     conn.execute("DELETE FROM devices WHERE id = ?", (old_device_id,))
+    # NOT cascaded, because it is a JSON column rather than a join table --
+    # and remapped rather than pruned, for the same reason selection_devices
+    # above is moved rather than dropped: the replacement device stands in
+    # for the old one, so a surface that used to send there still should.
+    remap_device_in_last_destinations(conn, old_device_id, new_device_id, commit=False)
     conn.commit()
 
     recompute_device_state(conn, new_device_id)

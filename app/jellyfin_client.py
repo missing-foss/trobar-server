@@ -481,15 +481,46 @@ def mirror_create_or_replace_playlist(
     #189 review: this ordering (DELETE, then POST) is forced, not a design
     choice — the reverse (add the new set first, then remove the old one)
     would narrow the window where a mid-sequence failure leaves the remote
-    playlist empty, but confirmed live it doesn't work: re-adding an id
-    that's already present is deduped (204, no second entry), so adding
-    the new set before removing the old would delete the overlap right
-    back out along with the old entries. A failure between the DELETE and
-    the POST here does leave the remote playlist empty until the next
-    successful sync repairs it — self-healing (the failure is recorded as
-    `write_failed` with the remote id kept, so the next run retries the
-    same replace), but a narrower guarantee than Subsonic's atomic single-
-    call replace, which never has an empty window at all."""
+    playlist empty, but confirmed live on 10.11.11 it doesn't work:
+    re-adding an id that's already present is deduped there (204, no second
+    entry), so adding the new set before removing the old would delete the
+    overlap right back out along with the old entries.
+
+    That dedupe is a version property, not a property of Jellyfin, and it
+    is already gone. Measured against both, same probe:
+
+        re-add an id already present   10.11.11: 204, 1 entry  -> 1 entry
+                                       12.0.0 : 204, 1 entry  -> 2 entries
+
+    So on 12.0 the premise above is simply false: 12.0 dropped the database
+    constraint that made a repeated entry impossible, and a re-add creates
+    a second one.
+
+    THE ORDERING SURVIVES ANYWAY, which is why the code is untouched.
+    Clearing first is correct whether or not the server dedupes, and the
+    add-first alternative is still wrong on 12.0 for a different reason
+    than it was on 10.11.11 — measured too:
+
+        one DELETE by item id          10.11.11: 2 entries -> 1
+                                       12.0.0 : 3 entries -> 1
+
+    DELETE removes EVERY entry carrying that id, duplicates included, on
+    both. So adding the new set before removing the old would still delete
+    the overlap right back out. Different mechanism, same conclusion.
+
+    One thing worth knowing before anything tries to address a single
+    entry: `PlaylistItemId` does NOT distinguish duplicates on either
+    version — it comes back equal to the item's own Id, so two entries for
+    the same track are indistinguishable in the response. Passing item Ids
+    as `entryIds`, which is what the clear below does, stays correct
+    precisely because it is meant to remove all of them.
+
+    A failure between the DELETE and the POST here does leave the remote
+    playlist empty until the next successful sync repairs it — self-healing
+    (the failure is recorded as `write_failed` with the remote id kept, so
+    the next run retries the same replace), but a narrower guarantee than
+    Subsonic's atomic single-call replace, which never has an empty window
+    at all."""
     config = db.get_mirror_jellyfin_config()
     if config is None:
         return {"status": "error", "reason": "not_configured", "code": None}

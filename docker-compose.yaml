@@ -28,6 +28,16 @@ services:
       # Optional (#285 playlist mirroring) — only meaningful if MIRROR_VOLUME
       # is set below; unused otherwise. Writable, unlike /music above.
       MIRROR_ROOT: /mirrors
+      # Optional — one more folder walked for .m3u/.m3u8 playlists, for a
+      # player that keeps them outside your music library. Read-only, like
+      # /music above: Trobar never writes here.
+      #
+      # Set only when PLAYLIST_VOLUME is, unlike MIRROR_ROOT above: this
+      # one is READ on every playlist sync the moment it has a value, so
+      # an unconditional default would have every deployment scanning a
+      # folder its admin never asked for, and show that path in the
+      # Administration field as though someone had configured it.
+      EXTRA_PLAYLIST_ROOT: ${PLAYLIST_VOLUME:+/playlists}
       AUTH_MODE: ${AUTH_MODE:-local}
       ADMIN_USERNAME: ${ADMIN_USERNAME:?set ADMIN_USERNAME in .env}
       # Security-relevant — see .env.example and docs Operations > Networking.
@@ -50,6 +60,11 @@ services:
       # unless you also set a mirror folder in Administration >
       # Configuration.
       - ${MIRROR_VOLUME:-./mirrors}:/mirrors
+      # Optional extra playlist folder — read-only, and defaulting to a
+      # local ./playlists folder for the same reason the mirror mount
+      # above defaults: the line costs nothing when PLAYLIST_VOLUME is
+      # unset. Must not be inside your music folder.
+      - ${PLAYLIST_VOLUME:-./playlists}:/playlists:ro
     ports:
       # Bind to localhost and put your reverse proxy in front.
       - "127.0.0.1:5000:5000"

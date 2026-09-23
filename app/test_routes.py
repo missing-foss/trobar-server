@@ -18,6 +18,7 @@ gets its own fresh SQLite file via db.init_db(). Auth is a real session
 cookie (AUTH_MODE defaults to local), set through the test client's
 session_transaction — the same session key get_current_user_id() reads.
 """
+import json
 import os
 import shutil
 import sqlite3
@@ -1204,6 +1205,526 @@ class AdminConfigMirrorFolderValidationTests(_RouteTestBase):
         resp = self.client.put("/api/admin/config", json={"mirror_folder": raw})
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(db.get_config(self.conn, "mirror_folder"), str(separate / "b"))
+
+
+class AdminConfigExtraPlaylistFolderValidationTests(_RouteTestBase):
+    """PUT /api/admin/config rejects an extra playlist folder that overlaps
+    either MUSIC_ROOT or the mirror output folder.
+
+    Both overlaps import the same playlist twice: the second root is walked
+    for .m3u exactly the way MUSIC_ROOT is, so a file under both roots is
+    listed under both ids, and a mirror written inside it comes straight
+    back as a source playlist — the self-import loop the mirror_folder rule
+    above already exists to prevent, reachable again through a second root.
+
+    Overlap is rejected in EITHER direction here, unlike the mirror rule,
+    because this root is READ: a folder containing MUSIC_ROOT would walk
+    the music library too, where a mirror folder containing MUSIC_ROOT
+    would still write its files outside it."""
+
+    def setUp(self):
+        super().setUp()
+        self._music_root = Path(tempfile.mkdtemp(prefix="trobar-test-music-root-", dir=_TMP))
+        db.set_config(self.conn, "music_root", str(self._music_root))
+        self.conn.commit()
+        _login(self.client, self.admin)
+
+    def _put(self, **fields):
+        return self.client.put("/api/admin/config", json=fields)
+
+    def test_accepts_a_separate_folder(self):
+        separate = Path(_TMP) / "a-separate-playlist-dir"
+        resp = self._put(extra_playlist_folder=str(separate))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(self.conn, "extra_playlist_folder"), str(separate))
+
+    def test_clearing_the_field_unsets_it(self):
+        db.set_config(self.conn, "extra_playlist_folder", str(Path(_TMP) / "x"))
+        self.conn.commit()
+        self.assertEqual(self._put(extra_playlist_folder="").status_code, 200)
+        self.assertIsNone(db.get_config(self.conn, "extra_playlist_folder"))
+
+    def test_rejects_a_folder_equal_to_music_root(self):
+        self.assertEqual(self._put(extra_playlist_folder=str(self._music_root)).status_code, 400)
+
+    def test_rejects_a_folder_inside_music_root(self):
+        self.assertEqual(
+            self._put(extra_playlist_folder=str(self._music_root / "playlists")).status_code, 400)
+
+    def test_rejects_a_folder_containing_music_root(self):
+        self.assertEqual(
+            self._put(extra_playlist_folder=str(self._music_root.parent)).status_code, 400)
+
+    def test_rejects_a_dotdot_path_that_resolves_into_music_root(self):
+        evasive = str(self._music_root / "sub" / "..")
+        self.assertEqual(self._put(extra_playlist_folder=evasive).status_code, 400)
+
+    def test_dotdot_in_an_accepted_folder_is_normalized_before_storing(self):
+        separate = Path(_TMP) / "a-separate-playlist-dir"
+        resp = self._put(extra_playlist_folder=str(separate / "a" / ".." / "b"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(self.conn, "extra_playlist_folder"), str(separate / "b"))
+
+    def test_rejects_a_folder_overlapping_the_stored_mirror_folder(self):
+        mirror = Path(_TMP) / "a-mirror-dir"
+        db.set_config(self.conn, "mirror_folder", str(mirror))
+        self.conn.commit()
+        self.assertEqual(self._put(extra_playlist_folder=str(mirror / "sub")).status_code, 400)
+
+    def test_rejects_a_mirror_folder_overlapping_the_stored_extra_folder(self):
+        """The symmetric twin: the pair is refused whichever field the
+        admin is editing."""
+        extra = Path(_TMP) / "a-separate-playlist-dir"
+        db.set_config(self.conn, "extra_playlist_folder", str(extra))
+        self.conn.commit()
+        self.assertEqual(self._put(mirror_folder=str(extra / "sub")).status_code, 400)
+
+    def test_one_put_setting_both_to_an_overlapping_pair_is_rejected(self):
+        """The admin form PUTs the whole config object, so both fields
+        arrive together — the check has to read the value this request is
+        about to store, not the one already stored."""
+        base = Path(_TMP) / "both-at-once"
+        resp = self._put(extra_playlist_folder=str(base), mirror_folder=str(base / "out"))
+        self.assertEqual(resp.status_code, 400)
+
+    def test_one_put_moving_the_mirror_out_of_the_way_is_accepted(self):
+        """The other half of that: a save that FIXES an overlap by moving
+        the other folder must not be refused against the stale stored
+        value."""
+        extra = Path(_TMP) / "moving-extra"
+        db.set_config(self.conn, "mirror_folder", str(extra / "out"))
+        self.conn.commit()
+        resp = self._put(extra_playlist_folder=str(extra),
+                         mirror_folder=str(Path(_TMP) / "moved-mirror"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(self.conn, "extra_playlist_folder"), str(extra))
+
+    def test_a_refused_save_writes_neither_folder(self):
+        """The review defect on this branch, as a route-level test.
+
+        Both fields commit together now. Before that they committed one at
+        a time, so a PUT whose mirror was refused had already written the
+        extra folder -- and that write had only ever been checked against
+        the mirror value in the BODY, the one that just got rejected. What
+        stayed in the store was the mirror as it already was, next to an
+        extra folder nothing had ever compared it to: an overlapping pair,
+        arrived at THROUGH the checks rather than around them, while the
+        admin saw a 400 and believed nothing had been saved."""
+        mirror = Path(_TMP) / "probe-mirror-dir"
+        db.set_config(self.conn, "mirror_folder", str(mirror))
+        self.conn.commit()
+
+        resp = self._put(extra_playlist_folder=str(mirror / "sub"),
+                         mirror_folder=str(self._music_root / "inside"))
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIsNone(db.get_config(self.conn, "extra_playlist_folder"))
+        self.assertEqual(db.get_config(self.conn, "mirror_folder"), str(mirror))
+
+    def test_a_refused_save_does_not_write_the_field_that_was_fine(self):
+        """The general form of the above: a rejection leaves this endpoint
+        as it found it, including the half that would have been accepted on
+        its own."""
+        separate = Path(_TMP) / "a-separate-playlist-dir"
+        resp = self._put(extra_playlist_folder=str(separate),
+                         mirror_folder=str(self._music_root / "inside"))
+        self.assertEqual(resp.status_code, 400)
+        self.assertIsNone(db.get_config(self.conn, "extra_playlist_folder"))
+
+    def test_clearing_a_folder_is_validated_against_the_environment_default(self):
+        """Clearing a field clears the OVERRIDE, and the environment
+        default underneath becomes effective again -- so an empty value is
+        not "unset" for validation purposes. Reachable with the shipped
+        compose file, which sets MIRROR_ROOT."""
+        env_mirror = Path(_TMP) / "env-mirror-parent" / "out"
+        with mock.patch.dict(os.environ, {"MIRROR_ROOT": str(env_mirror)}):
+            resp = self._put(extra_playlist_folder=str(Path(_TMP) / "env-mirror-parent"),
+                             mirror_folder="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIsNone(db.get_config(self.conn, "extra_playlist_folder"))
+
+    def test_clearing_a_folder_is_accepted_with_no_environment_default(self):
+        """The control for the test above -- otherwise it would pass just
+        as well against a rule that refused every cleared field."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MIRROR_ROOT", None)
+            resp = self._put(extra_playlist_folder=str(Path(_TMP) / "env-mirror-parent"),
+                             mirror_folder="")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_an_unrelated_save_is_not_refused_by_a_pair_it_is_not_touching(self):
+        """The admin form PUTs every field at once, so a rule that fired on
+        stored state alone would 400 saves of settings nobody was editing.
+        With neither folder field in the body this does nothing at all."""
+        overlapping = Path(_TMP) / "already-overlapping"
+        db.set_config(self.conn, "extra_playlist_folder", str(overlapping))
+        db.set_config(self.conn, "mirror_folder", str(overlapping / "out"))
+        self.conn.commit()
+        self.assertEqual(self._put(itunes_library_path="/music/Library.xml").status_code, 200)
+
+    def test_the_effective_value_is_echoed_back(self):
+        separate = Path(_TMP) / "a-separate-playlist-dir"
+        self._put(extra_playlist_folder=str(separate))
+        data = self.client.get("/api/admin/config").get_json()
+        self.assertEqual(data["extra_playlist_folder"], str(separate))
+
+
+class DeviceStorageForeignBytesTests(_RouteTestBase):
+    """POST /api/device/storage's optional `foreign_bytes` -- the bytes of
+    music already in the sync folder that Trobar did not put there.
+
+    Everything here is about one rule: ABSENT IS NOT ZERO. A client too old
+    to measure the folder sends nothing, and every device enrolled before
+    the client could measure it has NULL. Storing zero for either would
+    state a measurement nobody made, and the budget would then silently go
+    on believing the folder was empty -- which is the defect this feature
+    exists to fix, reintroduced from the other end."""
+
+    def setUp(self):
+        super().setUp()
+        self.device_id, self.token = sync_state.create_device(
+            self.conn, self.owner, "phone", max_size_bytes=5000)
+        self.conn.commit()
+
+    def _report(self, **body):
+        return self.client.post("/api/device/storage", json=body,
+                                headers={"Authorization": f"Bearer {self.token}"})
+
+    def _row(self):
+        return self.conn.execute(
+            "SELECT reported_foreign_bytes AS b, foreign_bytes_reported_at AS at, "
+            "reported_free_bytes AS free FROM devices WHERE id = ?",
+            (self.device_id,)).fetchone()
+
+    def test_a_reported_figure_is_stored_and_timestamped(self):
+        self.assertEqual(self._report(free_bytes=1, total_bytes=2, foreign_bytes=4096).status_code, 200)
+        row = self._row()
+        self.assertEqual(row["b"], 4096)
+        self.assertIsNotNone(row["at"])
+
+    def test_zero_is_a_real_measurement_and_is_stored(self):
+        self.assertEqual(self._report(free_bytes=1, total_bytes=2, foreign_bytes=0).status_code, 200)
+        row = self._row()
+        self.assertEqual(row["b"], 0)
+        self.assertIsNotNone(row["at"])
+
+    def test_an_old_client_omitting_the_field_leaves_it_unset(self):
+        """The upgrade path: a client that never learned to measure the
+        folder must not be recorded as having measured it empty."""
+        self.assertEqual(self._report(free_bytes=1, total_bytes=2).status_code, 200)
+        row = self._row()
+        self.assertIsNone(row["b"])
+        self.assertIsNone(row["at"])
+
+    def test_a_later_report_without_the_field_does_not_erase_the_last_one(self):
+        """A client that stops sending it -- a downgrade, or a build where
+        the walk failed -- leaves a stale number that says how stale it is.
+        Erasing it would throw away the only measurement anyone has."""
+        self._report(free_bytes=1, total_bytes=2, foreign_bytes=4096)
+        self._report(free_bytes=9, total_bytes=9)
+        row = self._row()
+        self.assertEqual(row["b"], 4096)
+        self.assertEqual(row["free"], 9)  # the rest of the report still landed
+
+    def test_an_unusable_value_is_ignored_without_losing_the_rest(self):
+        """Negative, boolean and non-numeric are client bugs. Storing one
+        would quietly shrink or inflate the budget for as long as nobody
+        looked; 400ing the request would lose the free/total figures over a
+        field that is allowed to be missing entirely."""
+        for bad in (-1, "4096", None, True, 1.5):
+            with self.subTest(bad=bad):
+                self.conn.execute(
+                    "UPDATE devices SET reported_foreign_bytes = NULL, "
+                    "foreign_bytes_reported_at = NULL WHERE id = ?", (self.device_id,))
+                self.conn.commit()
+                resp = self._report(free_bytes=7, total_bytes=8, foreign_bytes=bad)
+                self.assertEqual(resp.status_code, 200)
+                row = self._row()
+                self.assertIsNone(row["b"])
+                self.assertEqual(row["free"], 7)
+
+    def test_usage_reports_null_until_a_device_has_measured(self):
+        _login(self.client, self.owner)
+        data = self.client.get(f"/api/devices/{self.device_id}/usage").get_json()
+        self.assertIsNone(data["reported_foreign_bytes"])
+        self.assertIsNone(data["folder_used_bytes"])
+        # Not merely falsy: the UI has to tell "unmeasured" from "empty".
+        self.assertFalse(data["folder_over_limit"])
+
+    def test_usage_reports_the_folder_total_once_measured(self):
+        self._report(free_bytes=1, total_bytes=2, foreign_bytes=6000)
+        _login(self.client, self.owner)
+        data = self.client.get(f"/api/devices/{self.device_id}/usage").get_json()
+        self.assertEqual(data["reported_foreign_bytes"], 6000)
+        self.assertEqual(data["folder_used_bytes"], 6000)  # nothing synced yet
+        # 6000 in a folder limited to 5000, with Trobar holding none of it.
+        self.assertTrue(data["folder_over_limit"])
+        self.assertFalse(data["over_limit"])
+
+
+def _ok(title, tracks):
+    return {"status": "ok", "playlist": title, "tracks": [
+        {"position": i, "title": t, "artist": a, "album": None, "path": None}
+        for i, (a, t) in enumerate(tracks)]}
+
+
+class PlaylistSubscriptionTests(_RouteTestBase):
+    """Public-playlist URL subscriptions: /api/playlist-subscriptions.
+
+    Every test here stubs ytmusic_client.get_playlist_tracks. Nothing
+    reaches YouTube, which is also the acceptance criterion these routes
+    have to meet — a Trobar with no subscriptions makes no external call at
+    all, and one with subscriptions makes exactly the calls its owner asked
+    for."""
+
+    URL = "https://music.youtube.com/playlist?list=PLabc123"
+
+    def _add(self, url=None, response=None):
+        response = response if response is not None else _ok("Road Trip", [("Bon Jovi", "Livin' On A Prayer")])
+        with mock.patch.object(main.ytmusic_client, "get_playlist_tracks", return_value=response):
+            return self.client.post("/api/playlist-subscriptions", json={"url": url or self.URL})
+
+    def _subscriptions(self):
+        return self.conn.execute("SELECT * FROM playlist_subscriptions ORDER BY id").fetchall()
+
+    def _playlists(self):
+        return self.conn.execute(
+            "SELECT * FROM playlists WHERE source_provider = 'ytmusic' ORDER BY id").fetchall()
+
+    def test_adding_a_url_imports_it_immediately(self):
+        _login(self.client, self.owner)
+        resp = self._add()
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["subscription"]["title"], "Road Trip")
+        self.assertEqual(body["subscription"]["track_count"], 1)
+        self.assertEqual(len(self._playlists()), 1)
+
+    def test_the_playlist_it_creates_is_owned_and_private(self):
+        """#496's default, reached through a new route: a subscription is
+        personal, so what it produces starts visible to its owner alone."""
+        _login(self.client, self.owner)
+        self._add()
+        row = self._playlists()[0]
+        self.assertEqual(row["owner_user_id"], self.owner)
+        self.assertEqual(row["shared"], 0)
+
+    def test_a_link_that_is_not_a_playlist_is_rejected_before_any_fetch(self):
+        _login(self.client, self.owner)
+        with mock.patch.object(main.ytmusic_client, "get_playlist_tracks") as fetch:
+            resp = self.client.post(
+                "/api/playlist-subscriptions", json={"url": "https://example.test/nope"})
+        self.assertEqual(resp.status_code, 400)
+        fetch.assert_not_called()
+        self.assertEqual(self._subscriptions(), [])
+
+    def test_re_adding_the_same_playlist_by_another_url_refreshes_it(self):
+        """The same playlist has several URL spellings. Pasting a second
+        one means "this playlist", not "a second playlist"."""
+        _login(self.client, self.owner)
+        self._add()
+        self._add(url="https://www.youtube.com/watch?v=abc&list=PLabc123")
+        self.assertEqual(len(self._subscriptions()), 1)
+        self.assertEqual(len(self._playlists()), 1)
+
+    def test_two_users_subscribing_to_one_playlist_get_one_each(self):
+        """Keyed on the subscription, not the external id. Sharing one row
+        would hand ownership to whoever synced last and reset the other's
+        sharing choice with it."""
+        _login(self.client, self.owner)
+        self._add()
+        _login(self.client, self.other)
+        self._add()
+        rows = self._playlists()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["owner_user_id"] for r in rows}, {self.owner, self.other})
+
+    def test_a_playlist_that_matches_nothing_reports_its_counts(self):
+        """The mix-video case. It imports perfectly and matches nothing,
+        and its URL is indistinguishable from a good playlist's — so the
+        pair of numbers is the only thing that tells a user which they
+        pasted."""
+        _login(self.client, self.owner)
+        resp = self._add(response=_ok("Jazz house mix", [
+            ("Max Shkiv", "90 minute jazz house mix"),
+            ("Max Shkiv", "2 hour lounge mix"),
+        ]))
+        sub = resp.get_json()["subscription"]
+        self.assertEqual((sub["track_count"], sub["matched_count"]), (2, 0))
+
+    def test_an_unavailable_playlist_is_recorded_not_raised(self):
+        _login(self.client, self.owner)
+        resp = self._add(response={"status": "unavailable"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "unavailable")
+        self.assertEqual(self._subscriptions()[0]["last_error"], "unavailable")
+        self.assertEqual(self._playlists(), [])
+
+    def test_a_later_failure_never_removes_the_playlist_already_imported(self):
+        """#71's lesson, on the source most exposed to it: the endpoint is
+        unofficial and will refuse sometimes. A playlist somebody has
+        already synced onto a device must survive that."""
+        _login(self.client, self.owner)
+        self._add()
+        playlist_id = self._playlists()[0]["id"]
+        sub_id = self._subscriptions()[0]["id"]
+
+        with mock.patch.object(main.ytmusic_client, "get_playlist_tracks",
+                               return_value={"status": "unavailable"}):
+            resp = self.client.post(f"/api/playlist-subscriptions/{sub_id}/refresh")
+        self.assertEqual(resp.get_json()["status"], "unavailable")
+
+        rows = self._playlists()
+        self.assertEqual([r["id"] for r in rows], [playlist_id])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) c FROM playlist_tracks WHERE playlist_id = ?",
+                (playlist_id,)).fetchone()["c"],
+            1)
+        self.assertEqual(self._subscriptions()[0]["last_error"], "unavailable")
+
+    def test_a_successful_refresh_clears_the_error(self):
+        _login(self.client, self.owner)
+        self._add(response={"status": "unavailable"})
+        sub_id = self._subscriptions()[0]["id"]
+        with mock.patch.object(main.ytmusic_client, "get_playlist_tracks",
+                               return_value=_ok("Back again", [("A", "B")])):
+            self.client.post(f"/api/playlist-subscriptions/{sub_id}/refresh")
+        row = self._subscriptions()[0]
+        self.assertIsNone(row["last_error"])
+        self.assertEqual(row["title"], "Back again")
+
+    def test_a_rename_at_the_source_follows_through(self):
+        _login(self.client, self.owner)
+        self._add()
+        sub_id = self._subscriptions()[0]["id"]
+        with mock.patch.object(main.ytmusic_client, "get_playlist_tracks",
+                               return_value=_ok("Renamed", [("A", "B")])):
+            self.client.post(f"/api/playlist-subscriptions/{sub_id}/refresh")
+        self.assertEqual(self._playlists()[0]["title"], "Renamed")
+
+    def test_removing_a_subscription_removes_its_playlist(self):
+        """Deliberately unlike a failed fetch: this is the user asking for
+        it to go."""
+        _login(self.client, self.owner)
+        self._add()
+        sub_id = self._subscriptions()[0]["id"]
+        resp = self.client.delete(f"/api/playlist-subscriptions/{sub_id}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._subscriptions(), [])
+        self.assertEqual(self._playlists(), [])
+
+    def test_listing_shows_only_your_own(self):
+        _login(self.client, self.owner)
+        self._add()
+        _login(self.client, self.other)
+        self.assertEqual(
+            self.client.get("/api/playlist-subscriptions").get_json()["subscriptions"], [])
+
+    def test_the_admin_cannot_list_someone_elses_either(self):
+        """An admin can already see every playlist a subscription produces.
+        Listing other people's subscribed URLs here would only add a second,
+        less obvious place for one household member's tastes to leak."""
+        _login(self.client, self.owner)
+        self._add()
+        _login(self.client, self.admin)
+        self.assertEqual(
+            self.client.get("/api/playlist-subscriptions").get_json()["subscriptions"], [])
+
+    def test_another_user_cannot_refresh_or_remove_yours(self):
+        _login(self.client, self.owner)
+        self._add()
+        sub_id = self._subscriptions()[0]["id"]
+        _login(self.client, self.other)
+        self.assertEqual(
+            self.client.post(f"/api/playlist-subscriptions/{sub_id}/refresh").status_code, 403)
+        self.assertEqual(
+            self.client.delete(f"/api/playlist-subscriptions/{sub_id}").status_code, 403)
+        self.assertEqual(len(self._subscriptions()), 1)
+
+    def test_the_admin_can_remove_one(self):
+        _login(self.client, self.owner)
+        self._add()
+        sub_id = self._subscriptions()[0]["id"]
+        _login(self.client, self.admin)
+        self.assertEqual(
+            self.client.delete(f"/api/playlist-subscriptions/{sub_id}").status_code, 200)
+
+
+class PlaylistSubscriptionSyncTests(_RouteTestBase):
+    """The subscription merge inside a full sync run, which is a different
+    path from the routes above: the prune pass runs there and is what could
+    delete a playlist behind a failing fetch."""
+
+    def _subscribe(self, owner_user_id, external_id="PLabc123"):
+        cur = self.conn.execute(
+            "INSERT INTO playlist_subscriptions (owner_user_id, provider, external_id, url) "
+            "VALUES (?, 'ytmusic', ?, ?)",
+            (owner_user_id, external_id, f"https://music.youtube.com/playlist?list={external_id}"))
+        self.conn.commit()
+        return sync_state._new_id(cur)
+
+    def _sync(self, response=None, side_effect=None):
+        """A full sync run with a do-nothing active provider, so what is
+        under test is the subscription merge and the prune pass around it
+        rather than any particular provider's listing."""
+        provider = mock.Mock()
+        provider.list_playlists.return_value = {"status": "ok", "playlists": []}
+        with mock.patch.object(playlist_sync.ytmusic_client, "get_playlist_tracks",
+                               return_value=response, side_effect=side_effect):
+            return playlist_sync.sync_playlists(provider, "subsonic")
+
+    def test_a_subscription_is_merged_in_alongside_the_active_provider(self):
+        self._subscribe(self.owner)
+        result = self._sync(_ok("Road Trip", [("Bon Jovi", "Livin' On A Prayer")]))
+        self.assertEqual(result["status"], "ok")
+        rows = self.conn.execute(
+            "SELECT title, owner_user_id FROM playlists WHERE source_provider = 'ytmusic'").fetchall()
+        self.assertEqual([(r["title"], r["owner_user_id"]) for r in rows], [("Road Trip", self.owner)])
+
+    def test_with_no_subscriptions_the_client_is_never_called(self):
+        """Opt-in, measured rather than asserted in prose: zero external
+        calls when nobody has subscribed to anything."""
+        provider = mock.Mock()
+        provider.list_playlists.return_value = {"status": "ok", "playlists": []}
+        with mock.patch.object(playlist_sync.ytmusic_client, "get_playlist_tracks") as fetch:
+            playlist_sync.sync_playlists(provider, "subsonic")
+        fetch.assert_not_called()
+
+    def test_the_prune_pass_spares_a_playlist_whose_fetch_failed(self):
+        """Without the explicit protection this is exactly how the playlist
+        disappears: its key is not in listed_keys this run, and 'ytmusic'
+        is in provider_ids, so the stale pass would take it."""
+        self._subscribe(self.owner)
+        self._sync(_ok("Road Trip", [("Bon Jovi", "Livin' On A Prayer")]))
+        before = self.conn.execute(
+            "SELECT id FROM playlists WHERE source_provider = 'ytmusic'").fetchone()["id"]
+
+        result = self._sync({"status": "unavailable"})
+        after = self.conn.execute(
+            "SELECT id FROM playlists WHERE source_provider = 'ytmusic'").fetchall()
+        self.assertEqual([r["id"] for r in after], [before])
+        self.assertEqual(result["removed"], 0)
+
+    def test_one_subscription_failing_does_not_take_another_users_with_it(self):
+        self._subscribe(self.owner, "PLone")
+        self._subscribe(self.other, "PLtwo")
+        calls = []
+
+        def per_subscription(title, external_id):
+            calls.append(external_id)
+            if external_id == "PLone":
+                return {"status": "unavailable"}
+            return _ok("Theirs", [("A", "B")])
+
+        # Seed both, then fail only one.
+        self._sync(_ok("Seeded", [("A", "B")]))
+        self._sync(side_effect=per_subscription)
+        rows = self.conn.execute(
+            "SELECT title FROM playlists WHERE source_provider = 'ytmusic' ORDER BY id").fetchall()
+        self.assertEqual([r["title"] for r in rows], ["Seeded", "Theirs"])
+        self.assertEqual(sorted(calls), ["PLone", "PLtwo"])
 
 
 class AdminConfigUrlValidationTests(_RouteTestBase):
@@ -2467,6 +2988,308 @@ class PerDeviceBasketTests(_RouteTestBase):
         self.assertEqual(self._device_ids_for(item_id), [self.device_a])
 
 
+class RememberedDestinationPruningTests(_RouteTestBase):
+    """Deleting a device must not leave its id behind in any user's
+    remembered picker destinations.
+
+    users.basket_last_destinations is a JSON column, so nothing cascades
+    it. A leftover id is worse than useless: the picker only renders
+    checkboxes for devices that still exist, so the dead id cannot be
+    seen or unchecked, but it is still pre-selected on every pick from
+    that surface -- and _require_device_access then 404s the whole
+    add/send with "Device not found"."""
+
+    def setUp(self):
+        super().setUp()
+        self.device_a, _ = sync_state.create_device(self.conn, self.owner, "phone")
+        self.device_b, _ = sync_state.create_device(self.conn, self.owner, "tablet")
+        self.conn.commit()
+        _login(self.client, self.owner)
+
+    def _remember(self, surface, device_ids):
+        resp = self.client.patch("/api/basket/last-destination", json={
+            "surface": surface, "device_ids": device_ids})
+        self.assertEqual(resp.status_code, 200)
+
+    def _remembered(self, user_id=None):
+        """Read the column directly rather than via GET /api/profile: the
+        point of these tests is what is left in the DB, and a read-time
+        filter added later must not be able to make them pass while the
+        stored value is still poisoned."""
+        row = self.conn.execute(
+            "SELECT basket_last_destinations FROM users WHERE id = ?",
+            (self.owner if user_id is None else user_id,),
+        ).fetchone()
+        raw = row["basket_last_destinations"]
+        return json.loads(raw) if raw else {}
+
+    def test_remembering_a_destination_round_trips(self):
+        # Guards the tests below: if the PATCH stored nothing, every
+        # "the id is gone" assertion would pass against a device that was
+        # never remembered in the first place.
+        self._remember("library", [self.device_a, self.device_b])
+        self.assertEqual(self._remembered(), {"library": [self.device_a, self.device_b]})
+
+    def test_deleting_a_device_prunes_it_and_leaves_its_neighbour(self):
+        self._remember("library", [self.device_a, self.device_b])
+        resp = self.client.delete(f"/api/devices/{self.device_a}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._remembered(), {"library": [self.device_b]})
+
+    def test_the_reported_failure_a_send_after_the_delete_no_longer_carries_a_dead_id(self):
+        # End to end over the API, in the order the report describes:
+        # remember, delete, then stage from that surface with exactly the
+        # ids the picker would pre-select. Before the fix the remembered
+        # list still held the deleted id and this POST 404'd.
+        self._remember("library", [self.device_a, self.device_b])
+        self.client.delete(f"/api/devices/{self.device_a}")
+        preselected = self._remembered()["library"]
+        resp = self.client.post("/api/basket", json={
+            "type": "artist", "target": "A", "device_ids": preselected})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_every_surface_is_pruned_not_just_one(self):
+        self._remember("library", [self.device_a])
+        self._remember("suggestions", [self.device_a, self.device_b])
+        self.client.delete(f"/api/devices/{self.device_a}")
+        self.assertEqual(
+            self._remembered(), {"library": [], "suggestions": [self.device_b]})
+
+    def test_a_surface_that_never_named_the_device_is_untouched(self):
+        self._remember("library", [self.device_b])
+        self.client.delete(f"/api/devices/{self.device_a}")
+        self.assertEqual(self._remembered(), {"library": [self.device_b]})
+
+    def test_another_users_memory_of_the_device_is_pruned_too(self):
+        # An admin deleting someone else's device: the pruning cannot be
+        # scoped to the acting user, or the owner keeps the dead id and
+        # hits the failure the deleting admin never sees.
+        self._remember("library", [self.device_a])
+        _login(self.client, self.admin)
+        resp = self.client.delete(f"/api/devices/{self.device_a}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._remembered(self.owner), {"library": []})
+
+    def test_a_malformed_column_does_not_break_the_delete(self):
+        # Same tolerate-garbage contract _basket_last_destinations_dict
+        # already has: a hand-edited DB must not make a device
+        # undeletable.
+        self.conn.execute(
+            "UPDATE users SET basket_last_destinations = ? WHERE id = ?",
+            ("not json at all", self.owner))
+        self.conn.commit()
+        resp = self.client.delete(f"/api/devices/{self.device_a}")
+        self.assertEqual(resp.status_code, 200)
+        gone = self.conn.execute(
+            "SELECT 1 FROM devices WHERE id = ?", (self.device_a,)).fetchone()
+        self.assertIsNone(gone)
+
+    def test_a_failed_delete_leaves_the_memory_alone(self):
+        # The prune shares the delete's transaction, so a delete that
+        # never happens must not prune either. self.other manages neither
+        # device, so this 403s before anything is written.
+        self._remember("library", [self.device_a])
+        _login(self.client, self.other)
+        resp = self.client.delete(f"/api/devices/{self.device_a}")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(self._remembered(self.owner), {"library": [self.device_a]})
+
+
+class ContainedPathTests(unittest.TestCase):
+    """#56/#57/#58: every join of a stored relative path onto a root now goes
+    through main._contained(), which returns None instead of a path that
+    escapes the root.
+
+    No live defect prompted this -- both writers are server-generated. The
+    guard exists so the read and delete sides stop depending on that staying
+    true of every future writer, which is the property app/mirror.py already
+    has for its own writes and these sites did not."""
+
+    ROOT = Path("/srv/music")
+
+    def test_an_ordinary_relative_path_is_joined(self):
+        # The control. Without it, every rejection below would pass against a
+        # function that returned None unconditionally.
+        self.assertEqual(main._contained(self.ROOT, "Artist/Album/01.flac"),
+                         Path("/srv/music/Artist/Album/01.flac"))
+
+    def test_a_bare_filename_is_joined(self):
+        self.assertEqual(main._contained(self.ROOT, "7.png"), Path("/srv/music/7.png"))
+
+    def test_the_root_itself_is_allowed(self):
+        self.assertEqual(main._contained(self.ROOT, "."), self.ROOT)
+
+    def test_a_parent_traversal_is_refused(self):
+        self.assertIsNone(main._contained(self.ROOT, "../etc/passwd"))
+
+    def test_a_traversal_buried_mid_path_is_refused(self):
+        self.assertIsNone(main._contained(self.ROOT, "Artist/../../etc/passwd"))
+
+    def test_an_absolute_path_is_refused(self):
+        # os.path.join() discards the base when the second argument is
+        # absolute; the prefix test is what catches the result.
+        self.assertIsNone(main._contained(self.ROOT, "/etc/passwd"))
+
+    def test_a_sibling_directory_sharing_a_prefix_is_refused(self):
+        # /srv/music-private starts with the base STRING but is not inside
+        # the base DIRECTORY -- the separator in the comparison is what
+        # distinguishes them, and dropping it would silently allow this.
+        self.assertIsNone(main._contained(self.ROOT, "../music-private/x"))
+
+
+class SafeReferrerTests(_RouteTestBase):
+    """#60: /set-language redirects to the referrer, so the referrer is
+    attacker-influenced input and the redirect is an open-redirect sink.
+
+    _safe_referrer() guards it by requiring the referrer's host to be ours
+    and the path to start with a slash. That is necessary and was not
+    sufficient: a path beginning `//` or `/\\` starts with a slash, passes
+    the host check, and is then resolved by the browser as a protocol-
+    relative URL to a DIFFERENT origin -- so the host that was validated is
+    not the host the user lands on.
+
+    The guard had no tests at all before this class, which is why the gap
+    survived. Each rejected shape is named below rather than covered by one
+    example, so a future rewrite has to keep rejecting all of them."""
+
+    ORIGIN = "http://localhost"
+
+    def _location(self, referrer):
+        resp = self.client.get("/set-language/en",
+                               headers={"Referer": referrer} if referrer else {})
+        self.assertEqual(resp.status_code, 302)
+        return resp.headers["Location"]
+
+    def test_a_same_host_path_is_kept(self):
+        # The control. If this failed, every assertion below would pass
+        # against a guard that simply refuses everything.
+        self.assertEqual(self._location(f"{self.ORIGIN}/library"), "/library")
+
+    def test_a_same_host_path_keeps_its_query(self):
+        self.assertEqual(self._location(f"{self.ORIGIN}/a?b=c"), "/a?b=c")
+
+    def test_a_foreign_host_falls_back_home(self):
+        self.assertEqual(self._location("http://evil.example/x"), "/")
+
+    def test_a_protocol_relative_referrer_falls_back_home(self):
+        self.assertEqual(self._location("//evil.example/x"), "/")
+
+    def test_a_double_slash_path_on_our_own_host_falls_back_home(self):
+        # The reported defect. urlsplit() gives path "//evil.example", which
+        # starts with "/" and so passed the old check -- and Location:
+        # //evil.example is protocol-relative, i.e. another origin.
+        self.assertEqual(self._location(f"{self.ORIGIN}//evil.example"), "/")
+
+    def test_a_slash_backslash_path_on_our_own_host_falls_back_home(self):
+        # Same shape via the separator several browsers normalise to "/".
+        self.assertEqual(self._location(f"{self.ORIGIN}/\\evil.example"), "/")
+
+    def test_no_referrer_falls_back_home(self):
+        self.assertEqual(self._location(None), "/")
+
+    def test_the_emitted_location_never_carries_a_foreign_authority(self):
+        # The property, stated once independently of the shapes above: after
+        # this route, the browser must stay on this origin. A new bypass that
+        # nobody thought to enumerate should fail here even if it slips past
+        # every named case.
+        hostile = [
+            "http://evil.example/x", "//evil.example/x",
+            f"{self.ORIGIN}//evil.example", f"{self.ORIGIN}/\\evil.example",
+            f"{self.ORIGIN}//evil.example/path?q=1",
+        ]
+        for referrer in hostile:
+            with self.subTest(referrer=referrer):
+                loc = self._location(referrer)
+                self.assertFalse(loc.startswith("//"), loc)
+                self.assertFalse(loc.startswith("/\\"), loc)
+                self.assertNotIn("evil.example", loc)
+
+
+class DeviceDeleteBasketOrphanTests(_RouteTestBase):
+    """#22: deleting a device must not leave basket_items rows with no
+    device links.
+
+    basket_item_devices cascades on device_id, so the link rows go and the
+    item does not. app/db.py's SCHEMA comment on that table states the
+    no-zero-links invariant as something maintained everywhere a
+    basket_items row is touched -- but the cascade is not a place a row is
+    touched by application code, so it was the one path that broke it. The
+    result is invisible rather than loud: the basket panel renders per
+    device, so an item with no devices has nowhere to appear, cannot be
+    cleared, and accumulates one per delete."""
+
+    def setUp(self):
+        super().setUp()
+        self.device_a, _ = sync_state.create_device(self.conn, self.owner, "phone")
+        self.device_b, _ = sync_state.create_device(self.conn, self.owner, "tablet")
+        self.conn.commit()
+        _login(self.client, self.owner)
+
+    def _stage(self, item_type, target, device_ids):
+        resp = self.client.post("/api/basket", json={
+            "type": item_type, "target": target, "device_ids": device_ids})
+        self.assertEqual(resp.status_code, 200)
+        return resp.get_json()["id"]
+
+    def _item_row_exists(self, item_id):
+        """Reads basket_items directly rather than through GET /api/basket.
+
+        The whole defect is a row that the API cannot show: it renders per
+        device, so an orphaned item is already absent from that response
+        while still sitting in the table. Asserting over the endpoint would
+        pass against the unfixed code."""
+        return self.conn.execute(
+            "SELECT 1 FROM basket_items WHERE id = ?", (item_id,)
+        ).fetchone() is not None
+
+    def _link_count(self, item_id):
+        return self.conn.execute(
+            "SELECT COUNT(*) AS n FROM basket_item_devices WHERE basket_item_id = ?",
+            (item_id,),
+        ).fetchone()["n"]
+
+    def test_staging_creates_the_row_this_suite_asserts_about(self):
+        # Guards the two tests below. Both assert a row is absent after a
+        # delete; if staging never wrote one, or wrote it somewhere
+        # _item_row_exists does not look, they would pass against code that
+        # prunes nothing at all.
+        item_id = self._stage("artist", "A", [self.device_a])
+        self.assertTrue(self._item_row_exists(item_id))
+        self.assertEqual(self._link_count(item_id), 1)
+
+    def test_deleting_the_items_only_device_removes_the_item_row(self):
+        item_id = self._stage("artist", "A", [self.device_a])
+        resp = self.client.delete(f"/api/devices/{self.device_a}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._link_count(item_id), 0)
+        self.assertFalse(self._item_row_exists(item_id))
+
+    def test_an_item_staged_for_a_second_device_survives(self):
+        # The other half of the invariant: prune what the delete orphaned,
+        # and nothing else. An item that still has somewhere to render must
+        # keep its row and its remaining link.
+        item_id = self._stage("artist", "A", [self.device_a, self.device_b])
+        resp = self.client.delete(f"/api/devices/{self.device_a}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(self._item_row_exists(item_id))
+        self.assertEqual(self._link_count(item_id), 1)
+
+    def test_an_unrelated_users_orphan_is_left_alone(self):
+        # Scoped to what this delete orphaned, not a global sweep: a
+        # link-less row produced by any other cause stays put, so a later
+        # producer of this state surfaces instead of being quietly mopped up
+        # by every device deletion.
+        stray = self.conn.execute(
+            "INSERT INTO basket_items (user_id, type, target) VALUES (?, 'artist', 'Z')",
+            (self.owner,),
+        ).lastrowid
+        self.conn.commit()
+        item_id = self._stage("artist", "A", [self.device_a])
+        self.client.delete(f"/api/devices/{self.device_a}")
+        self.assertFalse(self._item_row_exists(item_id))
+        self.assertTrue(self._item_row_exists(stray))
+
+
 class BasketFanOutDelegationTests(_RouteTestBase):
     """#349 (decided 2026-07-28): a basket CAN fan out to a delegated
     device -- this needed no new code, since api_basket_fan_out()'s
@@ -2766,6 +3589,80 @@ class DeviceEndpointTests(_RouteTestBase):
         # (it carries no session cookie) — it fails auth (401) instead of 403.
         r = self.client.post("/api/device/ack", headers={"Origin": "https://evil.example"}, json={})
         self.assertNotEqual(r.status_code, 403)
+
+
+class DeviceRepairCodeRouteTests(_RouteTestBase):
+    """POST /api/devices/<id>/repair-code — mint an enrollment code that
+    re-attaches a reinstalled app to THIS device instead of creating a new
+    one, then redeem it through the wizard's ordinary endpoint."""
+
+    def setUp(self):
+        super().setUp()
+        self.device_id, self.old_token = sync_state.create_device(
+            self.conn, self.owner, "Pixel", "phone")
+        self.conn.commit()
+        _login(self.client, self.owner)
+
+    def _mint(self, device_id=None):
+        return self.client.post(
+            f"/api/devices/{device_id or self.device_id}/repair-code")
+
+    def test_the_reported_failure_a_reinstalled_app_gets_its_device_back(self):
+        # End to end over the API, in the order a user hits it: mint a code in
+        # the web UI, redeem it from a fresh install exactly as the wizard
+        # does. Before this existed there was no request that could do it --
+        # redeem always created a new device.
+        mint = self._mint()
+        self.assertEqual(mint.status_code, 200)
+        code = mint.get_json()["code"]
+
+        redeem = self.client.post("/api/enrollment/redeem",
+                                  json={"code": code, "name": "Pixel"})
+        self.assertEqual(redeem.status_code, 200)
+        self.assertEqual(redeem.get_json()["id"], self.device_id)
+
+        count = self.conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_the_response_carries_the_devices_existing_name(self):
+        # The app displays what it gets back; it must see the device's real
+        # name, not the placeholder it sent.
+        code = self._mint().get_json()["code"]
+        body = self.client.post("/api/enrollment/redeem",
+                                json={"code": code, "name": "Some new phone"}).get_json()
+        self.assertEqual(body["name"], "Pixel")
+
+    def test_a_stranger_cannot_mint_a_repair_code(self):
+        # 403 rather than 404: the device exists, this user just may not
+        # manage it. Minting is the whole attack surface here -- a code is a
+        # bearer credential for someone else's device.
+        _login(self.client, self.other)
+        self.assertEqual(self._mint().status_code, 403)
+
+    def test_minting_for_a_device_that_does_not_exist_is_404(self):
+        self.assertEqual(self._mint(device_id=999999).status_code, 404)
+
+    def test_an_admin_may_mint_but_ownership_does_not_move(self):
+        # An admin helping someone re-pair must not silently acquire the
+        # device: the grant is bound to the OWNER, not to whoever minted it.
+        _login(self.client, self.admin)
+        code = self._mint().get_json()["code"]
+        self.client.post("/api/enrollment/redeem", json={"code": code, "name": "Pixel"})
+        row = self.conn.execute(
+            "SELECT owner_user_id FROM devices WHERE id=?", (self.device_id,)).fetchone()
+        self.assertEqual(row["owner_user_id"], self.owner)
+
+    def test_cross_origin_mint_is_blocked(self):
+        # Same CSRF Origin check every other /api/devices* mutation carries.
+        r = self.client.post(f"/api/devices/{self.device_id}/repair-code",
+                             headers={"Origin": "https://evil.example"})
+        self.assertEqual(r.status_code, 403)
+
+    def test_minting_requires_a_session(self):
+        self.client.get("/logout")
+        with self.client.session_transaction() as sess:
+            sess.clear()
+        self.assertNotEqual(self._mint().status_code, 200)
 
 
 class DeviceTransferRouteTests(_RouteTestBase):
@@ -3202,7 +4099,9 @@ class IntegrationDevicesRouteTests(_RouteTestBase):
             set(row.keys()),
             {
                 "id", "name", "device_type", "owner_user_id", "owner_username",
-                "is_own", "is_pinned", "max_size_bytes", "reported_free_bytes",
+                "is_own", "is_pinned", "max_size_bytes",
+                "reported_foreign_bytes", "foreign_bytes_reported_at",
+                "reported_free_bytes",
                 "reported_total_bytes", "free_bytes_reported_at", "created_at",
                 "last_seen_at", "source_of_truth", "transcode_format",
                 "artist_images", "unknown_track_count", "autofit", "sync_status",
@@ -5064,6 +5963,25 @@ class ProfileWidgetOrderRouteTests(_RouteTestBase):
             resp.get_json()["dashboard_widgets"]["order"], ["recently_added", "library"])
 
 
+class ProfileAdminOnlyWidgetRouteTests(_RouteTestBase):
+    """The whole-profile PUT carries the same admin-only union the narrow
+    PATCH does: a non-admin's request can hide the administration widget
+    further, never un-hide it. The PATCH path had three tests on this and
+    the PUT path none, so neutralising the PUT's union failed nothing."""
+
+    def test_a_non_admin_put_cannot_re_enable_the_admin_widget(self):
+        _login(self.client, self.owner)
+        resp = self.client.put("/api/profile", json={"dashboard_widgets": {"disabled": [], "order": [], "settings": {}}})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["dashboard_widgets"]["disabled"], ["administration"])
+        self.assertEqual(self.client.get("/api/profile").get_json()["dashboard_widgets"]["disabled"], ["administration"])
+
+    def test_an_admin_put_keeps_the_list_it_sent(self):
+        _login(self.client, self.admin)
+        resp = self.client.put("/api/profile", json={"dashboard_widgets": {"disabled": [], "order": [], "settings": {}}})
+        self.assertEqual(resp.get_json()["dashboard_widgets"]["disabled"], [])
+
+
 class ProfileHideZeroMatchPlaylistsRouteTests(_RouteTestBase):
     """#411: hide_zero_match_playlists round-trips through the real route,
     same as cover_limit/order above — and defaults to off (today's
@@ -5264,3 +6182,624 @@ class LibraryQuizPairRouteTests(_RouteTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AppApiAuthTests(_RouteTestBase):
+    """/api/app/* -- the phone's own screens, authenticated by the device
+    token it already holds and acting as the device's owner. Everything
+    here is the boundary: who the token acts as, what it cannot reach, and
+    that the two gate exemptions it needed widened nothing else."""
+
+    def setUp(self):
+        super().setUp()
+        main._rl_failures.clear()
+        self.addCleanup(main._rl_failures.clear)
+        self.device_id, self.token = sync_state.create_device(
+            self.conn, self.owner, "Phone", "phone")
+        self.conn.commit()
+
+    def _whoami(self, token=None, **kw):
+        headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+        return self.client.get("/api/app/whoami", headers=headers, **kw)
+
+    def test_no_header_is_401_with_a_json_error(self):
+        resp = self._whoami()
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn("error", resp.get_json())
+
+    def test_unknown_token_is_401(self):
+        self.assertEqual(self._whoami("not-a-real-token").status_code, 401)
+
+    def test_a_valid_token_acts_as_the_device_owner(self):
+        resp = self._whoami(self.token)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body["user_id"], self.owner)
+        self.assertEqual(body["username"], "owner")
+        self.assertIs(body["is_admin"], False)
+        self.assertEqual(body["device_id"], self.device_id)
+        self.assertEqual(body["device_name"], "Phone")
+        self.assertEqual(body["app_api"], main.APP_API_VERSION)
+
+    def test_regenerating_the_device_token_revokes_the_old_one_here_too(self):
+        sync_state.regenerate_token(self.conn, self.device_id)
+        self.conn.commit()
+        self.assertEqual(self._whoami(self.token).status_code, 401)
+
+    def test_a_device_pinned_to_another_user_still_acts_as_its_owner(self):
+        # Pinning is visibility for the pinner; it never changes who the
+        # device belongs to, so it must never change who its token acts as.
+        self.conn.execute(
+            "INSERT INTO device_pins (user_id, device_id) VALUES (?, ?)", (self.other, self.device_id))
+        self.conn.commit()
+        self.assertEqual(self._whoami(self.token).get_json()["user_id"], self.owner)
+
+    def test_admin_status_is_read_on_every_request_not_cached(self):
+        self.conn.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        self.assertIs(self._whoami(self.token).get_json()["is_admin"], True)
+        self.conn.execute("UPDATE users SET is_admin = 0 WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        self.assertIs(self._whoami(self.token).get_json()["is_admin"], False)
+
+    def test_require_app_admin_is_403_for_a_non_admin_and_silent_for_an_admin(self):
+        with main.app.test_request_context("/api/app/whoami"):
+            main._require_app_admin(True)
+            with self.assertRaises(Exception) as cm:
+                main._require_app_admin(False)
+            self.assertEqual(getattr(cm.exception, "code", None), 403)
+
+    def test_session_routes_stay_gated_and_a_device_token_does_not_open_them(self):
+        # The exemption is by prefix. A session route with no cookie is still
+        # 401 -- and stays 401 when the device token is offered to it, because
+        # the device credential is never consulted outside its two prefixes.
+        self.assertEqual(self.client.get("/api/library/artists").status_code, 401)
+        resp = self.client.get(
+            "/api/library/artists", headers={"Authorization": f"Bearer {self.token}"})
+        self.assertEqual(resp.status_code, 401)
+
+    def test_app_prefix_needs_no_session_at_all(self):
+        # No _login() anywhere in this class: every 200 above already proves
+        # the login gate exempted the prefix. Pinned explicitly for the reader.
+        with self.client.session_transaction() as sess:
+            self.assertNotIn("local_user_id", sess)
+        self.assertEqual(self._whoami(self.token).status_code, 200)
+
+    def test_cross_origin_request_to_the_app_prefix_is_not_csrf_blocked(self):
+        # Bearer-authenticated, no ambient cookie to abuse: the Origin check
+        # must not fire (405 here, since whoami takes no POST -- anything but
+        # the 403 the check would produce). The session route is the control.
+        resp = self.client.post("/api/app/whoami", json={},
+                                headers={"Origin": "https://evil.example",
+                                         "Authorization": f"Bearer {self.token}"})
+        self.assertNotEqual(resp.status_code, 403)
+        _login(self.client, self.owner)
+        control = self.client.post("/api/devices", json={"name": "x"},
+                                   headers={"Origin": "https://evil.example"})
+        self.assertEqual(control.status_code, 403)
+
+    def test_wrong_tokens_share_the_device_backoff_bucket(self):
+        # One bucket for both prefixes: a wrong token against the App API is
+        # the same wrong token against the sync API, and blocking one while
+        # leaving the other open would just move the guessing over.
+        for i in range(30):
+            resp = self._whoami("wrong")
+            self.assertEqual(resp.status_code, 401, f"attempt {i} was not a plain 401")
+        self.assertEqual(self._whoami("wrong").status_code, 429)
+        sync_resp = self.client.get(
+            "/api/device/info", headers={"Authorization": "Bearer wrong"})
+        self.assertEqual(sync_resp.status_code, 429)
+
+    def test_device_info_advertises_the_app_api_version(self):
+        resp = self.client.get(
+            "/api/device/info", headers={"Authorization": f"Bearer {self.token}"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["app_api"], main.APP_API_VERSION)
+
+    def test_every_route_under_the_prefix_refuses_an_unauthenticated_request(self):
+        # The login gate exempts /api/app/ wholesale, so a route added under
+        # it that forgets _authenticated_app_user() is not over-permissioned
+        # but UNAUTHENTICATED, and nothing else would notice. This enumerates
+        # the prefix from the URL map rather than naming routes, so it covers
+        # routes that do not exist yet. Path parameters get a placeholder; a
+        # rule this cannot build fails loudly rather than being skipped.
+        rules = [r for r in main.app.url_map.iter_rules() if r.rule.startswith("/api/app/")]
+        self.assertTrue(rules, "the control: the prefix has routes to check")
+        for rule in rules:
+            built = rule.build({a: 1 for a in rule.arguments}, append_unknown=False)
+            self.assertIsNotNone(built, f"{rule.rule}: give its parameters a placeholder here")
+            assert built is not None  # the line above already failed if not; this narrows the type
+            url = built[1]
+            for method in sorted((rule.methods or set()) - {"HEAD", "OPTIONS"}):
+                resp = self.client.open(url, method=method, json={} if method != "GET" else None)
+                self.assertEqual(resp.status_code, 401, f"{method} {rule.rule} answered without a token")
+
+    def test_a_device_whose_owner_row_is_gone_is_refused_not_a_500(self):
+        # Unreachable through the UI (deleting a user refuses while devices
+        # remain), so the orphan is forced with foreign keys off. The point is
+        # the 401: an orphaned device must not act as anyone, and must not
+        # crash the request either.
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        self.conn.execute("DELETE FROM users WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        resp = self._whoami(self.token)
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn("error", resp.get_json())
+class DashboardWidgetsMonthsTests(unittest.TestCase):
+    """settings.<widget>.months is held to 1-24 on the tolerant path too:
+    a stored or PUT value outside the range is dropped, so the client's
+    default applies, rather than persisted for another client to read."""
+
+    def test_in_range_months_kept(self):
+        result = main._normalize_dashboard_widgets(
+            {"settings": {"recently_added": {"months": 6}, "recently_released": {"months": 24}}})
+        self.assertEqual(result["settings"]["recently_added"], {"months": 6})
+        self.assertEqual(result["settings"]["recently_released"], {"months": 24})
+
+    def test_out_of_range_months_dropped(self):
+        for bad in (0, 25, -3, 99):
+            with self.subTest(months=bad):
+                result = main._normalize_dashboard_widgets(
+                    {"settings": {"recently_added": {"months": bad}}})
+                self.assertNotIn("recently_added", result["settings"])
+
+    def test_non_integer_months_dropped(self):
+        for bad in ("6", 6.5, True, None, [6]):
+            with self.subTest(months=bad):
+                result = main._normalize_dashboard_widgets(
+                    {"settings": {"recently_added": {"months": bad}}})
+                self.assertNotIn("recently_added", result["settings"])
+
+    def test_months_on_a_widget_without_that_setting_dropped(self):
+        result = main._normalize_dashboard_widgets({"settings": {"devices": {"months": 3}}})
+        self.assertNotIn("devices", result["settings"])
+
+    def test_unknown_settings_keys_dropped(self):
+        result = main._normalize_dashboard_widgets({"settings": {"theme": "dark", "cover_limit": 30}})
+        self.assertEqual(result["settings"], {"cover_limit": 30})
+
+
+class DashboardWidgetsPatchRouteTests(_RouteTestBase):
+    """PATCH /api/profile/dashboard-widgets -- the narrow write. Two clients
+    can now edit widget preferences without one overwriting the other's
+    unrelated profile fields, and a malformed request is refused with the
+    field named rather than silently corrected."""
+
+    def _patch(self, body, user=None):
+        _login(self.client, user or self.owner)
+        return self.client.patch("/api/profile/dashboard-widgets", json=body)
+
+    def _stored(self, user=None):
+        _login(self.client, user or self.owner)
+        return self.client.get("/api/profile").get_json()["dashboard_widgets"]
+
+    def test_requires_a_session(self):
+        resp = self.client.patch("/api/profile/dashboard-widgets", json={"order": []})
+        self.assertEqual(resp.status_code, 401)
+
+    def test_returns_the_stored_normalized_preferences(self):
+        resp = self._patch({"order": ["devices", "library"]})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), self._stored())
+        self.assertEqual(resp.get_json()["order"], ["devices", "library"])
+
+    def test_a_settings_patch_leaves_order_and_disabled_alone(self):
+        self._patch({"order": ["devices", "library"], "disabled": ["most_played"]})
+        resp = self._patch({"settings": {"recently_added": {"months": 6}}})
+        body = resp.get_json()
+        self.assertEqual(body["order"], ["devices", "library"])
+        # a non-admin's list always carries the admin-only widget, sorted
+        self.assertEqual(body["disabled"], ["administration", "most_played"])
+        self.assertEqual(body["settings"]["recently_added"], {"months": 6})
+
+    def test_settings_merge_key_by_key(self):
+        self._patch({"settings": {"cover_limit": 30}})
+        body = self._patch({"settings": {"recently_added": {"months": 12}}}).get_json()
+        self.assertEqual(body["settings"]["cover_limit"], 30)
+        self.assertEqual(body["settings"]["recently_added"], {"months": 12})
+
+    def test_the_narrow_write_does_not_touch_other_profile_fields(self):
+        _login(self.client, self.owner)
+        self.client.put("/api/profile", json={"lastfm_username": "someone", "cover_view_mode": "grid"})
+        self._patch({"disabled": ["devices"]})
+        profile = self.client.get("/api/profile").get_json()
+        self.assertEqual(profile["lastfm_username"], "someone")
+        self.assertEqual(profile["cover_view_mode"], "grid")
+
+    def test_months_out_of_range_is_400(self):
+        for bad in (0, 25, "6", 6.5, True):
+            with self.subTest(months=bad):
+                resp = self._patch({"settings": {"recently_released": {"months": bad}}})
+                self.assertEqual(resp.status_code, 400)
+                self.assertIn("error", resp.get_json())
+
+    def test_unknown_settings_key_is_400(self):
+        self.assertEqual(self._patch({"settings": {"theme": "dark"}}).status_code, 400)
+
+    def test_months_on_a_widget_without_that_setting_is_400(self):
+        self.assertEqual(self._patch({"settings": {"devices": {"months": 3}}}).status_code, 400)
+
+    def test_cover_limit_outside_the_curated_set_is_400(self):
+        self.assertEqual(self._patch({"settings": {"cover_limit": 20}}).status_code, 400)
+        self.assertEqual(self._patch({"settings": {"cover_limit": 45}}).status_code, 200)
+
+    def test_ids_must_be_lists_of_strings(self):
+        for bad in ("devices", [1, 2], [None], {"a": 1}):
+            with self.subTest(value=bad):
+                self.assertEqual(self._patch({"disabled": bad}).status_code, 400)
+                self.assertEqual(self._patch({"order": bad}).status_code, 400)
+
+    def test_body_must_be_an_object(self):
+        _login(self.client, self.owner)
+        resp = self.client.patch("/api/profile/dashboard-widgets", json=["order"])
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unknown_widget_ids_in_order_are_kept(self):
+        body = self._patch({"order": ["devices", "from_a_newer_client"]}).get_json()
+        self.assertEqual(body["order"], ["devices", "from_a_newer_client"])
+
+    def test_a_non_admin_cannot_re_enable_the_admin_widget(self):
+        body = self._patch({"disabled": []}).get_json()
+        self.assertIn("administration", body["disabled"])
+
+    def test_an_admin_can_enable_the_admin_widget(self):
+        body = self._patch({"disabled": []}, user=self.admin).get_json()
+        self.assertEqual(body["disabled"], [])
+
+    def test_an_empty_patch_changes_nothing(self):
+        before = self._patch({"order": ["library"], "settings": {"cover_limit": 60}}).get_json()
+        self.assertEqual(self._patch({}).get_json(), before)
+
+
+class AppApiLibraryTests(_RouteTestBase):
+    """/api/app/library/* -- the same library reads as the session routes,
+    behind the device token acting as the owner. Parity with the session
+    route is asserted directly wherever the response is deterministic, and
+    the one per-user input (the Last.fm key) is shown to be the owner's."""
+
+    def setUp(self):
+        super().setUp()
+        self.device_id, self.token = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        self._track("a/x/1.flac", artist="Alpha", album="X", year=2020)
+        self._track("a/x/2.flac", artist="Alpha", album="X", year=2020)
+        self._track("a/y/1.flac", artist="Alpha", album="Y", year=2018, reissue_year=2021)
+        self._track("b/z/1.flac", artist="Beta", album="Z")
+        self._track("b/gone/1.flac", artist="Beta", album="Gone", deleted_at="2026-01-01")
+        self.conn.commit()
+
+    def _track(self, relative_path, **cols):
+        fields = {"relative_path": relative_path, "artist": "A", "album": "B", "title": "T",
+                  "size": 1, "mtime": 0.0}
+        fields.update(cols)
+        self.conn.execute(
+            f"INSERT INTO tracks ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+            tuple(fields.values()))
+
+    def _app(self, path, token=None):
+        return self.client.get(path, headers={"Authorization": f"Bearer {token or self.token}"})
+
+    def _session(self, path, user=None):
+        _login(self.client, user or self.owner)
+        return self.client.get(path)
+
+    def test_artists_match_the_session_route(self):
+        resp = self._app("/api/app/library/artists")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), self._session("/api/library/artists").get_json())
+        by_name = {a["artist"]: a for a in resp.get_json()}
+        self.assertEqual(by_name["Alpha"], {"artist": "Alpha", "track_count": 3, "album_count": 2})
+        self.assertEqual(by_name["Beta"]["album_count"], 1)  # the deleted album is not counted
+
+    def test_albums_match_the_session_route(self):
+        resp = self._app("/api/app/library/albums?artist=Alpha")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), self._session("/api/library/albums?artist=Alpha").get_json())
+        self.assertEqual([a["album"] for a in resp.get_json()], ["X", "Y"])
+        self.assertEqual(resp.get_json()[1]["reissue_year"], 2021)
+
+    def test_similar_artists_use_the_owners_lastfm_key_and_filter_to_the_library(self):
+        self.conn.execute("UPDATE users SET lastfm_api_key = 'owner-key' WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        with mock.patch.object(main.lastfm, "similar_artists",
+                               return_value=["beta", "Nobody", "Alpha", "Beta"]) as similar:
+            resp = self._app("/api/app/library/similar-artists?artist=Alpha")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), ["Beta"])  # itself skipped, unknown dropped, case from the library
+        self.assertEqual(similar.call_args.args[:2], ("Alpha", "owner-key"))
+
+    def test_similar_artists_with_no_artist_still_authenticates_first(self):
+        resp = self.client.get("/api/app/library/similar-artists")
+        self.assertEqual(resp.status_code, 401)
+        with mock.patch.object(main.lastfm, "similar_artists") as similar:
+            self.assertEqual(self._app("/api/app/library/similar-artists").get_json(), [])
+        similar.assert_not_called()
+
+    def test_cover_404s_for_an_unknown_album_with_a_json_error(self):
+        resp = self._app("/api/app/library/cover?artist=Alpha&album=Nope")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("error", resp.get_json())
+
+    def test_cover_serves_the_cached_bytes_with_the_cache_header(self):
+        with mock.patch.object(main, "_contained", return_value=Path("/music/a/x/1.flac")), \
+                mock.patch.object(main.covers, "get_cover", return_value=(b"JPEGBYTES", "image/jpeg")):
+            resp = self._app("/api/app/library/cover?artist=Alpha&album=X")
+            via_session = self._session("/api/library/cover?artist=Alpha&album=X")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, b"JPEGBYTES")
+        self.assertEqual(resp.mimetype, "image/jpeg")
+        self.assertEqual(resp.headers.get("Cache-Control"), "public, max-age=86400")
+        self.assertEqual(resp.data, via_session.data)
+
+    def test_artist_image_serves_bytes_and_a_small_variant(self):
+        with mock.patch.object(main.artist_images, "get_artist_image", return_value=(b"BIG", "image/png")), \
+                mock.patch.object(main.artist_images, "downscale", return_value=(b"SMALL", "image/jpeg")) as down:
+            full = self._app("/api/app/library/artist-image?artist=Alpha")
+            small = self._app("/api/app/library/artist-image?artist=Alpha&size=small")
+        self.assertEqual((full.status_code, full.data, full.mimetype), (200, b"BIG", "image/png"))
+        self.assertEqual((small.status_code, small.data, small.mimetype), (200, b"SMALL", "image/jpeg"))
+        self.assertEqual(full.headers.get("Cache-Control"), "public, max-age=86400")
+        down.assert_called_once()
+
+    def test_artist_image_404s_when_absent_or_unnamed(self):
+        with mock.patch.object(main.artist_images, "get_artist_image", return_value=None):
+            self.assertEqual(self._app("/api/app/library/artist-image?artist=Alpha").status_code, 404)
+        self.assertEqual(self._app("/api/app/library/artist-image").status_code, 404)
+
+    def test_the_session_routes_still_require_a_session(self):
+        for path in ("/api/library/artists", "/api/library/albums?artist=Alpha",
+                     "/api/library/similar-artists?artist=Alpha",
+                     "/api/library/cover?artist=Alpha&album=X", "/api/library/artist-image?artist=Alpha"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 401)
+class AppApiBasketTests(_RouteTestBase):
+    """/api/app/basket*, /api/app/selections, /api/app/devices* -- the
+    staging loop behind the device token. The basket is server-side and per
+    user, so the phone and the browser share one; these tests stage through
+    the app prefix and read back through both."""
+
+    def setUp(self):
+        super().setUp()
+        self.phone, self.token = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        self.car, _ = sync_state.create_device(self.conn, self.owner, "Car", "dap")
+        self.bobs, _ = sync_state.create_device(self.conn, self.other, "Bob's", "phone")
+        self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) VALUES "
+            "('a/x/1.flac', 'Alpha', 'X', 'T', 1, 0.0), ('a/y/1.flac', 'Alpha', 'Y', 'T', 1, 0.0)")
+        self.conn.commit()
+
+    def _app(self, method, path, **kw):
+        return self.client.open(path, method=method, headers={"Authorization": f"Bearer {self.token}"}, **kw)
+
+    def _stage(self, target="Alpha||X", devices=None, type_="album"):
+        # None means "the phone"; an explicit [] is sent as-is (the refusal case).
+        ids = [self.phone] if devices is None else devices
+        return self._app("POST", "/api/app/basket", json={"type": type_, "target": target, "device_ids": ids})
+
+    def test_staging_is_shared_with_the_browser(self):
+        resp = self._stage(devices=[self.phone, self.car])
+        self.assertEqual(resp.status_code, 200)
+        via_app = self._app("GET", "/api/app/basket").get_json()
+        _login(self.client, self.owner)
+        via_session = self.client.get("/api/basket").get_json()
+        self.assertEqual(via_app, via_session)
+        self.assertEqual(len(via_app), 1)
+        self.assertEqual(sorted(via_app[0]["device_ids"]), sorted([self.phone, self.car]))
+        self.assertEqual(via_app[0]["title"], "Alpha — X" if "—" in via_app[0]["title"] else via_app[0]["title"])
+
+    def test_staging_needs_a_destination_and_only_devices_the_owner_may_use(self):
+        self.assertEqual(self._stage(devices=[]).status_code, 400)
+        self.assertEqual(self._stage(devices=[self.bobs]).status_code, 403)
+        self.assertEqual(self._app("GET", "/api/app/basket").get_json(), [])
+
+    def test_unstaging_the_last_device_removes_the_item_never_leaving_it_linkless(self):
+        item = self._stage(devices=[self.phone, self.car]).get_json()["id"]
+        self.assertEqual(self._app("DELETE", f"/api/app/basket/{item}/devices/{self.car}").status_code, 200)
+        self.assertEqual(self._app("GET", "/api/app/basket").get_json()[0]["device_ids"], [self.phone])
+        self.assertEqual(self._app("DELETE", f"/api/app/basket/{item}/devices/{self.phone}").status_code, 200)
+        self.assertEqual(self._app("GET", "/api/app/basket").get_json(), [])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) AS n FROM basket_items").fetchone()["n"], 0)
+
+    def test_fan_out_sends_only_the_named_devices_section(self):
+        self._stage("Alpha||X", devices=[self.phone, self.car])
+        self._stage("Alpha||Y", devices=[self.car])
+        resp = self._app("POST", "/api/app/basket/fan-out", json={"device_ids": [self.phone]})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"status": "ok", "count": 1, "skipped": 0})
+        sel = self.conn.execute(
+            "SELECT s.target, sd.device_id FROM selections s JOIN selection_devices sd ON sd.selection_id = s.id"
+        ).fetchall()
+        self.assertEqual([(r["target"], r["device_id"]) for r in sel], [("Alpha||X", self.phone)])
+        left = {i["target"]: sorted(i["device_ids"]) for i in self._app("GET", "/api/app/basket").get_json()}
+        self.assertEqual(left, {"Alpha||X": [self.car], "Alpha||Y": [self.car]})
+
+    def test_fan_out_to_nowhere_is_refused(self):
+        self._stage()
+        self.assertEqual(self._app("POST", "/api/app/basket/fan-out", json={"device_ids": []}).status_code, 400)
+        self.assertEqual(len(self._app("GET", "/api/app/basket").get_json()), 1)
+
+    def test_last_destination_is_stored_per_surface_and_visible_to_the_browser(self):
+        resp = self._app("PATCH", "/api/app/basket/last-destination",
+                         json={"surface": "app-library", "device_ids": [self.car]})
+        self.assertEqual(resp.status_code, 200)
+        _login(self.client, self.owner)
+        profile = self.client.get("/api/profile").get_json()
+        self.assertEqual(profile["basket_last_destinations"]["app-library"], [self.car])
+
+    def test_selections_devices_and_usage_match_the_session_routes(self):
+        self._stage(devices=[self.phone])
+        self._app("POST", "/api/app/basket/fan-out", json={"device_ids": [self.phone]})
+        app_sel = self._app("GET", "/api/app/selections").get_json()
+        app_dev = self._app("GET", "/api/app/devices").get_json()
+        app_use = self._app("GET", f"/api/app/devices/{self.phone}/usage").get_json()
+        _login(self.client, self.owner)
+        self.assertEqual(app_sel, self.client.get("/api/selections").get_json())
+        self.assertEqual(app_dev, self.client.get("/api/devices").get_json())
+        self.assertEqual(app_use, self.client.get(f"/api/devices/{self.phone}/usage").get_json())
+        self.assertEqual(sorted(d["name"] for d in app_dev), ["Car", "Phone"])  # not Bob's
+        self.assertEqual(app_use["track_count"], 1)
+
+    def test_usage_of_another_users_device_is_403(self):
+        self.assertEqual(self._app("GET", f"/api/app/devices/{self.bobs}/usage").status_code, 403)
+
+    def test_another_users_basket_is_invisible(self):
+        _login(self.client, self.other)
+        self.client.post("/api/basket", json={"type": "album", "target": "Alpha||X", "device_ids": [self.bobs]})
+        self.assertEqual(self._app("GET", "/api/app/basket").get_json(), [])
+
+    def test_another_users_basket_item_cannot_be_removed_by_id(self):
+        # The id comes straight from the URL; the delete must be scoped to
+        # the acting user, not just to the id. Bob's row surviving is the
+        # assertion; the status is not the point.
+        _login(self.client, self.other)
+        bobs_item = self.client.post(
+            "/api/basket", json={"type": "album", "target": "Alpha||X", "device_ids": [self.bobs]}).get_json()["id"]
+        self._app("DELETE", f"/api/app/basket/{bobs_item}")
+        self.assertEqual([i["id"] for i in self.client.get("/api/basket").get_json()], [bobs_item])
+
+    def test_clear_and_remove(self):
+        item = self._stage("Alpha||X").get_json()["id"]
+        self._stage("Alpha||Y")
+        self.assertEqual(self._app("DELETE", f"/api/app/basket/{item}").status_code, 200)
+        self.assertEqual([i["target"] for i in self._app("GET", "/api/app/basket").get_json()], ["Alpha||Y"])
+        self.assertEqual(self._app("DELETE", "/api/app/basket").status_code, 200)
+        self.assertEqual(self._app("GET", "/api/app/basket").get_json(), [])
+
+    def test_fan_out_never_sends_an_item_to_a_device_it_was_not_staged_for(self):
+        # Both devices in one call, each item staged for only one of them:
+        # X must land on the phone only and Y on the car only. The raw
+        # request list, applied to every item, would put both on both.
+        self._stage("Alpha||X", devices=[self.phone])
+        self._stage("Alpha||Y", devices=[self.car])
+        resp = self._app("POST", "/api/app/basket/fan-out", json={"device_ids": [self.phone, self.car]})
+        self.assertEqual(resp.get_json(), {"status": "ok", "count": 2, "skipped": 0})
+        sel = self.conn.execute(
+            "SELECT s.target, sd.device_id FROM selections s JOIN selection_devices sd ON sd.selection_id = s.id "
+            "ORDER BY s.target, sd.device_id").fetchall()
+        self.assertEqual([(r["target"], r["device_id"]) for r in sel],
+                         [("Alpha||X", self.phone), ("Alpha||Y", self.car)])
+        self.assertEqual(self._app("GET", "/api/app/basket").get_json(), [])
+
+
+class AppApiDashboardTests(_RouteTestBase):
+    """/api/app/dashboard/*, the widget data routes under the prefix, and
+    the admin-only counts. Every route acts as the device's owner and
+    answers what the session route answers; the two feeds that need a
+    listening history say whether one is configured."""
+
+    def setUp(self):
+        super().setUp()
+        self.phone, self.token = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime, duration, year) VALUES "
+            "('a/x/1.flac', 'Alpha', 'X', 'T', 100, 0.0, 200.0, 1994), "
+            "('a/y/1.mp3', 'Alpha', 'Y', 'U', 50, 0.0, 100.0, 2003)")
+        self.conn.commit()
+
+    def _app(self, method, path, **kw):
+        return self.client.open(path, method=method, headers={"Authorization": f"Bearer {self.token}"}, **kw)
+
+    def test_catalog_is_one_list_served_to_both_clients_and_labelled(self):
+        via_app = self._app("GET", "/api/app/dashboard/catalog").get_json()
+        _login(self.client, self.owner)
+        via_session = self.client.get("/api/dashboard/catalog").get_json()
+        self.assertEqual(via_app, via_session)
+        self.assertEqual([w["id"] for w in via_app if w["admin_only"]], ["administration"])
+        self.assertEqual(via_app[0], {"id": "library", "admin_only": False})
+        # The labels the web renders are keyed by the same ids, in the same
+        # order -- the drift this route exists to prevent.
+        with main.app.test_request_context("/"):
+            labels = main._build_js_i18n()["widgets"]
+        self.assertEqual([w["id"] for w in via_app], list(labels.keys()))
+
+    def test_stats_and_recent_widgets_answer_what_the_session_routes_answer(self):
+        _login(self.client, self.owner)
+        for path in ("/api/library/stats", "/api/library/recently-added?months=3",
+                     "/api/library/recently-released?months=3"):
+            with self.subTest(path=path):
+                self.assertEqual(self._app("GET", path.replace("/api/", "/api/app/", 1)).get_json(), self.client.get(path).get_json())
+        stats = self._app("GET", "/api/app/library/stats").get_json()
+        self.assertEqual(stats["total_tracks"], 2)
+        self.assertEqual(stats["by_codec"], {"flac": {"tracks": 1, "bytes": 100}, "mp3": {"tracks": 1, "bytes": 50}})
+        self.assertEqual(stats["by_decade"], {"1990s": 1, "2000s": 1})
+
+    def test_feeds_say_whether_a_listening_history_is_configured(self):
+        _login(self.client, self.owner)
+        body = self._app("GET", "/api/app/suggestions?period=6month").get_json()
+        self.assertFalse(body["configured"])
+        self.assertEqual(body["items"], self.client.get("/api/suggestions?period=6month").get_json())
+        self.assertEqual(self._app("GET", "/api/app/suggestions/most-played").get_json(),
+                         {"configured": False, "items": []})
+        self.conn.execute("UPDATE users SET lastfm_username = 'alice' WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        ranked = [{"artist": "Alpha", "album": "X", "playcount": 5}, {"artist": "Beta", "album": "Z", "playcount": 9}]
+        with mock.patch.object(main.lastfm, "suggestions", return_value=[]), \
+                mock.patch.object(main.lastfm, "recently_played_suggestions", return_value=[]), \
+                mock.patch.object(main.lastfm, "most_played", return_value=ranked):
+            self.assertTrue(self._app("GET", "/api/app/suggestions").get_json()["configured"])
+            body = self._app("GET", "/api/app/suggestions/most-played?limit=1").get_json()
+        self.assertTrue(body["configured"])
+        self.assertEqual(body["items"], [ranked[1]])  # re-ranked by playcount, then cut to the limit
+
+    def test_admin_counts_need_an_admin_owner_on_both_prefixes(self):
+        self.assertEqual(self._app("GET", "/api/app/admin/counts").status_code, 403)
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.get("/api/admin/counts").status_code, 403)
+        self.conn.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (self.owner,))
+        self.conn.execute("INSERT INTO device_delegations (grantee_user_id, target_user_id) VALUES (?, ?)",
+                          (self.other, self.owner))
+        self.conn.commit()
+        expected = {"users": 3, "delegations": 1}
+        self.assertEqual(self._app("GET", "/api/app/admin/counts").get_json(), expected)
+        self.assertEqual(self.client.get("/api/admin/counts").get_json(), expected)
+
+    def test_widget_preferences_read_and_patch_under_the_prefix(self):
+        stored = self._app("GET", "/api/app/dashboard/widgets").get_json()
+        self.assertEqual(stored, {"disabled": [], "order": [], "settings": {"cover_limit": 15}})
+        resp = self._app("PATCH", "/api/app/dashboard/widgets",
+                         json={"disabled": ["devices"], "settings": {"recently_added": {"months": 6}}})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        # a non-admin's list always carries the admin-only widget, sorted
+        self.assertEqual(body["disabled"], ["administration", "devices"])
+        self.assertEqual(body["settings"], {"cover_limit": 15, "recently_added": {"months": 6}})
+        self.assertEqual(self._app("GET", "/api/app/dashboard/widgets").get_json(), body)
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.get("/api/profile").get_json()["dashboard_widgets"], body)
+        self.assertEqual(self._app("PATCH", "/api/app/dashboard/widgets", json={"settings": {"cover_limit": 7}}).status_code, 400)
+        self.assertEqual(self._app("PATCH", "/api/app/dashboard/widgets", data="[]",
+                                   content_type="application/json").status_code, 400)
+
+
+class AppApiProfileTests(_RouteTestBase):
+    """/api/app/profile -- the owner's display preferences and last chosen
+    destinations, read through the device token; what the browser set is
+    what the phone sees, and nothing else from the profile row."""
+
+    def setUp(self):
+        super().setUp()
+        self.phone, self.token = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+
+    def _app(self, method, path, **kw):
+        return self.client.open(path, method=method, headers={"Authorization": f"Bearer {self.token}"}, **kw)
+
+    def test_defaults_for_a_fresh_account(self):
+        self.assertEqual(self._app("GET", "/api/app/profile").get_json(),
+                         {"cover_view_mode": "list", "show_reissue_year": False, "basket_last_destinations": {}})
+
+    def test_reads_what_the_browser_set_and_what_the_phone_patched(self):
+        _login(self.client, self.owner)
+        self.client.put("/api/profile", json={"cover_view_mode": "grid", "show_reissue_year": True,
+                                              "dashboard_widgets": {"disabled": [], "order": [], "settings": {}}})
+        self._app("PATCH", "/api/app/basket/last-destination", json={"surface": "app-library", "device_ids": [self.phone]})
+        body = self._app("GET", "/api/app/profile").get_json()
+        self.assertEqual(body["cover_view_mode"], "grid")
+        self.assertIs(body["show_reissue_year"], True)
+        self.assertEqual(body["basket_last_destinations"], {"app-library": [self.phone]})
+        # Only these three keys: no scrobble usernames or keys reach a phone.
+        self.assertEqual(set(body), {"cover_view_mode", "show_reissue_year", "basket_last_destinations"})
+
+    def test_is_the_owners_row_not_another_users(self):
+        _login(self.client, self.other)
+        self.client.put("/api/profile", json={"cover_view_mode": "grid", "show_reissue_year": False,
+                                              "dashboard_widgets": {"disabled": [], "order": [], "settings": {}}})
+        self.assertEqual(self._app("GET", "/api/app/profile").get_json()["cover_view_mode"], "list")

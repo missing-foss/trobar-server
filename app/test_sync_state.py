@@ -17,6 +17,7 @@ regression here hurts users directly.
 In-memory SQLite (db.SCHEMA + db._run_migrations()), no Flask — same
 harness pattern as test_selections.py / test_playlist_sync.py.
 """
+import json
 import sqlite3
 import unittest
 
@@ -558,6 +559,116 @@ class EnrollmentGrantTests(unittest.TestCase):
         self.assertIsNotNone(sync_state.redeem_enrollment_grant(self.conn, code, "A", "phone", None))
         self.assertIsNone(sync_state.redeem_enrollment_grant(self.conn, code, "B", "phone", None))
 
+    # --- Re-pairing an existing device -----------------------------
+
+    def test_a_device_bound_code_returns_the_same_device_not_a_new_one(self):
+        # The whole point: a reinstalled app gets its device back, with the
+        # selections and settings that outlived the uninstall still attached.
+        device_id, old_token = sync_state.create_device(
+            self.conn, self.user, "Pixel", "phone", max_size_bytes=5_000_000)
+        self.conn.commit()
+        code = sync_state.create_enrollment_grant(self.conn, self.user, device_id=device_id)
+
+        result = sync_state.redeem_enrollment_grant(self.conn, code, "ignored", "phone", None)
+        assert result is not None
+        got_id, new_token = result
+
+        self.assertEqual(got_id, device_id)
+        count = self.conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        self.assertEqual(count, 1)  # no second device was created
+        self.assertIsNotNone(sync_state.authenticate_device(self.conn, new_token))
+
+    def test_re_pairing_keeps_the_devices_own_name_and_settings(self):
+        # The app sends its own defaults on every redeem. Honouring them here
+        # would overwrite exactly what re-pairing exists to preserve.
+        device_id, _ = sync_state.create_device(
+            self.conn, self.user, "Kitchen tablet", "tablet", max_size_bytes=5_000_000)
+        self.conn.commit()
+        code = sync_state.create_enrollment_grant(self.conn, self.user, device_id=device_id)
+
+        sync_state.redeem_enrollment_grant(
+            self.conn, code, "Pixel", "phone", 999, transcode_format="mp3_320")
+
+        row = self.conn.execute(
+            "SELECT name, device_type, max_size_bytes FROM devices WHERE id=?",
+            (device_id,)).fetchone()
+        self.assertEqual(row["name"], "Kitchen tablet")
+        self.assertEqual(row["device_type"], "tablet")
+        self.assertEqual(row["max_size_bytes"], 5_000_000)
+
+    def test_re_pairing_invalidates_the_previous_token(self):
+        # A re-pair is a rotation: whatever the old install still held stops
+        # working, which is the same promise regenerate-token makes.
+        device_id, old_token = sync_state.create_device(self.conn, self.user, "Pixel", "phone")
+        self.conn.commit()
+        code = sync_state.create_enrollment_grant(self.conn, self.user, device_id=device_id)
+
+        sync_state.redeem_enrollment_grant(self.conn, code, "Pixel", "phone", None)
+
+        self.assertIsNone(sync_state.authenticate_device(self.conn, old_token))
+
+    def test_a_code_whose_device_was_deleted_is_refused_not_downgraded(self):
+        # The dangerous case. If a dead device_id fell through to the
+        # create-a-device branch, "re-pair" would silently become "enrol a
+        # brand-new device" at the moment the user least expects it.
+        device_id, _ = sync_state.create_device(self.conn, self.user, "Pixel", "phone")
+        self.conn.commit()
+        code = sync_state.create_enrollment_grant(self.conn, self.user, device_id=device_id)
+        self.conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+        self.conn.commit()
+
+        self.assertIsNone(
+            sync_state.redeem_enrollment_grant(self.conn, code, "Pixel", "phone", None))
+        count = self.conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_a_code_is_refused_if_the_device_changed_hands(self):
+        # Ownership is re-checked at redeem, not trusted from mint time: ten
+        # minutes is long enough for a device to move.
+        other = _make_user(self.conn, "bob")
+        device_id, _ = sync_state.create_device(self.conn, self.user, "Pixel", "phone")
+        self.conn.commit()
+        code = sync_state.create_enrollment_grant(self.conn, self.user, device_id=device_id)
+        self.conn.execute(
+            "UPDATE devices SET owner_user_id = ? WHERE id = ?", (other, device_id))
+        self.conn.commit()
+
+        self.assertIsNone(
+            sync_state.redeem_enrollment_grant(self.conn, code, "Pixel", "phone", None))
+
+    def test_a_device_bound_code_is_single_use_too(self):
+        device_id, _ = sync_state.create_device(self.conn, self.user, "Pixel", "phone")
+        self.conn.commit()
+        code = sync_state.create_enrollment_grant(self.conn, self.user, device_id=device_id)
+
+        self.assertIsNotNone(
+            sync_state.redeem_enrollment_grant(self.conn, code, "Pixel", "phone", None))
+        self.assertIsNone(
+            sync_state.redeem_enrollment_grant(self.conn, code, "Pixel", "phone", None))
+
+    def test_deleting_a_device_drops_its_outstanding_repair_codes(self):
+        # ON DELETE CASCADE: a grant that can never be satisfied should not
+        # sit in the table waiting to be refused.
+        device_id, _ = sync_state.create_device(self.conn, self.user, "Pixel", "phone")
+        self.conn.commit()
+        sync_state.create_enrollment_grant(self.conn, self.user, device_id=device_id)
+        self.assertEqual(self._grant_count(), 1)
+
+        self.conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+        self.conn.commit()
+        self.assertEqual(self._grant_count(), 0)
+
+    def test_an_ordinary_code_still_creates_a_new_device(self):
+        # The unchanged path, pinned alongside the new one: a grant with no
+        # device_id must behave exactly as it did before this existed.
+        code = sync_state.create_enrollment_grant(self.conn, self.user)
+        result = sync_state.redeem_enrollment_grant(self.conn, code, "New phone", "phone", None)
+        assert result is not None
+        device_id, _ = result
+        row = self.conn.execute(
+            "SELECT name FROM devices WHERE id=?", (device_id,)).fetchone()
+        self.assertEqual(row["name"], "New phone")
+
     def _grant_count(self):
         return self.conn.execute("SELECT COUNT(*) FROM enrollment_grants").fetchone()[0]
 
@@ -820,6 +931,128 @@ class RefreshAutofitTests(unittest.TestCase):
         self.assertEqual(summary["budget_bytes"], 2000)
 
 
+class AutofitAgainstPreExistingContentTests(unittest.TestCase):
+    """"Max music size" is the total the user allows in the sync FOLDER, so
+    music already in that folder has to count against it.
+
+    Before this, the budget was Trobar's own byte ledger and nothing else:
+    a fresh install pointed at a folder that already held music filled it to
+    the configured limit on top of what was there, and the real footprint
+    exceeded the limit from the first sync."""
+
+    def setUp(self):
+        self.conn = _make_conn()
+        self.user = _make_user(self.conn)
+
+    def _device(self, budget, foreign=None, percent=100):
+        device, _ = sync_state.create_device(
+            self.conn, self.user, "phone", max_size_bytes=budget)
+        self.conn.execute("UPDATE devices SET autofit_percent = ? WHERE id = ?",
+                          (percent, device))
+        if foreign is not None:
+            self.conn.execute(
+                "UPDATE devices SET reported_foreign_bytes = ?, "
+                "foreign_bytes_reported_at = datetime('now') WHERE id = ?",
+                (foreign, device))
+        self.conn.commit()
+        sel = sync_state.create_autofit_selection(self.conn, device, self.user)
+        return device, sel
+
+    def _library(self):
+        _make_track_sd(self.conn, "Aa", "Ha", "1", "aa/1.flac", size=1000)
+        _make_track_sd(self.conn, "Aa", "Ha", "2", "aa/2.flac", size=1000)
+        _make_track_sd(self.conn, "Bb", "Hb", "1", "bb/1.flac", size=1000)
+        _make_track_sd(self.conn, "Bb", "Hb", "2", "bb/2.flac", size=1000)
+
+    def _fit(self, sel):
+        return sync_state.refresh_autofit(self.conn, sel, [("aa", "ha"), ("bb", "hb")])
+
+    def test_reported_content_comes_off_the_budget(self):
+        self._library()
+        _, sel = self._device(budget=5000, foreign=3000)
+        summary = self._fit(sel)
+        # 5000 limit, 3000 already in the folder -> one 2000 B album, not two.
+        self.assertEqual(summary["albums"], 1)
+        self.assertEqual(summary["bytes"], 2000)
+        self.assertEqual(summary["used_by_foreign_bytes"], 3000)
+        self.assertTrue(summary["foreign_bytes_known"])
+
+    def test_a_folder_already_at_the_limit_fits_nothing(self):
+        self._library()
+        _, sel = self._device(budget=5000, foreign=5000)
+        summary = self._fit(sel)
+        self.assertEqual(summary["reason"], "budget_full")
+        self.assertEqual(summary["albums"], 0)
+
+    def test_a_device_that_has_never_reported_behaves_as_before(self):
+        """The upgrade path. Every device enrolled before the client could
+        measure the folder has NULL here, and auto-fit must not stop working
+        for them -- so NULL is treated as zero for the arithmetic. The
+        difference is carried out separately rather than being lost."""
+        self._library()
+        _, sel = self._device(budget=5000, foreign=None)
+        summary = self._fit(sel)
+        self.assertEqual(summary["albums"], 2)
+        self.assertEqual(summary["bytes"], 4000)
+        self.assertEqual(summary["used_by_foreign_bytes"], 0)
+        self.assertFalse(summary["foreign_bytes_known"])
+
+    def test_measured_empty_is_reported_apart_from_never_measured(self):
+        """The control for the test above: identical arithmetic, different
+        claim. Without this pair, "treated as zero" and "is zero" would be
+        indistinguishable in the summary and the UI would have to guess."""
+        self._library()
+        _, sel = self._device(budget=5000, foreign=0)
+        summary = self._fit(sel)
+        self.assertEqual(summary["albums"], 2)
+        self.assertTrue(summary["foreign_bytes_known"])
+
+    def test_the_share_cap_still_binds_when_it_is_the_lower_one(self):
+        """`percent` keeps meaning a share of the whole limit, not of a
+        remainder -- so with room to spare in the folder it is still the
+        thing that stops the fill."""
+        self._library()
+        _, sel = self._device(budget=10000, foreign=1000, percent=25)
+        summary = self._fit(sel)
+        # share = 2500, folder leaves 9000 -> share binds, one album fits.
+        self.assertEqual(summary["budget_bytes"], 2500)
+        self.assertEqual(summary["albums"], 1)
+
+    def test_the_folder_cap_binds_when_the_share_would_overrun_it(self):
+        """The other side of the min(): a generous share must not be allowed
+        to push the folder past the limit. Subtracting foreign content from
+        the share alone would get this right, but would then wrongly refuse
+        the case above."""
+        self._library()
+        _, sel = self._device(budget=5000, foreign=4000, percent=100)
+        summary = self._fit(sel)
+        # share = 5000 but only 1000 is left in the folder: nothing fits,
+        # because the smallest album here is 2000.
+        self.assertEqual(summary["albums"], 0)
+        self.assertEqual(summary["budget_bytes"], 5000)
+
+    def test_manual_selections_and_pre_existing_content_both_count(self):
+        self._library()
+        _make_track_sd(self.conn, "Manual", "M", "a", "m/a.flac", size=1000)
+        device, sel = self._device(budget=5000, foreign=2000)
+        sync_state.create_selection(self.conn, "artist", "Manual", self.user, [device])
+        summary = self._fit(sel)
+        # 5000 - 2000 foreign - 1000 manual = 2000 left: exactly one album.
+        self.assertEqual(summary["used_by_manual_bytes"], 1000)
+        self.assertEqual(summary["used_by_foreign_bytes"], 2000)
+        self.assertEqual(summary["albums"], 1)
+
+    def test_the_fill_basis_carries_the_same_numbers_as_the_real_fill(self):
+        """The slider preview applies this bound client-side. If the basis
+        did not carry the figure, the preview would promise space the sync
+        would then not use."""
+        device, _ = self._device(budget=5000, foreign=3000)
+        basis = sync_state.autofit_fill_basis(self.conn, device)
+        assert basis is not None  # the device exists; narrows dict | None
+        self.assertEqual(basis["foreign_bytes"], 3000)
+        self.assertTrue(basis["foreign_bytes_known"])
+
+
 class AutofitFillBasisTests(unittest.TestCase):
     """#217: the percent-independent basis for the slider-preview estimate
     (max_size_bytes/manual_bytes/avg_track_bytes) — must never write
@@ -841,7 +1074,11 @@ class AutofitFillBasisTests(unittest.TestCase):
         device, _ = sync_state.create_device(self.conn, self.user, "phone")
         self.assertEqual(
             sync_state.autofit_fill_basis(self.conn, device),
-            {"max_size_bytes": 0, "manual_bytes": 0, "avg_track_bytes": 0})
+            {"max_size_bytes": 0, "manual_bytes": 0, "avg_track_bytes": 0,
+             # False rather than absent: with no limit there is nothing to
+             # measure the folder against, but the caller still has to be
+             # able to tell "not measured" from "measured empty".
+             "foreign_bytes": 0, "foreign_bytes_known": False})
 
     def test_reports_the_device_limit_and_average_track_size(self):
         device, _ = sync_state.create_device(self.conn, self.user, "phone", max_size_bytes=10_000)
@@ -1411,6 +1648,78 @@ class TransferDeviceTests(unittest.TestCase):
         sync_state.transfer_device(self.conn, old, new)
 
         self.assertIsNone(self.conn.execute("SELECT id FROM devices WHERE id = ?", (old,)).fetchone())
+
+    def _remember(self, user_id, mapping):
+        self.conn.execute(
+            "UPDATE users SET basket_last_destinations = ? WHERE id = ?",
+            (json.dumps(mapping), user_id))
+        self.conn.commit()
+
+    def _remembered(self, user_id):
+        raw = self.conn.execute(
+            "SELECT basket_last_destinations FROM users WHERE id = ?",
+            (user_id,)).fetchone()["basket_last_destinations"]
+        return json.loads(raw) if raw else {}
+
+    def test_remembered_destinations_follow_the_device_to_its_replacement(self):
+        # The transfer is a swap, so the smart-default follows rather than
+        # being forgotten -- the same treatment selection_devices gets. A
+        # prune here would be correct but would silently reset a preference
+        # the user never asked to lose.
+        old, _ = sync_state.create_device(self.conn, self.user, "Old", "phone")
+        new, _ = sync_state.create_device(self.conn, self.user, "New", "phone")
+        self._remember(self.user, {"library": [old]})
+
+        sync_state.transfer_device(self.conn, old, new)
+
+        self.assertEqual(self._remembered(self.user), {"library": [new]})
+
+    def test_the_remap_leaves_other_devices_in_the_list_alone(self):
+        old, _ = sync_state.create_device(self.conn, self.user, "Old", "phone")
+        new, _ = sync_state.create_device(self.conn, self.user, "New", "phone")
+        bystander, _ = sync_state.create_device(self.conn, self.user, "Tablet", "tablet")
+        self._remember(self.user, {"library": [old, bystander], "suggestions": [bystander]})
+
+        sync_state.transfer_device(self.conn, old, new)
+
+        self.assertEqual(
+            self._remembered(self.user),
+            {"library": [new, bystander], "suggestions": [bystander]})
+
+    def test_remembering_both_devices_collapses_to_one_entry(self):
+        # Otherwise the replacement would appear twice in the same surface,
+        # which renders as one checkbox but two ids on every subsequent send.
+        old, _ = sync_state.create_device(self.conn, self.user, "Old", "phone")
+        new, _ = sync_state.create_device(self.conn, self.user, "New", "phone")
+        self._remember(self.user, {"library": [old, new]})
+
+        sync_state.transfer_device(self.conn, old, new)
+
+        self.assertEqual(self._remembered(self.user), {"library": [new]})
+
+    def test_another_users_memory_of_the_transferred_device_is_remapped_too(self):
+        # A delegate or admin can have remembered a device they do not own.
+        other = _make_user(self.conn, "bob")
+        old, _ = sync_state.create_device(self.conn, self.user, "Old", "phone")
+        new, _ = sync_state.create_device(self.conn, self.user, "New", "phone")
+        self._remember(other, {"library": [old]})
+
+        sync_state.transfer_device(self.conn, old, new)
+
+        self.assertEqual(self._remembered(other), {"library": [new]})
+
+    def test_a_malformed_column_does_not_break_the_transfer(self):
+        old, _ = sync_state.create_device(self.conn, self.user, "Old", "phone")
+        new, _ = sync_state.create_device(self.conn, self.user, "New", "phone")
+        self.conn.execute(
+            "UPDATE users SET basket_last_destinations = ? WHERE id = ?",
+            ("not json at all", self.user))
+        self.conn.commit()
+
+        sync_state.transfer_device(self.conn, old, new)
+
+        self.assertIsNone(
+            self.conn.execute("SELECT id FROM devices WHERE id = ?", (old,)).fetchone())
 
     def test_returns_a_summary(self):
         old, _ = sync_state.create_device(self.conn, self.user, "Old Watch", "watch")

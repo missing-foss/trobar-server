@@ -10,6 +10,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable, so the release workflow runs these same gates on a tag --
+  # called, not copied, so they cannot drift from what merges see.
+  workflow_call:
 
 permissions:
   contents: read
@@ -195,9 +198,22 @@ jobs:
         # Download the binary rather than use gitleaks-action: the org Actions
         # policy only allows GitHub-owned + verified-creator actions, and a
         # run step isn't subject to that allowlist.
+        #
+        # Downloaded to a file and sha256-verified BEFORE extraction, not piped
+        # into tar. An unverified archive feeding an extractor, whose extracted
+        # binary is then run over the whole repository, is a supply-chain step
+        # with no check on it. The pin is the digest of the real upstream
+        # artifact, computed from it rather than copied between workflows.
         run: |
+          set -euo pipefail
           v=8.24.3
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz" | tar -xz gitleaks
+          sha=9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+          curl -sSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz"
+          echo "${sha}  gitleaks.tar.gz" | sha256sum -c -
+          echo "GUARD gitleaks: archive sha256 verified against the pin"
+          tar -xzf gitleaks.tar.gz gitleaks
+          rm gitleaks.tar.gz
           ./gitleaks git --no-banner .
       - name: REUSE lint (per-file SPDX licensing, #122)
         # reuse is installed via app/requirements-dev.txt above.

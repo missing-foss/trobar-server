@@ -10,7 +10,16 @@ Playlists come from your active library provider (Roon / Jellyfin / Emby /
 Plex / LMS / Subsonic) and from each member's personal [Tidal](../providers/tidal.md) /
 [Spotify](../providers/spotify.md) accounts, merged into one pool. Filesystem
 alone has no provider playlists — see
-[Providers overview](../providers/index.md).
+[Providers overview](../providers/index.md). Any household member can also
+paste the link to a public
+[YouTube Music](../providers/youtube-music.md) playlist, with no account at
+all.
+
+Two local sources merge in on top of that, whichever provider is active:
+`.m3u`/`.m3u8` files under your music folder (always), and, when an admin
+configures them, an [extra playlist folder](../providers/filesystem.md#playlists-your-player-keeps-somewhere-else)
+outside it or an exported [iTunes/Apple Music](../providers/itunes.md)
+library.
 
 ## How they sync
 
@@ -106,6 +115,15 @@ Playlist mirrors**, have the full detail.
   Jellyfin provider connection even when both point at the same server.
   Matched the same way (artist/album/title), with the same silent-drop
   behavior for tracks the target doesn't have.
+
+    One thing here depends on the **server's version**, not on anything
+    Trobar chooses. If a source playlist lists the same track twice,
+    Jellyfin 10.11 collapses it to a single entry, while Jellyfin 12.0
+    keeps both — it dropped the constraint that made a repeat impossible.
+    Measured on 10.11.11 and 12.0.0. So the same source playlist can
+    produce a mirror with a different track count on two different
+    servers, and neither is a fault: 12.0 reproduces what your playlist
+    actually says.
 - **Emby** does the same against an Emby server, matched and
   connected the same way as the Jellyfin sink. One Emby-specific quirk:
   Emby reliably reverts the mirror's descriptive comment a few seconds

@@ -79,6 +79,28 @@ Full field-by-field reference (types, null semantics, rate-limit details)
 and worked recipes for Home Assistant, Grafana, and shell monitors:
 [Integration API](integration-api.md).
 
+## App API
+
+The per-device token above now opens a **second route group**,
+`/api/app/*`, for the Android app's own screens — library browsing, the
+basket, the Home dashboard — so that what a browser can do on the road can
+be done from the phone. No new credential: the token the phone holds from
+pairing is resolved to the device, then to the device's **owner**, and
+every route acts as that account, with admin re-checked on every request.
+
+What it can do is bounded by what the owner can do in a browser: stage to
+their own and pinned devices, send the basket, read the selections and
+devices they can see, read and narrowly write their own dashboard
+preferences. What it cannot do is listed as deliberately as what it can —
+no direct selection creation, no whole-profile write, no admin listings
+(counts only). The sync protocol under `/api/device/*` is untouched and
+stays its own contract; a breaking change under the App API prefix bumps
+the `app_api` level that `/api/device/info` advertises, which is what a
+client checks — never the server version.
+
+Full route-by-route reference, the compatibility rule, and the shapes the
+two prefixes share and do not share: [App API](app-api.md).
+
 ## Database-loss recovery
 
 A device can upload its **manifest** and the server re-matches it against the

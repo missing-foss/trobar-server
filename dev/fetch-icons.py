@@ -62,6 +62,11 @@ ICONS = {
     # which silently rendered as a blank icon next to "Spotify" in the
     # streaming-accounts card.
     "provider-spotify": "simple-icons:spotify",
+    # Public-playlist URL import. Same brand-glyph treatment as Tidal and
+    # Spotify above -- without it the playlist row falls back to the
+    # neutral music glyph, which reads as "unknown source" next to rows
+    # that name theirs.
+    "provider-ytmusic": "simple-icons:youtubemusic",
     # integrations / suggestion sources
     "lastfm": "simple-icons:lastdotfm",
     "listenbrainz": "selfhst:listenbrainz-dark",

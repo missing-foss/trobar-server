@@ -221,6 +221,102 @@ test.describe("cross-surface staging basket (#303/#501)", () => {
     expect(sel.device_ids.split(",").map(Number)).toContain(device.id);
   });
 
+  test("a remembered destination that no longer exists is dropped when the picker opens", async ({ page }) => {
+    // The reported failure: deleting a device left its id in
+    // basket_last_destinations, the picker copied it into deviceIds, and
+    // because the checkbox list only renders devices that still exist it
+    // could be neither seen nor unchecked — every send from that surface
+    // then failed wholesale with "Device not found".
+    //
+    // The server now prunes on deletion, so deleting a device here would
+    // no longer leave anything for the picker to filter and this test
+    // would pass without exercising the frontend at all. What it asserts
+    // instead is the case the server-side prune cannot reach: an install
+    // that already carried a dead id before the prune existed. That state
+    // is reproducible exactly, because the PATCH below records ids without
+    // checking them against `devices` — which is how the poison got in.
+    const created = await page.request.post("/api/devices", {
+      data: { name: "basket-stale-device" },
+    });
+    expect(created.ok()).toBeTruthy();
+    const device = await created.json();
+
+    const DEAD_DEVICE_ID = 999999;
+    const remembered = await page.request.patch("/api/basket/last-destination", {
+      data: { surface: "stale-surface", device_ids: [device.id, DEAD_DEVICE_ID] },
+    });
+    expect(remembered.ok()).toBeTruthy();
+
+    // A distinct surface name, not the 'library' the memory test above
+    // uses: these run against one shared server-side profile, so reusing
+    // it would have this test's leftovers decide what a later one opens
+    // pre-checked.
+    await gotoHome(page);
+    await appData(page, "app.openDevicePicker('artist', 'E2E Stale Target', 'stale-surface');");
+
+    // The surviving device is still remembered — the filter drops the dead
+    // id, it doesn't give up on the smart-default.
+    await expect(page.getByRole("checkbox", { name: "basket-stale-device" })).toBeChecked();
+    expect(await appData(page, "return app.picker.deviceIds;")).toEqual([device.id]);
+
+    // And the send that used to 404 now goes through.
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/basket/fan-out") && r.request().method() === "POST"),
+      page.getByRole("button", { name: "Add & send now", exact: true }).click(),
+    ]);
+    await expect.poll(() => appData(page, "return app.picker.open;")).toBe(false);
+
+    const selections = await (await page.request.get("/api/selections")).json();
+    const sel = selections.find((s) => s.type === "artist" && s.target === "E2E Stale Target");
+    expect(sel).toBeTruthy();
+    expect(sel.device_ids.split(",").map(Number)).toEqual([device.id]);
+
+    // _rememberPickerDestination() saved the filtered list back, so the
+    // install has healed itself — this is what stops the dead id coming
+    // round again on the next pick.
+    const profile = await (await page.request.get("/api/profile")).json();
+    expect(profile.basket_last_destinations["stale-surface"]).toEqual([device.id]);
+  });
+
+  test("a remembered destination survives the picker being opened before the device list has loaded", async ({ page }) => {
+    // The filter above must not treat "devices have not arrived yet" as
+    // "every remembered device was deleted". init() fetches devices and
+    // profile in one Promise.all and Alpine renders while those are still
+    // pending, so the picker can be opened with devices still empty; without
+    // the guard the whole remembered set is dropped, and the user -- shown
+    // nothing pre-selected -- ticks a subset and has that saved over it.
+    //
+    // Emptying app.devices reproduces that state directly. Racing the real
+    // fetch would test the timing of this harness rather than the branch.
+    const created = await page.request.post("/api/devices", {
+      data: { name: "basket-unloaded-device" },
+    });
+    expect(created.ok()).toBeTruthy();
+    const device = await created.json();
+
+    const remembered = await page.request.patch("/api/basket/last-destination", {
+      data: { surface: "unloaded-surface", device_ids: [device.id] },
+    });
+    expect(remembered.ok()).toBeTruthy();
+
+    await gotoHome(page);
+    await appData(page, "app.devices = [];");
+    await appData(page, "app.openDevicePicker('artist', 'E2E Unloaded Target', 'unloaded-surface');");
+
+    // Kept, not filtered away as unknown.
+    expect(await appData(page, "return app.picker.deviceIds;")).toEqual([device.id]);
+
+    // And once the devices actually arrive, the filter is live again --
+    // the guard must not have switched it off for the rest of the session.
+    await appData(page, "app.picker.open = false; return app.loadDevices();");
+    await page.request.patch("/api/basket/last-destination", {
+      data: { surface: "unloaded-surface", device_ids: [device.id, 999999] },
+    });
+    await appData(page, "return app.loadProfile();");
+    await appData(page, "app.openDevicePicker('artist', 'E2E Unloaded Target Two', 'unloaded-surface');");
+    expect(await appData(page, "return app.picker.deviceIds;")).toEqual([device.id]);
+  });
+
   test("Add & send now's label names the count once the section already has something staged (#501)", async ({ page }) => {
     // The issue's own edge case: a quick add must not silently ride along
     // on a pile already built for that device without being visible first.

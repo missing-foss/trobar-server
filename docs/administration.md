@@ -24,11 +24,18 @@ a *different* provider clears playlists and the artist-image cache (they belong
 to the provider that produced them); library, selections, users, and devices are
 untouched. Per-provider details: [Providers](providers/index.md).
 
-The **iTunes/Apple Music Library.xml path** field here is the one exception to
-"one provider at a time" — it's an optional local playlist source layered on
-top of the `.m3u`/`.m3u8` discovery every provider already gets, editable and
-effective regardless of which provider is active. See
-[Filesystem](providers/filesystem.md#what-you-get).
+**Local playlist sources** is the one exception to "one provider at a time".
+Both fields there are layered on top of the `.m3u`/`.m3u8` discovery every
+provider already gets, and both are editable and effective regardless of
+which provider is active:
+
+- **Extra playlist folder** — one folder outside your music library, walked
+  for `.m3u`/`.m3u8` exactly as the library is, for players that keep their
+  playlists in a directory of their own. Read-only; it must not overlap
+  your music folder or the mirror output folder. See
+  [Filesystem](providers/filesystem.md#playlists-your-player-keeps-somewhere-else).
+- **iTunes/Apple Music Library.xml path** — an exported library file. See
+  [iTunes / Apple Music](providers/itunes.md).
 
 ## API keys
 

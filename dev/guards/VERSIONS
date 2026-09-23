@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Canonical guards and the version each product repository should vendor.
+#
+# Format: <file> <version> <sha256-of-that-file>
+# Consumed by guards/verify-vendored.sh, which every repository vendors
+# alongside the guards themselves.
+#
+# To release a change: edit the guard, bump its version, update its hash here
+# (./rehash.sh in missing-foss/dev-guards), then open the vendoring pull request in each
+# repository. Nothing here reaches a repository until that PR is merged.
+check-tracker-refs.py 1.0.1 b4e036fa92fd8d350d2c2a586ba1c88044a13bf0ccbda3e59a19cabf1bad74a1
+verify-vendored.sh 1.0.0 d7ff84d86e48e1b5e06359f172a1ffa88b4debbd406c35a921c1fd3edd3e9889

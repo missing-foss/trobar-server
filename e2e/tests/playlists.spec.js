@@ -19,11 +19,82 @@ const { test, expect } = require("@playwright/test");
 // seeded DB, so that stays untested here the same way it always has been
 // (these rows are client-injected fixtures, not real playlists).
 
+// Every test below seeds `app.playlists` directly, and that seed races the
+// application's own loading of the same array.
+//
+// init() calls loadPlaylists() WITHOUT awaiting it, after a Promise.all of six
+// other fetches, and loadPlaylists() assigns `this.playlists` wholesale rather
+// than merging. So a response still in flight when a test seeds the array
+// replaces the seeded row with the real (empty) library. The row renders, then
+// vanishes; the Mirror… button ceases to exist; and `toBeDisabled()` fails with
+// "element(s) not found" — not on the fixed wait, but five seconds later, since
+// its auto-wait cannot recover something nothing will re-render.
+//
+// The wholesale replacement is deliberate: mirrorPicker holds an id rather than
+// an object, mirrorPickerPlaylist() re-reads the live row, and the picker
+// overlay is x-show-gated on the row still existing — all because a resync can
+// drop a row mid-interaction. The application is not what needs changing here.
+//
+// `waitForTimeout(400)` was a bet that the fetch finishes first. It usually
+// does, which is why this passed for months and then failed twice on unrelated
+// changes. Wait for the condition instead: no playlists response still in
+// flight. A duration guesses; a condition knows.
 async function gotoPlaylists(page) {
+  // Compares the parsed pathname for equality rather than testing a
+  // substring: /api/provider/playlists/sync and .../sync/status share the
+  // prefix, as do the per-playlist routes. Harmless when written -- nothing
+  // in this spec triggers a sync, and these counters are read only inside
+  // this helper before any test body runs -- but the containment was
+  // accidental rather than stated, and a later spec that DID sync would have
+  // satisfied a wait meaning "the start-up loads have settled" with an
+  // unrelated request (#40).
+  const isPlaylistsFetch = (r) => {
+    try {
+      return new URL(r.url()).pathname === "/api/provider/playlists";
+    } catch {
+      return false;
+    }
+  };
+  let inFlight = 0;
+  let settled = 0;
+  // Start-up issues exactly two of these, because init() runs twice. Both must
+  // be accounted for before seeding, and "none currently outstanding" is NOT
+  // enough to establish that.
+  //
+  // I assumed it was, on a measurement taken here: the two fetches overlapped
+  // by about a millisecond, so the in-flight count never reached zero between
+  // them. That held on a quiet machine and failed on CI. A trace from a loaded
+  // runner shows the two starting 228ms apart, with a 138ms window in which
+  // nothing was in flight -- the seed landed inside it at +778ms and the second
+  // response wiped it at +1009ms. Load does not merely make responses slower;
+  // it also spreads the two init() runs apart, which is what opens the gap.
+  //
+  // So wait for both, by count. If the application ever stops issuing exactly
+  // two, this times out and says so, which is the right failure: loud and at
+  // the wait, rather than an intermittent wipe five seconds later in an
+  // assertion that names the wrong thing.
+  const EXPECTED_STARTUP_LOADS = 2;
+  page.on("request", (r) => { if (isPlaylistsFetch(r)) inFlight += 1; });
+  page.on("requestfinished", (r) => { if (isPlaylistsFetch(r)) { inFlight -= 1; settled += 1; } });
+  page.on("requestfailed", (r) => { if (isPlaylistsFetch(r)) { inFlight -= 1; settled += 1; } });
+
   await page.goto("/#/playlists");
+
+  // Alpine attaches after the server-rendered DOM exists, so reaching $data
+  // before it has initialised throws rather than waiting.
+  await page.waitForFunction(
+    () => window.Alpine && !!window.Alpine.$data(document.querySelector("[x-data]")));
+
   await page.evaluate(() =>
     window.Alpine.$data(document.querySelector("[x-data]")).goToTab("playlists"));
-  await page.waitForTimeout(400);
+
+  await expect
+    .poll(() => settled >= EXPECTED_STARTUP_LOADS && inFlight === 0, {
+      message:
+        "waiting for both of the app's own playlists loads to finish before seeding",
+      timeout: 15_000,
+    })
+    .toBe(true);
 }
 
 test.describe("Playlists row mirror picker (#507)", () => {

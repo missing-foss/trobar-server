@@ -20,6 +20,7 @@ title) lookup key the same way, rather than inventing a second scheme."""
 import difflib
 import re
 import sqlite3
+import unicodedata
 
 
 def normalize(s: str) -> str:
@@ -85,20 +86,31 @@ def match_playlist_track_by_path(conn: sqlite3.Connection, path: str) -> int | N
     (e.g. differing NFS mount prefixes) even though the underlying
     Artist/Album/Filename structure is identical — confirmed this is exactly
     the shape Subsonic/Navidrome paths come in (e.g.
-    "Placebo/Placebo/01-01 - Come Home.flac")."""
+    "Placebo/Placebo/01-01 - Come Home.flac").
+
+    Segments are compared after NFC normalisation on both sides. An accent
+    can be stored precomposed or decomposed, the two render identically, and
+    a playlist written on a platform that prefers one form (macOS tools
+    write decomposed) names the same file as a library stored in the other.
+    The SQL prefilter is a byte-level LIKE, so it is asked for both forms of
+    the last segment; otherwise the candidate row would never reach the
+    comparison. A name mixing both forms within one segment is not covered."""
     if not path:
         return None
-    segments = tuple(p for p in path.replace("\\", "/").split("/") if p)
+    segments = tuple(unicodedata.normalize("NFC", p)
+                     for p in path.replace("\\", "/").split("/") if p)
     if not segments:
         return None
 
+    last_forms = sorted({segments[-1], unicodedata.normalize("NFD", segments[-1])})
     rows = conn.execute(
-        "SELECT id, relative_path FROM tracks WHERE deleted_at IS NULL "
-        "AND relative_path LIKE ?",
-        (f"%{segments[-1]}",),
+        "SELECT id, relative_path FROM tracks WHERE deleted_at IS NULL AND ("
+        + " OR ".join("relative_path LIKE ?" for _ in last_forms) + ")",
+        tuple(f"%{form}" for form in last_forms),
     ).fetchall()
     for row in rows:
-        row_segments = tuple(p for p in row["relative_path"].split("/") if p)
+        row_segments = tuple(unicodedata.normalize("NFC", p)
+                             for p in row["relative_path"].split("/") if p)
         n = min(len(segments), len(row_segments))
         if n and segments[-n:] == row_segments[-n:]:
             return row["id"]

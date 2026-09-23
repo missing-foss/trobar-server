@@ -15,6 +15,7 @@ never synced. The fix folds both sides with the same Unicode-aware Python
 normalization via a registered pynorm() function.
 """
 import sqlite3
+import unicodedata
 import unittest
 
 import matching
@@ -123,6 +124,32 @@ class MatchByPathTests(unittest.TestCase):
     def test_no_path_match_returns_none(self):
         _add(self.conn, "Placebo", "Come Home", relative_path="Placebo/Placebo/Come Home.flac")
         self.assertIsNone(matching.match_playlist_track_by_path(self.conn, "Nirvana/Nevermind/Breed.flac"))
+
+    # An accent can be stored precomposed (NFC, "é" as one code point) or
+    # decomposed (NFD, "e" plus a combining accent). Both render identically
+    # and neither is wrong: macOS tools tend to write NFD, most others NFC. A
+    # playlist written in one form and a library on disk in the other are the
+    # same files, and must match.
+    _NFC_PATH = unicodedata.normalize("NFC", "Édith Piaf/Chansons/01 - L'hymne à l'amour.flac")
+    _NFD_PATH = unicodedata.normalize("NFD", _NFC_PATH)
+
+    def test_decomposed_entry_matches_a_precomposed_file(self):
+        self.assertNotEqual(self._NFC_PATH, self._NFD_PATH)  # the fixture really differs
+        tid = _add(self.conn, "Édith Piaf", "L'hymne à l'amour", relative_path=self._NFC_PATH)
+        self.assertEqual(
+            matching.match_playlist_track_by_path(self.conn, "/Volumes/Music/" + self._NFD_PATH), tid)
+
+    def test_precomposed_entry_matches_a_decomposed_file(self):
+        tid = _add(self.conn, "Édith Piaf", "L'hymne à l'amour", relative_path=self._NFD_PATH)
+        self.assertEqual(
+            matching.match_playlist_track_by_path(self.conn, "/music/" + self._NFC_PATH), tid)
+
+    def test_a_different_accent_still_does_not_match(self):
+        """Normalising the form must not turn into ignoring accents: "à"
+        and "a" are different names."""
+        _add(self.conn, "Édith Piaf", "L'hymne à l'amour", relative_path=self._NFC_PATH)
+        self.assertIsNone(matching.match_playlist_track_by_path(
+            self.conn, "Édith Piaf/Chansons/01 - L'hymne a l'amour.flac"))
 
 
 if __name__ == "__main__":

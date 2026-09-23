@@ -411,6 +411,66 @@ class IdempotentRewriteTests(_MirrorJellyfinTestBase):
         self.assertEqual(second_call_remote_id, "77")
 
 
+class RepeatedTrackTests(_MirrorJellyfinTestBase):
+    """A RULING, not an observation: a track that appears more than once in
+    the source playlist is mirrored more than once. The mirror reproduces the
+    source, and the filesystem sink already writes a repeated track as two
+    entries, so flattening here would make the sinks disagree about what a
+    playlist is.
+
+    Whether the repeat survives on the target is the server's business, not
+    ours: Jellyfin 10.11.11 flattens it, 12.0 keeps it (both measured, see
+    mirror_create_or_replace_playlist()'s docstring). What this pins is that
+    Trobar sends it. Removing a repeat before the POST looks like an obvious
+    tidy-up, and it is exactly the change this test exists to refuse.
+
+    Deliberately NOT mocked at the jellyfin_client boundary like the rest of
+    this file: a mock there would record whatever list it was handed, so a
+    dedupe inside the client would pass unseen. Only the HTTP call is faked,
+    so the list is read off the wire, after every layer that could drop a
+    repeat (the playlist_tracks join, the tag lookup, the client)."""
+
+    def test_a_repeated_track_reaches_the_post_unchanged(self):
+        track_a = self._make_track("Artist", "Album", "Song A")
+        track_b = self._make_track("Artist", "Album", "Song B")
+        tag_index = {
+            _key("Artist", "Album", "Song A"): [{"id": "sA", "track_no": None}],
+            _key("Artist", "Album", "Song B"): [{"id": "sB", "track_no": None}],
+        }
+
+        def resp(status_code, body=None):
+            r = mock.Mock()
+            r.status_code = status_code
+            r.content = b"x" if body is not None else b""
+            r.json.return_value = body if body is not None else {}
+            return r
+
+        cases = {
+            # no remote playlist yet: one POST /Playlists carrying Ids
+            "create": (None, [resp(200, {"Id": "42"})],
+                       lambda calls: calls[0].kwargs["json"]["Ids"]),
+            # existing remote: GET, DELETE, then POST .../Items carrying ids
+            "replace": ("42", [resp(200, {"Items": [{"Id": "sA"}]}), resp(204), resp(204)],
+                        lambda calls: calls[2].kwargs["params"]["ids"].split(",")),
+        }
+        for branch, (remote_id, responses, posted_ids) in cases.items():
+            with self.subTest(branch=branch):
+                pid = self._make_playlist(f"Repeats ({branch})", remote_id=remote_id)
+                for position, track_id in enumerate([track_a, track_b, track_a]):
+                    self._add_playlist_track(pid, position, track_id)
+
+                with mock.patch.object(mirror_jellyfin.jellyfin_client, "mirror_build_tag_index",
+                                       return_value=tag_index), \
+                        mock.patch.object(mirror_jellyfin.jellyfin_client,
+                                          "mirror_set_playlist_metadata"), \
+                        mock.patch("requests.request", side_effect=responses) as req:
+                    mirror_jellyfin.write_mirror(self.conn, pid)
+
+                self.assertIsNone(self._row(pid)["jellyfin_mirror_last_error_code"])
+                self.assertEqual(req.call_count, len(responses))
+                self.assertEqual(posted_ids(req.call_args_list), ["sA", "sB", "sA"])
+
+
 class DeleteMirrorTests(_MirrorJellyfinTestBase):
     def test_delete_with_no_remote_id_is_a_clean_no_op(self):
         pid = self._make_playlist("Never Written", remote_id=None)
