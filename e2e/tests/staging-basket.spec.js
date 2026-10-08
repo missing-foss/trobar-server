@@ -273,9 +273,14 @@ test.describe("cross-surface staging basket (#303/#501)", () => {
 
     // _rememberPickerDestination() saved the filtered list back, so the
     // install has healed itself — this is what stops the dead id coming
-    // round again on the next pick.
-    const profile = await (await page.request.get("/api/profile")).json();
-    expect(profile.basket_last_destinations["stale-surface"]).toEqual([device.id]);
+    // round again on the next pick. It sends that save without waiting for
+    // it (the picker closes at once), so the profile is polled until the
+    // save lands: read straight after the close, it could still hold the
+    // dead id, as it did once on main (run 181).
+    await expect.poll(async () => {
+      const profile = await (await page.request.get("/api/profile")).json();
+      return profile.basket_last_destinations["stale-surface"];
+    }).toEqual([device.id]);
   });
 
   test("a remembered destination survives the picker being opened before the device list has loaded", async ({ page }) => {
@@ -308,11 +313,19 @@ test.describe("cross-surface staging basket (#303/#501)", () => {
 
     // And once the devices actually arrive, the filter is live again --
     // the guard must not have switched it off for the rest of the session.
-    await appData(page, "app.picker.open = false; return app.loadDevices();");
+    //
+    // The reloads are started in the page and then waited for by polling the
+    // state they write, not by returning their promises through evaluate:
+    // awaiting a page promise across the protocol once failed with "Resulting
+    // promise was garbage collected" although its request had been answered.
+    await appData(page, "app.picker.open = false; app.loadDevices();");
+    await expect.poll(() => appData(page, "return app.devices.map((d) => d.id);")).toContain(device.id);
     await page.request.patch("/api/basket/last-destination", {
       data: { surface: "unloaded-surface", device_ids: [device.id, 999999] },
     });
-    await appData(page, "return app.loadProfile();");
+    await appData(page, "app.loadProfile();");
+    await expect.poll(() => appData(page, "return app.profile.basket_last_destinations['unloaded-surface'];"))
+      .toEqual([device.id, 999999]);
     await appData(page, "app.openDevicePicker('artist', 'E2E Unloaded Target Two', 'unloaded-surface');");
     expect(await appData(page, "return app.picker.deviceIds;")).toEqual([device.id]);
   });

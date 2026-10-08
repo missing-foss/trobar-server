@@ -1347,10 +1347,13 @@ class WriteLockReleaseTests(unittest.TestCase):
                     {"position": 0, "artist": "A", "title": "T", "album": None}]}
 
         # sync_playlists opens its own connection via db.get_conn(); hand it the
-        # one we can inspect. The filesystem merge is stubbed to a no-op so it
-        # doesn't open+close (our shared) connection out from under the run.
+        # one we can inspect. The filesystem and Music Assistant merges are
+        # stubbed to no-ops so they don't open+close (our shared) connection
+        # out from under the run.
         with mock.patch.object(db, "get_conn", return_value=conn), \
                 mock.patch.object(playlist_sync.filesystem_client, "list_playlists",
+                                  return_value={"status": "error"}), \
+                mock.patch.object(playlist_sync.music_assistant_client, "list_playlists",
                                   return_value={"status": "error"}):
             result = playlist_sync.sync_playlists(_Provider(), "subsonic")
 
@@ -1361,6 +1364,100 @@ class WriteLockReleaseTests(unittest.TestCase):
         # committed before fetching playlist 2. Pre-#133 the second was True.
         self.assertEqual(in_txn_at_fetch, [False, False])
 
+
+class MusicAssistantMergeTests(unittest.TestCase):
+    """Music Assistant is an extra playlist source: merged in whichever
+    provider is active, its local-files tracks resolved by path, and its rows
+    left alone when it can't be listed."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="trobar-test-ma-sync-"))
+        self._prev_db_path, self._prev_data_dir = db.DB_PATH, db.DATA_DIR
+        db.DATA_DIR = self._tmp
+        db.DB_PATH = self._tmp / "test.db"
+        db.init_db()
+        conn = db.get_conn()
+        db.set_config(conn, "music_root", str(self._tmp / "no-such-music"))
+        conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+            "VALUES ('Aphelion/Parallax (2022)/01 - Event Horizon.flac', 'Aphelion', 'Parallax', "
+            "'Event Horizon', 1, 1)")
+        conn.commit()
+        conn.close()
+        patcher = mock.patch.object(playlist_sync.filesystem_client, "list_playlists",
+                                    return_value={"status": "error"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        db.DB_PATH, db.DATA_DIR = self._prev_db_path, self._prev_data_dir
+        for f in self._tmp.glob("*"):
+            f.unlink()
+        self._tmp.rmdir()
+
+    class _Primary:
+        def list_playlists(self):
+            return {"status": "ok", "playlists": [{"id": "j1", "title": "From Jellyfin"}]}
+
+        def get_playlist_tracks(self, title, source_playlist_id=None, **_k):
+            return {"status": "ok", "tracks": [
+                {"position": 0, "artist": "Nobody", "title": "Nothing", "album": None}]}
+
+    def _sync(self, ma_listing, ma_tracks=None):
+        ma = playlist_sync.music_assistant_client
+        with mock.patch.object(ma, "list_playlists", return_value=ma_listing), \
+                mock.patch.object(ma, "get_playlist_tracks", return_value=ma_tracks or {"status": "ok", "tracks": []}):
+            return playlist_sync.sync_playlists(self._Primary(), "jellyfin")
+
+    def _rows(self):
+        conn = db.get_conn()
+        try:
+            return {(r["source_provider"], r["source_playlist_id"], r["title"]) for r in conn.execute(
+                "SELECT source_provider, source_playlist_id, title FROM playlists")}
+        finally:
+            conn.close()
+
+    def test_merged_alongside_a_different_active_provider(self):
+        result = self._sync({"status": "ok", "playlists": [{"id": "9", "title": "Probe mix"}]})
+        self.assertEqual(result["playlists"], 2)
+        self.assertEqual(self._rows(), {("jellyfin", "j1", "From Jellyfin"), ("music_assistant", "9", "Probe mix")})
+
+    def test_local_files_track_resolves_by_path(self):
+        tracks = {"status": "ok", "tracks": [
+            # Tags that would not match by artist/title: only the path can.
+            {"position": 0, "artist": "Someone Else", "title": "Other", "album": None,
+             "path": "Aphelion/Parallax (2022)/01 - Event Horizon.flac"},
+            {"position": 1, "artist": "Aphelion", "title": "Streamed Only", "album": None, "path": None},
+        ]}
+        self._sync({"status": "ok", "playlists": [{"id": "9", "title": "Probe mix"}]}, tracks)
+        conn = db.get_conn()
+        try:
+            matched = [r["matched_track_id"] for r in conn.execute(
+                "SELECT pt.matched_track_id FROM playlist_tracks pt JOIN playlists p ON p.id = pt.playlist_id "
+                "WHERE p.source_provider = 'music_assistant' ORDER BY pt.position")]
+            track_id = conn.execute("SELECT id FROM tracks").fetchone()["id"]
+        finally:
+            conn.close()
+        self.assertEqual(matched, [track_id, None])
+
+    def test_a_failed_listing_keeps_earlier_rows_and_a_real_one_cleans_up(self):
+        self._sync({"status": "ok", "playlists": [{"id": "9", "title": "Probe mix"}]})
+        self._sync({"status": "error", "reason": "not_paired"})
+        self.assertIn(("music_assistant", "9", "Probe mix"), self._rows())
+        self._sync({"status": "ok", "playlists": []})
+        self.assertNotIn(("music_assistant", "9", "Probe mix"), self._rows())
+
+
+    def test_as_the_active_provider_it_is_listed_once(self):
+        ma = playlist_sync.music_assistant_client
+        listing = {"status": "ok", "playlists": [{"id": "9", "title": "Probe mix"}]}
+        with mock.patch.object(ma, "list_playlists", return_value=listing) as listed, \
+                mock.patch.object(ma, "get_playlist_tracks", return_value={"status": "ok", "tracks": []}):
+            result = playlist_sync.sync_playlists(ma, "music_assistant")
+        # The primary pass lists it; the extra-source pass doesn't run.
+        self.assertEqual(listed.call_count, 1)
+        self.assertEqual(result["playlists"], 1)
+        self.assertEqual(self._rows(), {("music_assistant", "9", "Probe mix")})
 
 class BackgroundSyncTests(unittest.TestCase):
     """#297 step 3: the sync is a JOB now — start_sync enqueues, and the

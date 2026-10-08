@@ -170,9 +170,9 @@ jobs:
       - name: Unit tests (with coverage)
         # PYTHONPATH=app, not `cd app`: coverage.py only auto-discovers a
         # config file in the current directory, unlike mypy below which
-        # walks up to find pyproject.toml from the repo root. Report only,
-        # no enforced threshold (#41) — visibility into the untested-code
-        # gap, not a gate on it.
+        # walks up to find pyproject.toml from the repo root. `coverage
+        # report` also fails the step when the total drops below the soft
+        # floor set there (fail_under).
         #
         # unittest discover (not a hardcoded module list, per dev/verify.sh's
         # matching comment): #252/#253 each shipped a test_*.py that was

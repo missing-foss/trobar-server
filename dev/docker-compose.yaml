@@ -19,14 +19,14 @@ services:
     build: ./gen
     volumes:
       - music:/music
-      - ./testlib.json:/testlib.json:ro
+      - ./${TESTLIB:-testlib.json}:/testlib.json:ro
     restart: "no"
 
   # Mock Last.fm — Suggestions / similar-artists / auto-fit ranking with no real key.
   lastfm-mock:
     build: ./lastfm-mock
     volumes:
-      - ./testlib.json:/testlib.json:ro
+      - ./${TESTLIB:-testlib.json}:/testlib.json:ro
     expose:
       - "8080"
     restart: unless-stopped

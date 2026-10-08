@@ -66,6 +66,7 @@ from pathlib import Path
 
 import db
 import itunes_library
+import sync_state
 
 _ITUNES_ID_PREFIX = "itunes:"
 _EXTRA_ID_PREFIX = "extra:"
@@ -108,11 +109,29 @@ def reconnect() -> dict:
     return status()
 
 
+def _is_trobar_managed(path: Path) -> bool:
+    """True if the file's second line is sync_state.M3U_MARKER: a copy
+    Trobar wrote itself (a mirror, or a device playlist), which must never
+    come back as a source playlist. The same line mirror._is_marker_safe()
+    checks before it overwrites or deletes anything. An unreadable file is
+    not Trobar's: it is left to the parser, which reads it as empty."""
+    try:
+        with path.open("rb") as f:
+            head = f.read(256)
+    except OSError:
+        return False
+    lines = head.decode("utf-8", errors="replace").splitlines()  # a BOM only touches line 1
+    return len(lines) > 1 and lines[1].strip() == sync_state.M3U_MARKER
+
+
 def _iter_playlist_files(root: Path):
+    """Every .m3u/.m3u8 under `root`, except Trobar's own: a mirror folder
+    may sit inside the music share, next to playlists a player saves there."""
     for dirpath, _dirnames, filenames in os.walk(root):
         for fname in filenames:
-            if Path(fname).suffix.lower() in _PLAYLIST_EXTENSIONS:
-                yield Path(dirpath) / fname
+            path = Path(dirpath) / fname
+            if path.suffix.lower() in _PLAYLIST_EXTENSIONS and not _is_trobar_managed(path):
+                yield path
 
 
 def _contained(root: Path, relative: str) -> Path | None:
@@ -198,7 +217,7 @@ def list_playlists() -> dict:
 def _find_playlist_file(root: Path, title: str) -> Path | None:
     for ext in _PLAYLIST_EXTENSIONS:
         candidate = _contained(root, f"{title}{ext}")
-        if candidate is not None and candidate.is_file():
+        if candidate is not None and candidate.is_file() and not _is_trobar_managed(candidate):
             return candidate
     return None
 

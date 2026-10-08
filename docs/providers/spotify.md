@@ -25,6 +25,9 @@ Same per-user model as [Tidal](tidal.md): each member connects their own account
 from **Profile → Streaming accounts** ("Connect Spotify"); the admin registers
 the OAuth app once and enables the feature.
 
+To bring in someone else's **public** playlist, no account is needed: paste
+its link instead. See [Spotify links](spotify-links.md).
+
 ## Admin: register the OAuth app (once)
 
 1. Register an app at [developer.spotify.com](https://developer.spotify.com).

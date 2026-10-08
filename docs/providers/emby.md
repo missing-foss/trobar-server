@@ -48,8 +48,9 @@ These credentials are read-only: Trobar uses them to read playlists.
 Trobar *can* write to an Emby server, as a **mirror target** — a separate
 connection you configure yourself. Mirroring creates and updates playlists on
 that server and can delete items from them. It is off until you enable it, and
-never touches a playlist it did not create. See
-[Playlists](../using/playlists.md#mirroring-to-a-local-folder-a-subsonicnavidrome-server-a-jellyfin-server-or-an-emby-server).
+never touches a playlist it did not create. When the mirror target is this
+same server, each mapped member's playlists are mirrored into their own
+Emby account. See [Playlists](../using/playlists.md#mirroring).
 
 !!! note
     Emby is closed-source (Jellyfin is the FOSS fork) — that has no bearing

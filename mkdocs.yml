@@ -8,12 +8,27 @@ repo_url: https://github.com/missing-foss/trobar-server
 
 theme:
   name: material
+  # The brand: Troubadour for the light scheme, Nuèch for the dark one. The
+  # colours are in docs/stylesheets/brand.css and the mark and favicon in
+  # docs/assets/brand/, all written by dev/gen_brand_css.py from
+  # brand/tokens/trobar-themes.json; that stylesheet also swaps the mark for
+  # Nuèch's in the dark scheme. The site follows the system setting until
+  # the toggle is used.
+  logo: assets/brand/trobar-mark-small-troubadour.svg
+  favicon: assets/brand/favicon.svg
   palette:
-    - scheme: default
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      # custom: Material adds no colours of its own; brand.css sets them all.
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
-    - scheme: slate
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
@@ -22,6 +37,9 @@ theme:
     - navigation.top
     - search.suggest
     - content.code.copy
+
+extra_css:
+  - stylesheets/brand.css
 
 # Build strictly: every docs/*.md must be in nav, internal links must resolve,
 # and internal anchors must exist. External links (GitHub, README, SECURITY.md,
@@ -83,9 +101,12 @@ nav:
       - Subsonic ecosystem: providers/subsonic.md
       - Filesystem: providers/filesystem.md
       - iTunes / Apple Music: providers/itunes.md
+      - Music Assistant: providers/music-assistant.md
+      - Kodi: providers/kodi.md
       - Tidal: providers/tidal.md
       - Spotify: providers/spotify.md
       - YouTube Music: providers/youtube-music.md
+      - Spotify links: providers/spotify-links.md
       - Providers we don't support: providers/other.md
   - Using Trobar:
       - Library & Selections: using/library-selections.md

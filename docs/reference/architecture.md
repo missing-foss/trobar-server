@@ -94,9 +94,10 @@ devices they can see, read and narrowly write their own dashboard
 preferences. What it cannot do is listed as deliberately as what it can —
 no direct selection creation, no whole-profile write, no admin listings
 (counts only). The sync protocol under `/api/device/*` is untouched and
-stays its own contract; a breaking change under the App API prefix bumps
-the `app_api` level that `/api/device/info` advertises, which is what a
-client checks — never the server version.
+stays its own contract; a breaking change under the App API prefix, or a
+new section a client gates a whole screen on, bumps the `app_api` level
+that `/api/device/info` advertises, which is what a client checks — never
+the server version.
 
 Full route-by-route reference, the compatibility rule, and the shapes the
 two prefixes share and do not share: [App API](app-api.md).

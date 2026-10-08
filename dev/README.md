@@ -48,6 +48,38 @@ your profile; the mock ignores the key.
 Stop with `docker compose down`. Wipe everything (including the seeded music and
 all app data) with `docker compose down -v`.
 
+## The showcase library (screenshots and demos)
+
+`dev/testlib.json` is deliberately small: 5 artists and 6 albums with
+solid-colour covers, which the e2e suite and the Last.fm mock rely on exactly.
+For screenshots, or anything that should look like a lived-in library, there is
+a second manifest, `dev/testlib-showcase.json`:
+
+- 32 invented artists and 61 albums (546 tracks) across about a dozen genres,
+  with `GENRE` tags, from 1968 to 2024. A quarter of the albums are MP3, the
+  rest FLAC.
+- Covers with a gradient, a shape and the title and artist set in type, drawn
+  per album from a seed: deterministic, invented and copyright-free.
+  Each artist gets a picture too (a gradient and their initials, as
+  `artist.png` in their folder), which the Filesystem provider serves.
+- Track lengths between about 2½ and 5½ minutes, so durations look real. They
+  are silent, about 150 MB in all.
+- Four `.m3u` playlists at the top of `/music`, which the Filesystem provider
+  picks up.
+
+Select it with `TESTLIB`, and give it its own compose project so its music
+volume doesn't mix with the small library's:
+
+```bash
+cd dev
+TESTLIB=testlib-showcase.json docker compose -p trobar-showcase up --build trobar
+```
+
+The first `up` takes a minute or two to generate the files. The Last.fm mock
+reads the same manifest, so Suggestions and similar artists stay consistent
+with it. Everything else in this file applies unchanged. Wipe it with
+`docker compose -p trobar-showcase down -v`.
+
 ## Testing the Subsonic / Jellyfin providers (optional)
 
 These need a one-time account setup in each server, then wiring into Trobar's
@@ -127,9 +159,10 @@ library doesn't have.
   `user.getRecentTracks`). Point real Last.fm back by unsetting
   `LASTFM_API_BASE` on the `trobar` service. To test against *live* Last.fm,
   set a real `LASTFM_API_KEY` and remove the `LASTFM_API_BASE` override.
-- **Regenerating the library:** edit `dev/testlib.json` and
-  `docker compose up --build --force-recreate music-seed` (or `down -v` for a
-  clean slate). The seeder is idempotent — it only writes files that don't exist.
+- **Regenerating the library:** edit `dev/testlib.json` (or the showcase
+  manifest) and `docker compose up --build --force-recreate music-seed` (or
+  `down -v` for a clean slate). The seeder is idempotent — it only writes files
+  that don't exist, so a changed cover or track length needs `down -v`.
 - The `trobar` image here is built with `AUTH_MODE=local` and
   `SESSION_COOKIE_SECURE=0` (plain-http dev); production uses the root
   `docker-compose.yaml` instead.

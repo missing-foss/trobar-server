@@ -10,8 +10,8 @@ const AxeBuilder = require("@axe-core/playwright").default;
 // real rendered DOM (this is an Alpine SPA, so static grep can't see these)
 // and asserts zero WCAG 2.1 A/AA violations — on the unauthenticated login
 // page and every authenticated tab (including Administration and Profile,
-// across each of their sub-tabs and per-provider config forms), in BOTH
-// themes (contrast depends on the active theme's tokens). Regression guard
+// across each of their sub-tabs and per-provider config forms), in every
+// brand theme and variant (contrast depends on the active theme's tokens). Regression guard
 // for the #101/#109 fixes: label/for associations, image alt text, the
 // --c-gray-400 / --c-pill-active-fg / text-accent contrast tokens,
 // always-underlined in-text links, landmarks, per-view <h1>.
@@ -25,7 +25,8 @@ const WCAG = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
 // separate (#281) — it's the only one needing to wait for a conditionally
 // mocked Most Played chart before scanning.
 const AUTH_VIEWS = ["library", "playlists", "selections", "lastfm", "about"];
-const ADMIN_SUBTABS = ["config", "health", "users", "delegations"];
+// Users holds the delegations too, as a section (opened below).
+const ADMIN_SUBTABS = ["config", "health", "users"];
 // The config sub-tab shows a different form per selected library-source provider.
 const PROVIDERS = ["roon", "subsonic", "jellyfin", "emby", "plex", "lms", "filesystem"];
 // #234/#235: devices is the one with the per-device cards; prefs/account are
@@ -33,11 +34,23 @@ const PROVIDERS = ["roon", "subsonic", "jellyfin", "emby", "plex", "lms", "files
 // otherwise only be caught on whichever sub-tab happens to get visited.
 const PROFILE_SUBTABS = ["prefs", "account", "devices"];
 
-async function setTheme(page, theme) {
-  await page.evaluate((t) => {
-    localStorage.setItem("trobar-theme", t);
-    document.documentElement.setAttribute("data-theme", t);
-  }, theme);
+// Every brand theme in every variant it has (trobar-server#141): contrast
+// depends on the active theme's tokens, so each one is scanned. Nuèch and
+// Contraste are dark only.
+const VARIANTS = [
+  { brand: "troubadour", mode: "dark" }, { brand: "troubadour", mode: "light" },
+  { brand: "garriga", mode: "dark" }, { brand: "garriga", mode: "light" },
+  { brand: "peira", mode: "dark" }, { brand: "peira", mode: "light" },
+  { brand: "nuech", mode: "dark" }, { brand: "contraste", mode: "dark" },
+];
+
+async function setTheme(page, variant) {
+  await page.evaluate((v) => {
+    localStorage.setItem("trobar-brand", v.brand);
+    localStorage.setItem("trobar-theme", v.mode);
+    document.documentElement.setAttribute("data-brand", v.brand);
+    document.documentElement.setAttribute("data-theme", v.mode);
+  }, variant);
 }
 
 // Readable assertion: on failure print "<rule> (<impact>) x<nodes>" per
@@ -46,7 +59,8 @@ function summarize(violations) {
   return violations.map((v) => `${v.id} (${v.impact}) x${v.nodes.length}`);
 }
 
-for (const theme of ["dark", "light"]) {
+for (const variant of VARIANTS) {
+  const theme = `${variant.brand} ${variant.mode}`;
   test(`login page has no WCAG A/AA violations (${theme})`, async ({ browser }) => {
     // The login page is unauthenticated — use a fresh context without the
     // logged-in storageState the other tests share.
@@ -54,7 +68,7 @@ for (const theme of ["dark", "light"]) {
     const page = await ctx.newPage();
     try {
       await page.goto("/login");
-      await setTheme(page, theme);
+      await setTheme(page, variant);
       await page.reload(); // let the head theme-script re-apply cleanly
       const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
       expect(summarize(results.violations)).toEqual([]);
@@ -74,7 +88,7 @@ for (const theme of ["dark", "light"]) {
   // when the env var is unset, so the suite doesn't hard-depend on the mock.
   test(`home tab has no WCAG A/AA violations (${theme})`, async ({ page }) => {
     await page.goto("/#/home");
-    await setTheme(page, theme);
+    await setTheme(page, variant);
     if (process.env.LASTFM_MOCK_USERNAME) {
       // Optional-chaining throughout (review feedback): waitForFunction
       // retries on a falsy return but rejects immediately on a thrown
@@ -94,7 +108,7 @@ for (const theme of ["dark", "light"]) {
   for (const view of AUTH_VIEWS) {
     test(`${view} tab has no WCAG A/AA violations (${theme})`, async ({ page }) => {
       await page.goto("/#/home");
-      await setTheme(page, theme);
+      await setTheme(page, variant);
       // SPA navigation — goToTab() flows through applyHistoryState like a real
       // click; hidden tabs are display:none, which axe skips.
       await page.evaluate((v) => window.Alpine.$data(document.querySelector("[x-data]")).goToTab(v), view);
@@ -113,7 +127,7 @@ for (const theme of ["dark", "light"]) {
   // tab's device fixture and the admin tab's health-panel load above.
   test(`playlists mirror picker has no WCAG A/AA violations (${theme})`, async ({ page }) => {
     await page.goto("/#/home");
-    await setTheme(page, theme);
+    await setTheme(page, variant);
     // Two separate evaluate() calls, not one: the seeded array raced a
     // loadPlaylists() response and lost, clobbering the seeded row back to
     // [] a few hundred ms later (caught via the failing click's
@@ -169,7 +183,7 @@ for (const theme of ["dark", "light"]) {
     expect(summarize(results.violations)).toEqual([]);
   });
 
-  // #508: the "duel the bard" Easter egg. The closed bard-mark button is
+  // #508: the "duel the bard" Easter egg. The closed mark button is
   // already covered by the plain "about tab" scan in AUTH_VIEWS above —
   // this exercises the modal itself in both states the closed-tab scan
   // never renders: this harness's real (empty) library response, and a
@@ -178,7 +192,7 @@ for (const theme of ["dark", "light"]) {
   // of an empty seeded library).
   test(`duel-the-bard quiz has no WCAG A/AA violations (${theme})`, async ({ page }) => {
     await page.goto("/#/home");
-    await setTheme(page, theme);
+    await setTheme(page, variant);
     await page.evaluate(() => {
       window.Alpine.$data(document.querySelector("[x-data]")).goToTab("about");
     });
@@ -218,7 +232,7 @@ for (const theme of ["dark", "light"]) {
   // waits).
   test(`profile tab has no WCAG A/AA violations (${theme})`, async ({ page }) => {
     await page.goto("/#/home");
-    await setTheme(page, theme);
+    await setTheme(page, variant);
     await page.request.post("/api/devices", { data: { name: "a11y-test-device" } });
     await page.evaluate(async () => {
       const d = window.Alpine.$data(document.querySelector("[x-data]"));
@@ -262,7 +276,7 @@ for (const theme of ["dark", "light"]) {
   // state change (not saved), so no server state is touched.
   test(`admin tab has no WCAG A/AA violations (${theme})`, async ({ page }) => {
     await page.goto("/#/home");
-    await setTheme(page, theme);
+    await setTheme(page, variant);
     await page.evaluate(() => window.Alpine.$data(document.querySelector("[x-data]")).goToTab("admin"));
     const found = [];
     for (const sub of ADMIN_SUBTABS) {
@@ -271,6 +285,10 @@ for (const theme of ["dark", "light"]) {
         await page.evaluate(async ([s, p]) => {
           const d = window.Alpine.$data(document.querySelector("[x-data]"));
           d.setSubTab("admin", s);
+          // Configuration is grouped into collapsible sections; open them all
+          // so the scan covers every card, as it did before the grouping.
+          if (s === "config") d.setAllSections('config', true);
+          if (s === "users") d.setAllSections('users', true);
           if (p) d.adminConfig.provider = p;
           // #266: health's issue-count chart lives behind x-if="health",
           // which stays null until "Check" is clicked — without this, the

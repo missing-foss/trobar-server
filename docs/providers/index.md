@@ -17,7 +17,8 @@ online, or existing at all. Choose one when you set up (see
 Trobar distinguishes two ways music reaches a playlist:
 
 - **Library provider** — one active at a time (Filesystem, Roon, Jellyfin,
-  Emby, Plex, Lyrion Music Server, or a Subsonic-compatible server). This is
+  Emby, Plex, Lyrion Music Server, a Subsonic-compatible server, or Music
+  Assistant). This is
   the shared, admin-configured source of truth for playlists and, for Roon,
   live pairing status.
 - **Personal streaming accounts** — each household member links their **own**
@@ -37,13 +38,21 @@ Tracks that exist only on a streaming service are flagged and skipped by design.
 | [Roon](roon.md) | Playlists, live pairing status | A Roon Core on the LAN |
 | [Jellyfin](jellyfin.md) | Playlists | Server URL + API key + username |
 | [Emby](emby.md) | Playlists | Server URL + API key + username |
-| [Plex](plex.md) | Playlists | Server URL + token |
+| [Plex](plex.md) | Playlists; also a mirror target | Server URL + token |
 | [Lyrion Music Server](lms.md) | Playlists | Server URL (+ user/password if secured) |
 | [Subsonic ecosystem](subsonic.md) | Playlists | Server URL + user + password |
+| [Music Assistant](music-assistant.md) | Playlists, artist images where it has them; also a mirror target | Server URL + long-lived token |
 
-Switching the active provider later (from [Administration](../administration.md))
-clears playlists and the artist-image cache — they belong to the provider that
-produced them. Your library, selections, users, and devices are untouched.
+Switching the active provider later goes through **Change library source…**
+in [Administration](../administration.md#changing-the-library-source). A
+playlist the new provider also has (same name and owner, most of the same
+tracks) is carried over with its settings; the old provider's other playlists
+and the artist-image cache are removed. The counts are shown before you
+confirm. Playlists from every other source keep their
+rows and settings. A device with one of the removed playlists selected loses
+that selection, and its next sync removes the playlist's file and any tracks
+no other selection keeps on it. Your library, users, devices, and artist,
+album and track selections are untouched.
 
 ## Local import sources
 
@@ -51,6 +60,13 @@ produced them. Your library, selections, users, and devices are untouched.
  `Library.xml`. Not a library provider itself (nothing to activate) — an
   extra playlist source the Filesystem provider merges in, working no
   matter which provider is active.
+
+## Other playlist sources
+
+- [Music Assistant](music-assistant.md) — playlists made in Music Assistant,
+  added alongside the active provider when it isn't the provider itself. An
+  admin enters its URL and a long-lived token once; the same connection
+  serves it as a library provider and as a mirror target.
 
 ## Personal streaming accounts
 
@@ -64,6 +80,9 @@ produced them. Your library, selections, users, and devices are untouched.
   its tracks are matched against your library. No account and no credentials,
   for you or for the server. Built on an **unofficial** interface, which the
   page explains before anything else — read it before relying on this.
+- [Spotify](spotify-links.md) — the same for a public Spotify playlist, up to
+  its first 100 tracks. Read from Spotify's embed player page, which is not
+  an API either; the page says what that means.
 
 ### Services with no direct integration (Roon only)
 

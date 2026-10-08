@@ -12,18 +12,29 @@ cross-platform [Desktop app](desktop.md), and the [Garmin watch app](garmin.md)
 
 ## Device tokens
 
-Every device gets its own API token. The token is shown **exactly once**:
+Every device gets its own API token, which the client receives by redeeming
+a short **pairing code**: 8 characters, shown with a QR code, valid for an
+hour and only once. The token itself is never shown.
 
-- created in the web UI (**Profile → Devices → create a device**), as a **QR
- code** for phones or a downloadable **`trobar-device.json`** for the
-  desktop app; or
-- created via **Profile → Devices → Add mobile device (QR / code)**, which
-  also mints a short, human-typeable enrollment code alongside the QR — the
-  path the Garmin watch app uses, since it can't scan a QR code and instead
-  has the server URL and code typed into it via Garmin Connect Mobile.
+- **A phone, tablet or watch:** **Profile → Devices → Add device**, choose
+  the type, then **Generate pairing code**. The app scans the QR code or
+  takes the typed code, and creates its device. The Garmin watch can't scan:
+  the server URL and code reach it as app settings, see
+  [Garmin → Pair](garmin.md#pair).
+- **A DAP, removable storage or a local folder:** **Add device**, enter a
+  name (and a limit if you want one), then **Create device**. The dialog shows
+  the server URL and a code for the [desktop app](desktop.md#pair-a-target).
+  The device keeps the name and limit you entered.
+- **Pairing again** (a reinstalled app, a reformatted card, another
+  computer's copy): **Re-pair in app** on the device issues a new code for
+  that same device. Its selections, settings and history stay, and whatever
+  was paired before stops working once the code is redeemed.
 
-Lost it? "Regenerate + QR" issues a fresh one — the old token stops working
-immediately.
+Desktop builds that predate pairing codes read only a raw token. For those,
+the code dialog of a DAP, card or folder has **Older desktop app? Get a config
+file instead**, which issues a new token (the old one stops working
+immediately) and offers it as a QR code and a downloadable
+`trobar-device.json`.
 
 ## The sync model
 

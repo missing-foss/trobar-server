@@ -24,7 +24,7 @@ Most "sync your music" tools either lock you into a single streaming service or 
 
 ## Why the name?
 
-*Trobar* is Occitan for "to find" — the verb the troubadours got their name from: musicians who owned their songs and carried them from court to court. That's the whole idea here: find the music you care about, keep it, carry it. The full story (and the reason there's a smug bard in the logo) is in [Why "Trobar"](https://missing-foss.github.io/trobar-server/project/why-trobar/).
+*Trobar* is Occitan for "to find" — the verb the troubadours got their name from: musicians who owned their songs and carried them from court to court. That's the whole idea here: find the music you care about, keep it, carry it. The full story (and why the logo is a lute's rosette) is in [Why "Trobar"](https://missing-foss.github.io/trobar-server/project/why-trobar/).
 
 ## Screenshots
 

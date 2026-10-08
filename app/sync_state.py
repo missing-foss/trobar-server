@@ -21,6 +21,7 @@ normal way (-> `removed`) if a later selection change actually drops it.
 
 import hashlib
 import json
+import posixpath
 import re
 import secrets
 import sqlite3
@@ -58,9 +59,9 @@ def hash_token(raw_token: str) -> str:
     # hash on every call. Enrollment codes are the one caller this doesn't
     # apply to -- 8 chars from a 31-symbol alphabet (~2^40, meant to be
     # hand-typed) -- but those are protected structurally instead: a
-    # 10-minute TTL, single-use, purge-on-mint (see ENROLLMENT_TTL_SECONDS
+    # one-hour TTL, single-use, purge-on-mint (see ENROLLMENT_TTL_SECONDS
     # below), so a stolen database holds at most a couple of live codes with
-    # minutes left, and an attacker with database access can mint their own
+    # under an hour left, and an attacker with database access can mint their own
     # grant anyway, making the hash moot at that point. See SECURITY.md
     # ("device tokens are secrets.token_urlsafe(32) stored only as
     # SHA-256") -- passwords use Werkzeug's PBKDF hash instead (main.py).
@@ -117,12 +118,13 @@ def regenerate_token(conn: sqlite3.Connection, device_id: int, *,
     """Issues a brand-new token for an existing device (invalidating the
     old one), since the raw token is never stored -- only its hash.
 
-    This is the DESKTOP pairing path: trobar-desktop consumes the resulting
-    {server_url, token} payload directly, as a pasted config or as
-    .trobar/device.json on the card. It is not a re-pairing path for the
-    Android app, whose wizard reads enrollment codes and ignores a `token`
-    key entirely -- that case is create_enrollment_grant(device_id=...),
-    which hands back the same device through the code flow the app speaks."""
+    Kept for trobar-desktop builds that predate enrollment codes: they read
+    only a {server_url, token} payload, as a pasted config or as
+    .trobar/device.json on the card. Every current client (Android, desktop,
+    the Garmin watch) re-pairs through create_enrollment_grant(device_id=...)
+    instead, which hands back the same device through an 8-character code;
+    redeeming one calls this to issue the device its new token. The web UI
+    offers the raw token only as a secondary action for those older builds."""
     raw_token = secrets.token_urlsafe(32)
     conn.execute(
         "UPDATE devices SET api_token_hash = ? WHERE id = ?",
@@ -144,10 +146,14 @@ def authenticate_device(conn: sqlite3.Connection, raw_token: str) -> sqlite3.Row
 
 
 # #163: enrollment grants. Unambiguous alphabet (no 0/O/1/I/L); 8 chars from 31
-# symbols is ~40 bits — plenty for a single-use code that expires in minutes and
-# is rate-limited.
+# symbols is ~40 bits — plenty for a single-use code that expires within the
+# hour and is rate-limited (30 failed redeems per 5 minutes per IP).
 _ENROLL_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-ENROLLMENT_TTL_SECONDS = 600  # 10 minutes
+# One hour, not the original 10 minutes, while the Garmin app is sideloaded:
+# a sideloaded watch can't take its settings from Garmin Connect, so the code
+# reaches it in a settings file copied over USB and is redeemed only at the
+# watch's next Wi-Fi sync. Back to 600 once the app installs from the Store.
+ENROLLMENT_TTL_SECONDS = 3600
 
 
 def _generate_enrollment_code() -> str:
@@ -166,8 +172,8 @@ def create_enrollment_grant(conn: sqlite3.Connection, owner_user_id: int,
     selections, track state and settings are not. Default None is the original
     behaviour, unchanged. The caller is responsible for checking that the
     owner may manage that device; redeem re-checks ownership regardless,
-    because ten minutes is long enough for a device to be deleted."""
-    # #166: purge-on-mint. This ephemeral table (10-min TTL, single-use) is only
+    because the code's lifetime is long enough for a device to be deleted."""
+    # #166: purge-on-mint. This ephemeral table (short TTL, single-use) is only
     # ever appended to and marked consumed, never cleaned — so drop the dead rows
     # (expired, or already redeemed) before adding a new one. Self-limiting, no
     # scheduler; committed atomically with the INSERT below. Redeem stays correct
@@ -216,7 +222,7 @@ def redeem_enrollment_grant(conn: sqlite3.Connection, code: str, name: str,
 
     if grant["device_id"] is not None:
         # Re-pairing an existing device. Ownership is re-checked here rather
-        # than trusted from mint time: the grant lives for ten minutes, and a
+        # than trusted from mint time: the grant lives for up to an hour, and a
         # device can be deleted or change hands inside that window. A code
         # whose device is gone is spent (consumed above) and refused, which is
         # the same answer the caller gets for any other invalid code -- it must
@@ -1151,6 +1157,14 @@ def transfer_device(conn: sqlite3.Connection, old_device_id: int, new_device_id:
         (old["transcode_format"], old["max_size_bytes"], old["autofit_percent"],
          old["artist_images"], old["source_of_truth"], new_device_id),
     )
+    # The old device's Home widget set comes too, unless the new one already
+    # has one of its own: that is a choice made on the new device.
+    conn.execute(
+        "UPDATE devices SET dashboard_widgets = "
+        "(SELECT dashboard_widgets FROM devices WHERE id = ?) "
+        "WHERE id = ? AND dashboard_widgets IS NULL",
+        (old_device_id, new_device_id),
+    )
     if old["transcode_format"] != new_prev_transcode:
         conn.execute(
             "UPDATE device_track_state SET status='pending', bytes_on_device=NULL, "
@@ -1184,6 +1198,16 @@ def transfer_device(conn: sqlite3.Connection, old_device_id: int, new_device_id:
             (selection_id, new_device_id),
         )
     conn.execute("DELETE FROM selection_devices WHERE device_id = ?", (old_device_id,))
+
+    # Playlists made on the old device become the new one's: same rows (so
+    # their selections, sharing and mirrors stay), keyed on the new id.
+    # The key is "<device id>:<path>" (playlist_sync.device_playlist_id).
+    old_prefix = f"{old_device_id}:"
+    conn.execute(
+        "UPDATE playlists SET source_playlist_id = ? || substr(source_playlist_id, ?) "
+        "WHERE source_provider = 'device' AND substr(source_playlist_id, 1, ?) = ?",
+        (f"{new_device_id}:", len(old_prefix) + 1, len(old_prefix), old_prefix),
+    )
 
     # Cascades cleanup of anything left tied to old_device_id (its own
     # device_track_state rows -- the source rows the INSERT OR REPLACE
@@ -1276,18 +1300,7 @@ def record_device_manifest(conn: sqlite3.Connection, device_id: int, paths: list
     and match on that. Duplicate paths are de-duplicated, so the returned counts
     reflect distinct paths."""
     seen_paths = list(dict.fromkeys(paths))  # dedup, preserve order
-    fmt_row = conn.execute(
-        "SELECT transcode_format FROM devices WHERE id = ?", (device_id,)).fetchone()
-    fmt = fmt_row["transcode_format"] if fmt_row is not None else None
-    # Rebuild device-path -> track_id over the live library in the same wire
-    # form get_changes emits, so an on-disk path the device uploads matches
-    # exactly (extension and all).
-    by_device_path: dict[str, int] = {}
-    for row in conn.execute(
-        "SELECT id, artist, album, title, track_no, disc_no, relative_path "
-        "FROM tracks WHERE deleted_at IS NULL"
-    ):
-        by_device_path[device_path(row, fmt)] = row["id"]
+    by_device_path = {p: row["id"] for p, row in device_path_index(conn, device_id).items()}
     matched_track_ids: list[int] = [
         by_device_path[p] for p in seen_paths if p in by_device_path]
     for track_id in matched_track_ids:
@@ -1304,6 +1317,64 @@ def record_device_manifest(conn: sqlite3.Connection, device_id: int, paths: list
     _record_device_unknown_tracks(conn, device_id, unmatched_paths)
     conn.commit()
     return {"matched": len(matched_track_ids), "unmatched": len(unmatched_paths)}
+
+
+def device_path_index(conn: sqlite3.Connection, device_id: int) -> dict[str, sqlite3.Row]:
+    """Every live library track keyed by its device_path() on this device
+    (its transcode_format applied): the form get_changes emits, so a path the
+    device reports from its own storage matches exactly, extension and all.
+    Rows carry id, artist, album, title, track_no, disc_no, relative_path."""
+    fmt_row = conn.execute(
+        "SELECT transcode_format FROM devices WHERE id = ?", (device_id,)).fetchone()
+    fmt = fmt_row["transcode_format"] if fmt_row is not None else None
+    return {device_path(row, fmt): row for row in conn.execute(
+        "SELECT id, artist, album, title, track_no, disc_no, relative_path "
+        "FROM tracks WHERE deleted_at IS NULL"
+    )}
+
+
+def resolve_card_entry(entry: str, playlist_path: str, index: dict) -> str | None:
+    """The device_path() an entry of a playlist found on the device names,
+    or None. `playlist_path` is the playlist file's own path, relative to the
+    device's sync root; `index` is device_path_index(). Every device_path()
+    is exactly artist/album/file, so:
+    - an entry with at least three segments matches by its last three. That
+      covers entries relative to the sync root (`Artist/Album/x.flac`), to
+      the playlist's folder (`../Artist/Album/x.flac`), and absolute ones
+      from the player's own mount (`/mnt/sdcard/Artist/Album/x.flac`);
+    - a shorter one is resolved against the playlist's folder: a playlist
+      saved in an album folder listing bare file names, or in an artist
+      folder listing `Album/x.flac`.
+    Backslashes count as separators (Windows-made playlists)."""
+    raw = entry.strip().replace("\\", "/")
+    parts = [p for p in raw.split("/") if p and p != "."]
+    if len(parts) >= 3:
+        tail = "/".join(parts[-3:])
+        return tail if tail in index else None
+    if not parts or raw.startswith("/"):
+        return None
+    beside = posixpath.normpath(posixpath.join(posixpath.dirname(playlist_path), *parts))
+    return beside if beside in index else None
+
+def add_device_unknown_tracks(conn: sqlite3.Connection, device_id: int, paths: list) -> None:
+    """Adds paths to this device's unknown tracks without dropping the ones
+    already there (unlike _record_device_unknown_tracks, which replaces the
+    set from a full manifest), then refreshes the count. Used for playlist
+    entries on the device that match no library track. Does not commit."""
+    for path in dict.fromkeys(paths):
+        artist, album, title = _parse_device_path(path)
+        conn.execute(
+            "INSERT INTO device_unknown_tracks (device_id, path, artist, album, title) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id, path) DO NOTHING",
+            (device_id, path, artist, album, title),
+        )
+    _refresh_unknown_track_count(conn, device_id)
+
+
+def device_playlist_filenames(conn: sqlite3.Connection, device_id: int) -> set[str]:
+    """The playlist files Trobar itself writes to this device's sync root."""
+    fmt = conn.execute("SELECT transcode_format FROM devices WHERE id = ?", (device_id,)).fetchone()
+    return {p["filename"] for p in _device_playlists(conn, device_id, fmt["transcode_format"] if fmt else None)}
 
 
 def _parse_device_path(path: str) -> tuple[str | None, str | None, str | None]:
@@ -1452,7 +1523,7 @@ def list_unresolved_playlist_tracks(conn: sqlite3.Connection, playlist_id: int) 
     """#200: this playlist's unresolved entries for the web review list —
     un-excluded first, then by artist/title/album."""
     rows = conn.execute(
-        "SELECT id, artist, title, album, isrc, excluded, first_seen_at "
+        "SELECT id, artist, title, album, inferred_album, isrc, excluded, first_seen_at "
         "FROM unresolved_playlist_tracks WHERE playlist_id = ? "
         "ORDER BY excluded, artist, title, album",
         (playlist_id,),

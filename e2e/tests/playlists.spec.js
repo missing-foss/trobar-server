@@ -57,23 +57,19 @@ async function gotoPlaylists(page) {
   };
   let inFlight = 0;
   let settled = 0;
-  // Start-up issues exactly two of these, because init() runs twice. Both must
-  // be accounted for before seeding, and "none currently outstanding" is NOT
-  // enough to establish that.
+  // Start-up issues exactly one of these (#111: init() used to run twice, and
+  // this waited for two). It must be accounted for before seeding, and "none
+  // currently outstanding" is NOT enough to establish that: before the load
+  // has even started, nothing is in flight either.
   //
-  // I assumed it was, on a measurement taken here: the two fetches overlapped
-  // by about a millisecond, so the in-flight count never reached zero between
-  // them. That held on a quiet machine and failed on CI. A trace from a loaded
-  // runner shows the two starting 228ms apart, with a 138ms window in which
-  // nothing was in flight -- the seed landed inside it at +778ms and the second
-  // response wiped it at +1009ms. Load does not merely make responses slower;
-  // it also spreads the two init() runs apart, which is what opens the gap.
-  //
-  // So wait for both, by count. If the application ever stops issuing exactly
-  // two, this times out and says so, which is the right failure: loud and at
-  // the wait, rather than an intermittent wipe five seconds later in an
-  // assertion that names the wrong thing.
-  const EXPECTED_STARTUP_LOADS = 2;
+  // That was learnt the hard way when there were two loads: a trace from a
+  // loaded runner showed them starting 228ms apart with a 138ms window in which
+  // nothing was in flight, and a seed landing in that window was wiped by the
+  // second response. So wait by count. If the application ever issues a
+  // different number, this times out and says so, which is the right failure:
+  // loud and at the wait, rather than an intermittent wipe five seconds later
+  // in an assertion that names the wrong thing.
+  const EXPECTED_STARTUP_LOADS = 1;
   page.on("request", (r) => { if (isPlaylistsFetch(r)) inFlight += 1; });
   page.on("requestfinished", (r) => { if (isPlaylistsFetch(r)) { inFlight -= 1; settled += 1; } });
   page.on("requestfailed", (r) => { if (isPlaylistsFetch(r)) { inFlight -= 1; settled += 1; } });
@@ -91,7 +87,7 @@ async function gotoPlaylists(page) {
   await expect
     .poll(() => settled >= EXPECTED_STARTUP_LOADS && inFlight === 0, {
       message:
-        "waiting for both of the app's own playlists loads to finish before seeding",
+        "waiting for the app's own playlists load to finish before seeding",
       timeout: 15_000,
     })
     .toBe(true);
@@ -235,6 +231,61 @@ test.describe("Playlists row mirror picker (#507)", () => {
     // carries the checkmark icon.
     await expect(jellyfinRow).toHaveClass(/border-gray-200/);
     await expect(jellyfinRow.locator("svg")).toHaveCount(2); // provider icon + checkmark
+  });
+
+  test("Music Assistant is a sink like the others, with its read-back error named", async ({ page }) => {
+    await gotoPlaylists(page);
+    await page.evaluate(() => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      app.playlists = [{
+        id: 8, title: "E2E Music Assistant Playlist", source_provider: "filesystem",
+        owner_user_id: null, owner_username: null, shared: 0, is_own: false,
+        mirror_enabled: false, mirror_last_error: null, mirror_folder_configured: false,
+        subsonic_mirror_enabled: false, subsonic_mirror_configured: false,
+        jellyfin_mirror_enabled: false, jellyfin_mirror_configured: false,
+        emby_mirror_enabled: false, emby_mirror_configured: false,
+        music_assistant_mirror_enabled: true, music_assistant_mirror_configured: true,
+        music_assistant_mirror_last_error: "1 of 3 tracks missing after the write",
+        music_assistant_mirror_last_error_code: "readback_mismatch",
+        golden_owner_username: null, inferred_origin_provider: null,
+        track_count: 10, matched_count: 5, unresolved_count: 0,
+      }];
+    });
+    await page.waitForTimeout(200);
+
+    await expect(page.locator(
+      "[title=\"Mirrored to Music Assistant — Music Assistant's copy doesn't hold what was written: 1 of 3 tracks missing after the write\"]",
+    )).toBeVisible();
+    await page.getByRole("button", { name: "Mirror…" }).click();
+    await expect(page.getByRole("button", { name: "Mirroring to Music Assistant" })).toBeVisible();
+  });
+
+  test("Plex is a sink like the others, with its read-back error named", async ({ page }) => {
+    await gotoPlaylists(page);
+    await page.evaluate(() => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      app.playlists = [{
+        id: 9, title: "E2E Plex Playlist", source_provider: "filesystem",
+        owner_user_id: null, owner_username: null, shared: 0, is_own: false,
+        mirror_enabled: false, mirror_last_error: null, mirror_folder_configured: false,
+        subsonic_mirror_enabled: false, subsonic_mirror_configured: false,
+        jellyfin_mirror_enabled: false, jellyfin_mirror_configured: false,
+        emby_mirror_enabled: false, emby_mirror_configured: false,
+        music_assistant_mirror_enabled: false, music_assistant_mirror_configured: false,
+        plex_mirror_enabled: true, plex_mirror_configured: true,
+        plex_mirror_last_error: "1 of 2 tracks missing after the write",
+        plex_mirror_last_error_code: "readback_mismatch",
+        golden_owner_username: null, inferred_origin_provider: null,
+        track_count: 10, matched_count: 5, unresolved_count: 0,
+      }];
+    });
+    await page.waitForTimeout(200);
+
+    await expect(page.locator(
+      "[title=\"Mirrored to Plex — Plex's copy doesn't hold what was written: 1 of 2 tracks missing after the write\"]",
+    )).toBeVisible();
+    await page.getByRole("button", { name: "Mirror…" }).click();
+    await expect(page.getByRole("button", { name: "Mirroring to Plex" })).toBeVisible();
   });
 
   test("the identity row shows a mirrored-sink badge with an accessible title (items 3-5)", async ({ page }) => {
@@ -518,5 +569,102 @@ test.describe("Hide zero-match playlists filter (#411)", () => {
     await page.waitForTimeout(400);
 
     await expect(page.getByRole("checkbox", { name: "Hide playlists with no local tracks" })).toBeChecked();
+  });
+});
+
+test.describe("Playlist gaps review", () => {
+  test("an album found in MusicBrainz says so; the source's own does not", async ({ page }) => {
+    await gotoPlaylists(page);
+    await page.evaluate(() => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      app.playlists = [{
+        id: 8, title: "E2E Gaps Playlist", source_provider: "roon",
+        owner_user_id: null, owner_username: null, shared: 0, is_own: false,
+        mirror_enabled: false, mirror_last_error: null, mirror_folder_configured: false,
+        golden_owner_username: null, inferred_origin_provider: null,
+        track_count: 10, matched_count: 8, unresolved_count: 2,
+      }];
+      app.unresolvedReviewFor = 8;
+      app.unresolvedReviewLoading = false;
+      app.unresolvedReviewError = false;
+      app.unresolvedReviewRows = [
+        { id: 1, artist: "Band", title: "Looked Up", album: "", inferred_album: "Found Album", isrc: null, excluded: false },
+        { id: 2, artist: "Band", title: "Given", album: "Source Album", inferred_album: null, isrc: null, excluded: false },
+      ];
+    });
+    await expect(page.getByText("Band — Found Album (from MusicBrainz) — Looked Up")).toBeVisible();
+    await expect(page.getByText("Band — Source Album — Given", { exact: true })).toBeVisible();
+  });
+});
+
+test.describe("Playlists row Lidarr requests", () => {
+  // Seeds one row with everything the Lidarr button reads, over a row that
+  // has gaps with album data and Lidarr fully configured.
+  async function seedLidarrRow(page, overrides) {
+    await page.evaluate((o) => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      app.playlists = [{
+        id: 7, title: "E2E Lidarr Playlist", source_provider: "filesystem",
+        owner_user_id: null, owner_username: null, shared: 0, is_own: false,
+        mirror_enabled: false, mirror_last_error: null, mirror_folder_configured: false,
+        subsonic_mirror_enabled: false, subsonic_mirror_configured: false,
+        jellyfin_mirror_enabled: false, jellyfin_mirror_configured: false,
+        emby_mirror_enabled: false, emby_mirror_configured: false,
+        golden_owner_username: null, inferred_origin_provider: null,
+        track_count: 10, matched_count: 7, unresolved_count: 3,
+        lidarr_request_enabled: false, lidarr_request_configured: true,
+        lidarr_request_connected: true, lidarr_request_has_albums: true,
+        lidarr_request_last_run_at: null, lidarr_request_last_count: null,
+        lidarr_request_last_error: null, lidarr_request_last_error_code: null,
+        ...o,
+      }];
+    }, overrides);
+    await expect(page.getByText("E2E Lidarr Playlist")).toBeVisible();
+  }
+
+  const lidarrButton = (page) => page.getByRole("button", { name: /missing albums/ });
+
+  test("without Lidarr configured the button is not there at all", async ({ page }) => {
+    await gotoPlaylists(page);
+    await seedLidarrRow(page, { lidarr_request_configured: false, lidarr_request_connected: false });
+    await expect(lidarrButton(page)).toBeHidden();
+  });
+
+  test("with Lidarr connected but not fully configured the button is not there either", async ({ page }) => {
+    await gotoPlaylists(page);
+    await seedLidarrRow(page, { lidarr_request_configured: false });
+    await expect(lidarrButton(page)).toBeHidden();
+  });
+
+  test("a playlist whose requests were on stays without button or error once Lidarr is gone", async ({ page }) => {
+    await gotoPlaylists(page);
+    await seedLidarrRow(page, {
+      lidarr_request_configured: false, lidarr_request_connected: false,
+      lidarr_request_enabled: true, lidarr_request_last_error_code: "unset_target",
+      lidarr_request_last_run_at: "2026-10-01T10:00:00Z",
+    });
+    await expect(lidarrButton(page)).toBeHidden();
+    await expect(page.getByText(/Lidarr requests aren't set up/)).toBeHidden();
+  });
+
+  test("a playlist with nothing missing says so, not that its source lacks album data", async ({ page }) => {
+    await gotoPlaylists(page);
+    await seedLidarrRow(page, { matched_count: 10, unresolved_count: 0, lidarr_request_has_albums: false });
+    await expect(lidarrButton(page)).toBeDisabled();
+    await expect(lidarrButton(page)).toHaveAttribute("title", /^Nothing is missing/);
+  });
+
+  test("a playlist whose gaps carry no album keeps the source hint", async ({ page }) => {
+    await gotoPlaylists(page);
+    await seedLidarrRow(page, { lidarr_request_has_albums: false });
+    await expect(lidarrButton(page)).toBeDisabled();
+    await expect(lidarrButton(page)).toHaveAttribute("title", /source doesn't provide album information/);
+  });
+
+  test("a playlist with gaps that carry albums can be switched on", async ({ page }) => {
+    await gotoPlaylists(page);
+    await seedLidarrRow(page, {});
+    await expect(lidarrButton(page)).toBeEnabled();
+    await expect(lidarrButton(page)).toHaveAttribute("title", /^Request this playlist's missing albums/);
   });
 });

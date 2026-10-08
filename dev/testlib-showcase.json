@@ -1,0 +1,1705 @@
+{
+ "_comment": "Showcase library for screenshots and demos: a fuller, realistic-looking fake library. Selected with TESTLIB=testlib-showcase.json (see dev/README.md). All names are invented -- no real artists or albums, nothing copyrighted. dev/testlib.json stays the small library the e2e suite and its Last.fm mock depend on.",
+ "user": {
+  "name": "devlistener",
+  "playcount": 18342
+ },
+ "cover_style": "designed",
+ "artist_images": true,
+ "track_seconds": [
+  148,
+  342
+ ],
+ "artists": [
+  {
+   "name": "Saltmarsh Choir",
+   "similar": [
+    "Cassia Wren",
+    "Halvard Stromsund",
+    "Selkie Bay"
+   ],
+   "albums": [
+    {
+     "title": "Low Tide Hymns",
+     "year": 2017,
+     "genre": "Folk",
+     "playcount": 94,
+     "tracks": [
+      "Salt Windows",
+      "Silver Gardens",
+      "Bright Engines",
+      "Hymn",
+      "Iron Bridges",
+      "Gentle Mornings",
+      "First Birds",
+      "Gardens",
+      "Bright Lanterns",
+      "Northern Weather",
+      "Broken Lanterns"
+     ]
+    },
+    {
+     "title": "The Estuary Songs",
+     "year": 2021,
+     "genre": "Folk",
+     "playcount": 242,
+     "tracks": [
+      "Waltz",
+      "Iron Waltz",
+      "Hollow Waves",
+      "First Rooms",
+      "Last Hours",
+      "Salt Islands",
+      "Morning Promise",
+      "Electric Windows",
+      "Salt Mornings"
+     ],
+     "format": "mp3"
+    }
+   ]
+  },
+  {
+   "name": "Cassia Wren",
+   "similar": [
+    "Saltmarsh Choir",
+    "Halvard Stromsund",
+    "Selkie Bay"
+   ],
+   "albums": [
+    {
+     "title": "Wildflower Theory",
+     "year": 1991,
+     "genre": "Folk",
+     "playcount": 177,
+     "tracks": [
+      "Velvet Lanterns",
+      "Streets",
+      "Rivers",
+      "Days",
+      "Gentle Signals",
+      "First Maps",
+      "Hollow Lanterns"
+     ]
+    },
+    {
+     "title": "Hedgerow",
+     "year": 1976,
+     "genre": "Folk",
+     "playcount": 183,
+     "tracks": [
+      "Distant Birds",
+      "Rooms",
+      "Slow Gardens",
+      "First Lights",
+      "Velvet Promise",
+      "Harbour Windows",
+      "First Islands",
+      "Iron Maps",
+      "Streets",
+      "Golden Days",
+      "Waltz"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Fennwick Trio",
+   "similar": [
+    "Brass Lantern Orchestra",
+    "Rosalind Achebe"
+   ],
+   "albums": [
+    {
+     "title": "Blue Hour Sessions",
+     "year": 2016,
+     "genre": "Jazz",
+     "playcount": 243,
+     "tracks": [
+      "Blue Bridges",
+      "Salt Streets",
+      "Last Hymn",
+      "Salt Engines",
+      "Silver Engines",
+      "Velvet Tides",
+      "Slow Weather",
+      "Electric Promise"
+     ]
+    },
+    {
+     "title": "Late Set at the Corsair",
+     "year": 2020,
+     "genre": "Jazz",
+     "playcount": 64,
+     "tracks": [
+      "Silver Roads",
+      "Letters",
+      "Salt Hours",
+      "Low Engines",
+      "Silver Rooms",
+      "Fields",
+      "Slow Lights",
+      "Electric Streets",
+      "Blue Days"
+     ],
+     "format": "mp3"
+    },
+    {
+     "title": "Three Rooms",
+     "year": 2024,
+     "genre": "Jazz",
+     "playcount": 47,
+     "tracks": [
+      "Golden Mornings",
+      "Silver Waves",
+      "Paper Song",
+      "Windows",
+      "Little Hymn",
+      "Copper Letters",
+      "Slow Streets",
+      "First Rivers",
+      "Mornings"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Orrin Vale",
+   "similar": [
+    "Juniper Static",
+    "Ilse Vandermeer",
+    "Monochrome Atlas"
+   ],
+   "albums": [
+    {
+     "title": "Quiet Machines",
+     "year": 2018,
+     "genre": "Electronic",
+     "playcount": 247,
+     "tracks": [
+      "Electric Weather",
+      "Paper Fields",
+      "Open Waltz",
+      "Broken Hours",
+      "Stars",
+      "Signals",
+      "Amber Bridges",
+      "Lanterns",
+      "Last Lights",
+      "Distant Lights",
+      "Salt Shadows"
+     ]
+    },
+    {
+     "title": "Signal Garden",
+     "year": 2022,
+     "genre": "Electronic",
+     "playcount": 133,
+     "tracks": [
+      "Summer Gardens",
+      "Salt Mornings",
+      "Midnight Lights",
+      "First Rooms",
+      "Northern Weather",
+      "Electric Shadows",
+      "Golden Bridges",
+      "First Signals",
+      "Open Islands",
+      "Summer Stars"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Velvet Cartography",
+   "similar": [
+    "Kestrel & Vane",
+    "The Lantern Assembly",
+    "Lowland Radio"
+   ],
+   "albums": [
+    {
+     "title": "Night Routes",
+     "year": 2019,
+     "genre": "Indie",
+     "playcount": 20,
+     "tracks": [
+      "Midnight Windows",
+      "Little Windows",
+      "Lights",
+      "Bright Mornings",
+      "Last Hours",
+      "Stars",
+      "Hours",
+      "Paper Windows"
+     ],
+     "format": "mp3"
+    },
+    {
+     "title": "Postcards from the Ring Road",
+     "year": 1998,
+     "genre": "Indie",
+     "playcount": 250,
+     "tracks": [
+      "Winter Waves",
+      "Waves",
+      "Paper Streets",
+      "Signals",
+      "Amber Roads",
+      "Silver Lanterns",
+      "First Roads",
+      "Gentle Waltz"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Kestrel & Vane",
+   "similar": [
+    "Velvet Cartography",
+    "The Lantern Assembly",
+    "Lowland Radio"
+   ],
+   "albums": [
+    {
+     "title": "Northern Lights, Southern Roads",
+     "year": 2020,
+     "genre": "Indie",
+     "playcount": 91,
+     "tracks": [
+      "Distant Hymn",
+      "Northern Shadows",
+      "Low Hours",
+      "Quiet Song",
+      "Broken Song",
+      "Little Rooms",
+      "Hours",
+      "Amber Stars"
+     ]
+    },
+    {
+     "title": "Weathervane",
+     "year": 2015,
+     "genre": "Indie",
+     "playcount": 228,
+     "tracks": [
+      "Bright Shadows",
+      "Paper Waltz",
+      "Waltz",
+      "Amber Tides",
+      "Lanterns",
+      "Midnight Fields",
+      "Days"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "The Lantern Assembly",
+   "similar": [
+    "Velvet Cartography",
+    "Kestrel & Vane",
+    "Lowland Radio"
+   ],
+   "albums": [
+    {
+     "title": "Paper Moons",
+     "year": 2007,
+     "genre": "Indie",
+     "playcount": 207,
+     "tracks": [
+      "Golden Promise",
+      "Silver Letters",
+      "First Streets",
+      "Distant Tides",
+      "Distant Windows",
+      "Salt Lights",
+      "Little Fields",
+      "Copper Hours",
+      "Salt Roads"
+     ],
+     "format": "mp3"
+    },
+    {
+     "title": "Small Fires",
+     "year": 2018,
+     "genre": "Indie",
+     "playcount": 64,
+     "tracks": [
+      "Kindling Season",
+      "Matchbook",
+      "Porch Lantern",
+      "Ember Street",
+      "Smoke Signals",
+      "Last Log",
+      "Cinder Waltz",
+      "Morning Ash"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Mira Okonkwo-Hale",
+   "similar": [
+    "Driftglass"
+   ],
+   "albums": [
+    {
+     "title": "Copper Season",
+     "year": 1979,
+     "genre": "Soul",
+     "playcount": 214,
+     "tracks": [
+      "Harbour Engines",
+      "Low Promise",
+      "Echoes",
+      "Winter Fields",
+      "Golden Lanterns",
+      "Gentle Waltz",
+      "Letters"
+     ]
+    },
+    {
+     "title": "Gold Leaf",
+     "year": 2022,
+     "genre": "Soul",
+     "playcount": 63,
+     "tracks": [
+      "Lights",
+      "Amber Waves",
+      "Silver Echoes",
+      "Copper Gardens",
+      "Paper Stars",
+      "Silver Lights",
+      "Paper Weather",
+      "Bridges",
+      "Mornings",
+      "Bright Echoes",
+      "Midnight Mornings"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Driftglass",
+   "similar": [
+    "Nightjar Collective"
+   ],
+   "albums": [
+    {
+     "title": "Harbour",
+     "year": 2017,
+     "genre": "Ambient",
+     "playcount": 178,
+     "tracks": [
+      "Last Birds",
+      "Winter Waves",
+      "Stars",
+      "Glass Letters",
+      "Distant Promise",
+      "Winter Rooms",
+      "Salt Windows",
+      "Summer Engines",
+      "Slow Windows"
+     ],
+     "format": "mp3"
+    },
+    {
+     "title": "Sea Fog Studies",
+     "year": 1996,
+     "genre": "Ambient",
+     "playcount": 142,
+     "tracks": [
+      "Signals",
+      "Glass Rivers",
+      "Last Gardens",
+      "Little Islands",
+      "Bright Song",
+      "Tides",
+      "Rooms",
+      "Golden Letters",
+      "Iron Stars",
+      "Distant Shadows"
+     ]
+    },
+    {
+     "title": "Breakwater",
+     "year": 2024,
+     "genre": "Ambient",
+     "playcount": 243,
+     "tracks": [
+      "Last Stars",
+      "Wild Rivers",
+      "Silver Shadows",
+      "Low Tides",
+      "Engines",
+      "Waves",
+      "First Birds",
+      "Amber Weather",
+      "Slow Shadows",
+      "Echoes",
+      "Bridges"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Thessaly Marsh",
+   "similar": [
+    "Aurelio Benedetti",
+    "Ebb & Flow Quartet"
+   ],
+   "albums": [
+    {
+     "title": "Nocturnes for a Small Town",
+     "year": 2001,
+     "genre": "Classical",
+     "playcount": 218,
+     "tracks": [
+      "Blue Signals",
+      "Weather",
+      "Lights",
+      "Amber Lanterns",
+      "Velvet Signals",
+      "First Bridges",
+      "Slow Islands",
+      "Echoes",
+      "Quiet Weather",
+      "Iron Lights"
+     ]
+    },
+    {
+     "title": "Winter Preludes",
+     "year": 2022,
+     "genre": "Classical",
+     "playcount": 104,
+     "tracks": [
+      "Midnight Lights",
+      "Open Stars",
+      "Quiet Promise",
+      "Bright Rooms",
+      "Summer Hours",
+      "Broken Promise",
+      "Open Waltz",
+      "Islands",
+      "Days"
+     ],
+     "format": "mp3"
+    }
+   ]
+  },
+  {
+   "name": "Brass Lantern Orchestra",
+   "similar": [
+    "Fennwick Trio",
+    "Rosalind Achebe"
+   ],
+   "albums": [
+    {
+     "title": "Streetlight Suite",
+     "year": 1987,
+     "genre": "Jazz",
+     "playcount": 33,
+     "tracks": [
+      "Quiet Waves",
+      "Shadows",
+      "First Echoes",
+      "Windows",
+      "Gentle Gardens",
+      "Midnight Birds",
+      "Little Waves",
+      "Little Maps",
+      "Summer Lights"
+     ]
+    },
+    {
+     "title": "Parade Weather",
+     "year": 2023,
+     "genre": "Jazz",
+     "playcount": 65,
+     "tracks": [
+      "Midnight Islands",
+      "Northern Days",
+      "Glass Fields",
+      "Golden Gardens",
+      "Broken Weather",
+      "Midnight Streets",
+      "Amber Windows",
+      "Distant Rivers"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Juniper Static",
+   "similar": [
+    "Orrin Vale",
+    "Ilse Vandermeer",
+    "Monochrome Atlas"
+   ],
+   "albums": [
+    {
+     "title": "Afterglow Protocol",
+     "year": 2021,
+     "genre": "Electronic",
+     "playcount": 55,
+     "tracks": [
+      "Distant Stations",
+      "Wild Stations",
+      "Glass Stars",
+      "Copper Days",
+      "Bright Mornings",
+      "Waves",
+      "Velvet Windows",
+      "Electric Stars",
+      "Lanterns"
+     ]
+    },
+    {
+     "title": "Low Orbit",
+     "year": 2018,
+     "genre": "Electronic",
+     "playcount": 106,
+     "tracks": [
+      "Midnight Signals",
+      "Echoes",
+      "First Mornings",
+      "Broken Islands",
+      "Mornings",
+      "Gentle Days",
+      "Iron Lanterns",
+      "Open Letters",
+      "Iron Birds",
+      "Engines",
+      "Salt Days"
+     ],
+     "format": "mp3"
+    }
+   ]
+  },
+  {
+   "name": "Ondine Laroche",
+   "similar": [
+    "Garance Moreau"
+   ],
+   "albums": [
+    {
+     "title": "Les Quais du Matin",
+     "year": 2005,
+     "genre": "Chanson",
+     "playcount": 142,
+     "tracks": [
+      "La Belle Fenêtre",
+      "La Douce Lettre",
+      "La Belle Chanson",
+      "Le Dernier Lettre",
+      "Le Petit Valse",
+      "La Belle Valse",
+      "Le Vieux Fenêtre"
+     ]
+    },
+    {
+     "title": "Rue des Tilleuls",
+     "year": 2007,
+     "genre": "Chanson",
+     "playcount": 153,
+     "tracks": [
+      "Le Vieux Gare",
+      "La Belle Lettre",
+      "Le Vieux Valse",
+      "Le Dernier Gare",
+      "Le Dernier Saison",
+      "La Belle Saison",
+      "Le Petit Valse",
+      "La Lente Gare",
+      "La Douce Fenêtre",
+      "La Lente Matin"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Halvard Stromsund",
+   "similar": [
+    "Saltmarsh Choir",
+    "Cassia Wren",
+    "Selkie Bay"
+   ],
+   "albums": [
+    {
+     "title": "Fjordlight",
+     "year": 2020,
+     "genre": "Folk",
+     "playcount": 198,
+     "tracks": [
+      "Streets",
+      "Quiet Maps",
+      "Letters",
+      "Gentle Days",
+      "Lights",
+      "Distant Rooms",
+      "Paper Gardens",
+      "Hollow Fields",
+      "First Waltz"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "The Copper Kites",
+   "similar": [
+    "Sundial Motel",
+    "Ferrous Bloom"
+   ],
+   "albums": [
+    {
+     "title": "Gravel & Gasoline",
+     "year": 2017,
+     "genre": "Rock",
+     "playcount": 86,
+     "tracks": [
+      "Waltz",
+      "Days",
+      "Open Gardens",
+      "Wild Gardens",
+      "Slow Stars",
+      "Golden Waltz",
+      "Iron Gardens"
+     ],
+     "format": "mp3"
+    },
+    {
+     "title": "Overpass",
+     "year": 2022,
+     "genre": "Rock",
+     "playcount": 246,
+     "tracks": [
+      "Velvet Rivers",
+      "Stations",
+      "Morning Lanterns",
+      "Golden Rivers",
+      "Wild Letters",
+      "Amber Gardens",
+      "Wild Waves",
+      "Amber Promise",
+      "Salt Rivers"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Nightjar Collective",
+   "similar": [
+    "Driftglass"
+   ],
+   "albums": [
+    {
+     "title": "Moth Hours",
+     "year": 2019,
+     "genre": "Ambient",
+     "playcount": 229,
+     "tracks": [
+      "Letters",
+      "Copper Gardens",
+      "Gardens",
+      "Winter Tides",
+      "Summer Tides",
+      "Velvet Tides",
+      "Hollow Lights",
+      "Broken Lights",
+      "Midnight Stars",
+      "Copper Hymn",
+      "Last Lights"
+     ]
+    },
+    {
+     "title": "Dusk Recordings",
+     "year": 1985,
+     "genre": "Ambient",
+     "playcount": 148,
+     "tracks": [
+      "Gentle Lights",
+      "Harbour Days",
+      "Promise",
+      "Silver Stations",
+      "Quiet Stations",
+      "Morning Song",
+      "Paper Stations"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Aurelio Benedetti",
+   "similar": [
+    "Thessaly Marsh",
+    "Ebb & Flow Quartet"
+   ],
+   "albums": [
+    {
+     "title": "Piano Diaries",
+     "year": 1998,
+     "genre": "Classical",
+     "playcount": 154,
+     "tracks": [
+      "Little Hymn",
+      "Salt Engines",
+      "Golden Bridges",
+      "Slow Weather",
+      "First Islands",
+      "Slow Fields",
+      "Bright Gardens",
+      "Broken Engines",
+      "Hollow Islands",
+      "Iron Maps",
+      "Midnight Stations"
+     ],
+     "format": "mp3"
+    },
+    {
+     "title": "Cantabile",
+     "year": 1968,
+     "genre": "Classical",
+     "playcount": 177,
+     "tracks": [
+      "Velvet Rivers",
+      "Golden Hours",
+      "First Mornings",
+      "Morning Lights",
+      "Gentle Days",
+      "Harbour Islands",
+      "Tides",
+      "Golden Lights",
+      "Bright Roads"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Sundial Motel",
+   "similar": [
+    "The Copper Kites",
+    "Ferrous Bloom"
+   ],
+   "albums": [
+    {
+     "title": "Vacancy",
+     "year": 2018,
+     "genre": "Rock",
+     "playcount": 79,
+     "tracks": [
+      "First Hymn",
+      "Golden Engines",
+      "Glass Shadows",
+      "Golden Roads",
+      "Electric Hymn",
+      "Wild Lights",
+      "Hollow Gardens",
+      "Broken Islands"
+     ]
+    },
+    {
+     "title": "Neon After Rain",
+     "year": 2021,
+     "genre": "Rock",
+     "playcount": 25,
+     "tracks": [
+      "Gentle Fields",
+      "Silver Windows",
+      "Iron Echoes",
+      "Hours",
+      "Wild Weather",
+      "Little Signals",
+      "Velvet Maps",
+      "Copper Windows",
+      "Morning Promise",
+      "Electric Stations",
+      "Iron Hymn"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Marigold Avenue",
+   "similar": [
+    "Clementine Harbour"
+   ],
+   "albums": [
+    {
+     "title": "Summer Static",
+     "year": 2022,
+     "genre": "Pop",
+     "playcount": 177,
+     "tracks": [
+      "Quiet Shadows",
+      "Slow Lights",
+      "Lanterns",
+      "Hollow Rivers",
+      "Gardens",
+      "Morning Shadows",
+      "Copper Days",
+      "Broken Weather"
+     ],
+     "format": "mp3"
+    },
+    {
+     "title": "Polaroid Hearts",
+     "year": 1991,
+     "genre": "Pop",
+     "playcount": 77,
+     "tracks": [
+      "Maps",
+      "Morning Bridges",
+      "Velvet Hymn",
+      "Morning Roads",
+      "Glass Promise",
+      "Harbour Windows",
+      "Golden Signals",
+      "Gentle Song",
+      "Paper Days"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Tamsin Grey",
+   "similar": [
+    "Wexford Lane"
+   ],
+   "albums": [
+    {
+     "title": "Rooms I Have Lived In",
+     "year": 1968,
+     "genre": "Singer-songwriter",
+     "playcount": 109,
+     "tracks": [
+      "Morning Mornings",
+      "Days",
+      "Winter Islands",
+      "Electric Waltz",
+      "Little Tides",
+      "Lights",
+      "Maps",
+      "Glass Days",
+      "Mornings",
+      "Distant Days"
+     ]
+    },
+    {
+     "title": "A Kinder Weather",
+     "year": 2023,
+     "genre": "Singer-songwriter",
+     "playcount": 231,
+     "tracks": [
+      "Gentle Hymn",
+      "Velvet Days",
+      "Golden Lanterns",
+      "Silver Lights",
+      "First Waves",
+      "Gentle Islands",
+      "Broken Maps",
+      "Gentle Days"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Ebb & Flow Quartet",
+   "similar": [
+    "Thessaly Marsh",
+    "Aurelio Benedetti"
+   ],
+   "albums": [
+    {
+     "title": "String Tides",
+     "year": 2021,
+     "genre": "Classical",
+     "playcount": 180,
+     "tracks": [
+      "Waltz",
+      "Little Lanterns",
+      "Distant Birds",
+      "Glass Windows",
+      "Summer Roads",
+      "Copper Rivers",
+      "First Windows",
+      "Distant Lanterns"
+     ],
+     "format": "mp3"
+    }
+   ]
+  },
+  {
+   "name": "Lowland Radio",
+   "similar": [
+    "Velvet Cartography",
+    "Kestrel & Vane",
+    "The Lantern Assembly"
+   ],
+   "albums": [
+    {
+     "title": "Frequencies",
+     "year": 2020,
+     "genre": "Indie",
+     "playcount": 109,
+     "tracks": [
+      "Quiet Signals",
+      "Waltz",
+      "Iron Streets",
+      "Blue Stations",
+      "Salt Rivers",
+      "Blue Echoes",
+      "Midnight Waltz",
+      "Gentle Rooms",
+      "Summer Stars",
+      "Open Hymn"
+     ]
+    },
+    {
+     "title": "Long Wave",
+     "year": 2024,
+     "genre": "Indie",
+     "playcount": 130,
+     "tracks": [
+      "Stars",
+      "Velvet Signals",
+      "Promise",
+      "Morning Fields",
+      "Silver Fields",
+      "Electric Promise",
+      "Paper Echoes",
+      "Salt Song",
+      "Gardens",
+      "Broken Promise",
+      "Midnight Tides"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Ilse Vandermeer",
+   "similar": [
+    "Orrin Vale",
+    "Juniper Static",
+    "Monochrome Atlas"
+   ],
+   "albums": [
+    {
+     "title": "Glass Cities",
+     "year": 2019,
+     "genre": "Electronic",
+     "playcount": 238,
+     "tracks": [
+      "Distant Lights",
+      "Slow Echoes",
+      "Electric Mornings",
+      "Broken Rooms",
+      "Winter Rivers",
+      "Quiet Stations",
+      "Iron Streets",
+      "Silver Lanterns"
+     ]
+    },
+    {
+     "title": "Tram Lines",
+     "year": 2005,
+     "genre": "Electronic",
+     "playcount": 149,
+     "tracks": [
+      "Streets",
+      "Wild Song",
+      "Copper Promise",
+      "Low Tides",
+      "Stars",
+      "Gentle Engines",
+      "Roads"
+     ],
+     "format": "mp3"
+    }
+   ]
+  },
+  {
+   "name": "The Quiet Cartel",
+   "similar": [
+    "Rosalind Achebe"
+   ],
+   "albums": [
+    {
+     "title": "Back Room Stories",
+     "year": 2021,
+     "genre": "Hip-hop",
+     "playcount": 60,
+     "tracks": [
+      "Iron Days",
+      "Salt Promise",
+      "Winter Signals",
+      "Distant Waltz",
+      "Midnight Lanterns",
+      "Wild Streets",
+      "Salt Letters",
+      "Low Hymn",
+      "Promise",
+      "Hymn",
+      "Hollow Hymn"
+     ]
+    },
+    {
+     "title": "Corner Store Philosophy",
+     "year": 1996,
+     "genre": "Hip-hop",
+     "playcount": 241,
+     "tracks": [
+      "Salt Days",
+      "Signals",
+      "Gentle Lanterns",
+      "Velvet Windows",
+      "Last Song",
+      "Midnight Engines",
+      "Lanterns",
+      "Little Lanterns",
+      "Waves",
+      "Glass Fields",
+      "Quiet Hours"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Rosalind Achebe",
+   "similar": [
+    "Fennwick Trio",
+    "Brass Lantern Orchestra"
+   ],
+   "albums": [
+    {
+     "title": "Indigo Hours",
+     "year": 1973,
+     "genre": "Jazz",
+     "playcount": 221,
+     "tracks": [
+      "Amber Roads",
+      "Lanterns",
+      "Roads",
+      "Blue Hours",
+      "Copper Engines",
+      "Last Hymn",
+      "Windows",
+      "Slow Engines",
+      "Northern Echoes",
+      "Paper Maps"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Pinegrove Drifters",
+   "similar": [
+    "Selkie Bay"
+   ],
+   "albums": [
+    {
+     "title": "Dust Roads Home",
+     "year": 2017,
+     "genre": "Country",
+     "playcount": 19,
+     "tracks": [
+      "Blue Fields",
+      "Wild Signals",
+      "Summer Waltz",
+      "Little Weather",
+      "Gentle Streets",
+      "Last Waves",
+      "Copper Fields",
+      "Electric Hymn"
+     ],
+     "format": "mp3"
+    },
+    {
+     "title": "Porch Light",
+     "year": 2022,
+     "genre": "Country",
+     "playcount": 239,
+     "tracks": [
+      "Gentle Fields",
+      "Blue Promise",
+      "Roads",
+      "Waltz",
+      "Paper Engines",
+      "Paper Gardens",
+      "Gentle Engines",
+      "Fields",
+      "Blue Days",
+      "Open Lanterns"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Selkie Bay",
+   "similar": [
+    "Saltmarsh Choir",
+    "Cassia Wren",
+    "Halvard Stromsund"
+   ],
+   "albums": [
+    {
+     "title": "Grey Seal Songs",
+     "year": 2007,
+     "genre": "Folk",
+     "playcount": 254,
+     "tracks": [
+      "Northern Lanterns",
+      "Days",
+      "Summer Echoes",
+      "Slow Bridges",
+      "Northern Shadows",
+      "Summer Hymn",
+      "Velvet Hymn",
+      "Morning Song",
+      "Little Song",
+      "Northern Weather"
+     ]
+    },
+    {
+     "title": "The Drowned Bell",
+     "year": 2017,
+     "genre": "Folk",
+     "playcount": 37,
+     "tracks": [
+      "Bell Under Water",
+      "Kelp Forest",
+      "The Ferryman's Daughter",
+      "Tide Chart",
+      "Seal Wife",
+      "Lamp on the Rocks",
+      "Home Before Dark"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Monochrome Atlas",
+   "similar": [
+    "Orrin Vale",
+    "Juniper Static",
+    "Ilse Vandermeer"
+   ],
+   "albums": [
+    {
+     "title": "Grid Lines",
+     "year": 2018,
+     "genre": "Electronic",
+     "playcount": 139,
+     "tracks": [
+      "Paper Fields",
+      "Engines",
+      "Lights",
+      "Last Days",
+      "Glass Tides",
+      "Waltz",
+      "Fields"
+     ],
+     "format": "mp3"
+    },
+    {
+     "title": "Ultramarine",
+     "year": 2023,
+     "genre": "Electronic",
+     "playcount": 106,
+     "tracks": [
+      "Gentle Tides",
+      "Copper Mornings",
+      "Low Letters",
+      "Slow Mornings",
+      "Wild Tides",
+      "First Rooms",
+      "Glass Song",
+      "Lights",
+      "Gentle Letters"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Clementine Harbour",
+   "similar": [
+    "Marigold Avenue"
+   ],
+   "albums": [
+    {
+     "title": "Sugar Coast",
+     "year": 2020,
+     "genre": "Pop",
+     "playcount": 129,
+     "tracks": [
+      "Iron Days",
+      "Signals",
+      "Slow Days",
+      "Electric Maps",
+      "Promise",
+      "Copper Weather",
+      "Distant Bridges",
+      "Maps"
+     ]
+    },
+    {
+     "title": "Lighthouse Kids",
+     "year": 2005,
+     "genre": "Pop",
+     "playcount": 203,
+     "tracks": [
+      "Golden Engines",
+      "Gardens",
+      "Bright Shadows",
+      "Silver Stars",
+      "Midnight Stations",
+      "Distant Echoes",
+      "Little Rivers"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Garance Moreau",
+   "similar": [
+    "Ondine Laroche"
+   ],
+   "albums": [
+    {
+     "title": "Petites Heures",
+     "year": 2019,
+     "genre": "Chanson",
+     "playcount": 150,
+     "tracks": [
+      "Le Vieux Saison",
+      "Le Dernier Rivière",
+      "Le Dernier Fenêtre",
+      "Le Vieux Gare",
+      "La Lente Rivière",
+      "La Lente Chanson",
+      "La Belle Gare",
+      "La Belle Saison",
+      "Le Petit Gare",
+      "Le Vieux Rivière"
+     ],
+     "format": "mp3"
+    }
+   ]
+  },
+  {
+   "name": "Ferrous Bloom",
+   "similar": [
+    "The Copper Kites",
+    "Sundial Motel"
+   ],
+   "albums": [
+    {
+     "title": "Iron & Petals",
+     "year": 2022,
+     "genre": "Rock",
+     "playcount": 59,
+     "tracks": [
+      "Gentle Fields",
+      "Paper Rooms",
+      "Summer Islands",
+      "Open Hours",
+      "Amber Signals",
+      "Hymn",
+      "Electric Hours",
+      "Quiet Birds",
+      "Bridges"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Wexford Lane",
+   "similar": [
+    "Tamsin Grey"
+   ],
+   "albums": [
+    {
+     "title": "Small Hours, Big Rooms",
+     "year": 2021,
+     "genre": "Singer-songwriter",
+     "playcount": 250,
+     "tracks": [
+      "Tides",
+      "Hollow Roads",
+      "Rooms",
+      "Northern Engines",
+      "Roads",
+      "Windows",
+      "Little Gardens"
+     ]
+    },
+    {
+     "title": "Kitchen Table Demos",
+     "year": 1971,
+     "genre": "Singer-songwriter",
+     "playcount": 220,
+     "tracks": [
+      "Bright Weather",
+      "Winter Shadows",
+      "Northern Waves",
+      "Harbour Engines",
+      "Distant Engines",
+      "Silver Windows",
+      "Harbour Mornings"
+     ]
+    }
+   ]
+  }
+ ],
+ "playlists": [
+  {
+   "name": "Sunday Morning",
+   "tracks": [
+    {
+     "artist": "Tamsin Grey",
+     "album": "A Kinder Weather",
+     "track": 3
+    },
+    {
+     "artist": "The Quiet Cartel",
+     "album": "Back Room Stories",
+     "track": 3
+    },
+    {
+     "artist": "Ebb & Flow Quartet",
+     "album": "String Tides",
+     "track": 8
+    },
+    {
+     "artist": "Kestrel & Vane",
+     "album": "Northern Lights, Southern Roads",
+     "track": 7
+    },
+    {
+     "artist": "Driftglass",
+     "album": "Harbour",
+     "track": 2
+    },
+    {
+     "artist": "Kestrel & Vane",
+     "album": "Weathervane",
+     "track": 5
+    },
+    {
+     "artist": "Marigold Avenue",
+     "album": "Polaroid Hearts",
+     "track": 5
+    },
+    {
+     "artist": "Orrin Vale",
+     "album": "Quiet Machines",
+     "track": 11
+    },
+    {
+     "artist": "Tamsin Grey",
+     "album": "A Kinder Weather",
+     "track": 4
+    },
+    {
+     "artist": "Driftglass",
+     "album": "Breakwater",
+     "track": 10
+    },
+    {
+     "artist": "Rosalind Achebe",
+     "album": "Indigo Hours",
+     "track": 10
+    },
+    {
+     "artist": "Kestrel & Vane",
+     "album": "Weathervane",
+     "track": 6
+    },
+    {
+     "artist": "Marigold Avenue",
+     "album": "Summer Static",
+     "track": 1
+    },
+    {
+     "artist": "Monochrome Atlas",
+     "album": "Grid Lines",
+     "track": 5
+    }
+   ]
+  },
+  {
+   "name": "Late Night Drive",
+   "tracks": [
+    {
+     "artist": "Ferrous Bloom",
+     "album": "Iron & Petals",
+     "track": 2
+    },
+    {
+     "artist": "Ilse Vandermeer",
+     "album": "Tram Lines",
+     "track": 4
+    },
+    {
+     "artist": "Wexford Lane",
+     "album": "Small Hours, Big Rooms",
+     "track": 5
+    },
+    {
+     "artist": "Ferrous Bloom",
+     "album": "Iron & Petals",
+     "track": 1
+    },
+    {
+     "artist": "Lowland Radio",
+     "album": "Frequencies",
+     "track": 9
+    },
+    {
+     "artist": "Nightjar Collective",
+     "album": "Dusk Recordings",
+     "track": 3
+    },
+    {
+     "artist": "Marigold Avenue",
+     "album": "Summer Static",
+     "track": 4
+    },
+    {
+     "artist": "Ferrous Bloom",
+     "album": "Iron & Petals",
+     "track": 6
+    },
+    {
+     "artist": "Nightjar Collective",
+     "album": "Dusk Recordings",
+     "track": 1
+    },
+    {
+     "artist": "Thessaly Marsh",
+     "album": "Nocturnes for a Small Town",
+     "track": 6
+    },
+    {
+     "artist": "Marigold Avenue",
+     "album": "Polaroid Hearts",
+     "track": 7
+    },
+    {
+     "artist": "Ondine Laroche",
+     "album": "Les Quais du Matin",
+     "track": 1
+    },
+    {
+     "artist": "Kestrel & Vane",
+     "album": "Weathervane",
+     "track": 3
+    },
+    {
+     "artist": "Nightjar Collective",
+     "album": "Dusk Recordings",
+     "track": 5
+    },
+    {
+     "artist": "Ondine Laroche",
+     "album": "Rue des Tilleuls",
+     "track": 6
+    },
+    {
+     "artist": "Ebb & Flow Quartet",
+     "album": "String Tides",
+     "track": 8
+    },
+    {
+     "artist": "Orrin Vale",
+     "album": "Signal Garden",
+     "track": 10
+    },
+    {
+     "artist": "Aurelio Benedetti",
+     "album": "Piano Diaries",
+     "track": 5
+    }
+   ]
+  },
+  {
+   "name": "Focus",
+   "tracks": [
+    {
+     "artist": "Monochrome Atlas",
+     "album": "Grid Lines",
+     "track": 1
+    },
+    {
+     "artist": "Mira Okonkwo-Hale",
+     "album": "Copper Season",
+     "track": 6
+    },
+    {
+     "artist": "Pinegrove Drifters",
+     "album": "Dust Roads Home",
+     "track": 7
+    },
+    {
+     "artist": "Wexford Lane",
+     "album": "Kitchen Table Demos",
+     "track": 4
+    },
+    {
+     "artist": "Pinegrove Drifters",
+     "album": "Porch Light",
+     "track": 5
+    },
+    {
+     "artist": "Brass Lantern Orchestra",
+     "album": "Streetlight Suite",
+     "track": 1
+    },
+    {
+     "artist": "Ilse Vandermeer",
+     "album": "Glass Cities",
+     "track": 7
+    },
+    {
+     "artist": "Saltmarsh Choir",
+     "album": "The Estuary Songs",
+     "track": 5
+    },
+    {
+     "artist": "Driftglass",
+     "album": "Sea Fog Studies",
+     "track": 2
+    },
+    {
+     "artist": "Pinegrove Drifters",
+     "album": "Porch Light",
+     "track": 4
+    },
+    {
+     "artist": "Ilse Vandermeer",
+     "album": "Tram Lines",
+     "track": 7
+    },
+    {
+     "artist": "Mira Okonkwo-Hale",
+     "album": "Gold Leaf",
+     "track": 6
+    },
+    {
+     "artist": "Ilse Vandermeer",
+     "album": "Tram Lines",
+     "track": 6
+    },
+    {
+     "artist": "Saltmarsh Choir",
+     "album": "The Estuary Songs",
+     "track": 8
+    },
+    {
+     "artist": "Ferrous Bloom",
+     "album": "Iron & Petals",
+     "track": 7
+    },
+    {
+     "artist": "Cassia Wren",
+     "album": "Wildflower Theory",
+     "track": 3
+    },
+    {
+     "artist": "Kestrel & Vane",
+     "album": "Northern Lights, Southern Roads",
+     "track": 5
+    },
+    {
+     "artist": "Ebb & Flow Quartet",
+     "album": "String Tides",
+     "track": 5
+    },
+    {
+     "artist": "Tamsin Grey",
+     "album": "A Kinder Weather",
+     "track": 2
+    },
+    {
+     "artist": "The Quiet Cartel",
+     "album": "Corner Store Philosophy",
+     "track": 8
+    },
+    {
+     "artist": "Clementine Harbour",
+     "album": "Sugar Coast",
+     "track": 5
+    },
+    {
+     "artist": "Aurelio Benedetti",
+     "album": "Piano Diaries",
+     "track": 5
+    }
+   ]
+  },
+  {
+   "name": "Kitchen Dancing",
+   "tracks": [
+    {
+     "artist": "Ebb & Flow Quartet",
+     "album": "String Tides",
+     "track": 5
+    },
+    {
+     "artist": "Marigold Avenue",
+     "album": "Polaroid Hearts",
+     "track": 5
+    },
+    {
+     "artist": "Mira Okonkwo-Hale",
+     "album": "Gold Leaf",
+     "track": 9
+    },
+    {
+     "artist": "Ebb & Flow Quartet",
+     "album": "String Tides",
+     "track": 3
+    },
+    {
+     "artist": "Thessaly Marsh",
+     "album": "Nocturnes for a Small Town",
+     "track": 2
+    },
+    {
+     "artist": "Ondine Laroche",
+     "album": "Les Quais du Matin",
+     "track": 1
+    },
+    {
+     "artist": "Velvet Cartography",
+     "album": "Postcards from the Ring Road",
+     "track": 4
+    },
+    {
+     "artist": "Juniper Static",
+     "album": "Low Orbit",
+     "track": 11
+    },
+    {
+     "artist": "Wexford Lane",
+     "album": "Small Hours, Big Rooms",
+     "track": 4
+    },
+    {
+     "artist": "Orrin Vale",
+     "album": "Signal Garden",
+     "track": 4
+    },
+    {
+     "artist": "Orrin Vale",
+     "album": "Quiet Machines",
+     "track": 4
+    },
+    {
+     "artist": "Ondine Laroche",
+     "album": "Les Quais du Matin",
+     "track": 5
+    }
+   ]
+  }
+ ]
+}

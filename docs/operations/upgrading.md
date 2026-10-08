@@ -129,7 +129,7 @@ nothing does this for them.
 ## New: mirror playlists to Subsonic/Navidrome, Jellyfin, or Emby (2.10.0)
 
 Three new mirror-target sinks join the existing folder mirror — see
-[Playlists → Mirroring](../using/playlists.md#mirroring-to-a-local-folder-a-subsonicnavidrome-server-a-jellyfin-server-or-an-emby-server)
+[Playlists → Mirroring](../using/playlists.md#mirroring)
 for what each does and its known quirks (notably: Emby reverts the
 mirrored playlist's comment field a few seconds after every write —
 its own behavior, outside Trobar's control, and harmless — the name and
@@ -206,3 +206,33 @@ active sink next to its title instead of a same-row action button; the
 icon turns red if that sink's last write failed. No action needed —
 every existing mirror keeps mirroring exactly as before, this only
 changes how you turn one on or off.
+
+## Filesystem mirrors move into per-user folders (2.16.0)
+
+The filesystem mirror now writes each playlist into its owner's folder,
+`<mirror folder>/<user>/music/`, with an empty `mixed/` beside it, and
+playlists nobody owns into `_shared/music/`. That is what lets each Kodi
+profile read only its own user's playlists ([Kodi](../providers/kodi.md)).
+
+**Action needed if a player reads the mirror folder.** On the first sync
+after upgrading, every mirror is rewritten into its owner's folder and the
+old file in the mirror folder itself is removed (only files carrying
+Trobar's marker; anything else is left alone). Point the player at a user's
+folder, or at `_shared/`, instead.
+
+## Pairing shows a short code for every device (2.16.0)
+
+**Profile → Devices** now pairs every device with an 8-character code and
+its QR code, valid for an hour: **Re-pair in app** on an existing device,
+and the dialog after **Create device** for a DAP, removable storage or a
+local folder. **Regenerate + QR**, which showed the device's raw token, is
+gone.
+
+**Action needed for the desktop app.** trobar-desktop v0.11.0, the current
+desktop release, can't read a code. To pair a card or folder with it, choose
+**Older desktop app? Get a config file instead** in the code dialog: that
+issues a new token, shown as a QR code and a downloadable
+`trobar-device.json`, and the device's previous token stops working
+immediately. A desktop release that reads codes will make this step
+unnecessary. Cards already paired keep working; nothing changes for them
+until they're paired again.

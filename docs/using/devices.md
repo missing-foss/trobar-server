@@ -54,8 +54,9 @@ not-yet-synced music.
 ## Replacing a device
 
 **"Replaces…"** on a device reassigns everything an old device held —
-synced tracks, selections, and settings — onto it, then deletes the old
-device. Pair the replacement first, then use this action on it and pick the
+synced tracks, selections, settings and the playlists made on it
+([Playlists made on a device](playlists.md#playlists-made-on-a-device)) —
+onto it, then deletes the old device. Pair the replacement first, then use this action on it and pick the
 device it's taking over from. See
 [Device loss, replacement & migration](device-recovery.md#client-replaced-server-intact)
 for the full picture, including what happens across device types and who's

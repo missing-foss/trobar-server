@@ -24,15 +24,22 @@ from pathlib import Path
 
 # Semantic name used in templates -> "set:icon" on api.iconify.design.
 ICONS = {
-    # device types (deviceIconSvg)
+    # Device icons: devices.icon, or the type's own (deviceIconSvg). A
+    # picture only -- the type drives behaviour. Generic shapes, no brand
+    # marks. "own:" entries are this project's drawings, in OWN_DRAWINGS.
     "device-phone": "lucide:smartphone",
-    "device-tablet": "lucide:tablet",
+    "device-phone-button": "own:phone-button",
+    "device-tablet": "own:tablet",
+    "device-tablet-small": "own:tablet-small",
+    "device-clickwheel": "own:clickwheel",
+    "device-cassette": "lucide:cassette-tape",
+    "device-dap-buttons": "own:dap-buttons",
+    "device-headphones": "lucide:headphones",
     "device-watch": "lucide:watch",
-    "device-dap": "lucide:headphones",
-    "device-sdcard": "lucide:memory-stick",
+    "device-sdcard": "tabler:device-sd-card",
+    "device-usb": "lucide:memory-stick",
     # #218: local-folder sync targets, distinct from a removable SD/USB
-    # device — same glyph as provider-filesystem (also lucide:folder),
-    # different semantic key since this one's driven by deviceIconSvg().
+    # device -- same glyph as provider-filesystem (also lucide:folder).
     "device-folder": "lucide:folder",
     # providers (header status badge). Brand glyphs, nominative
     # interoperability use: an all-generic set made the badges
@@ -67,9 +74,17 @@ ICONS = {
     # neutral music glyph, which reads as "unknown source" next to rows
     # that name theirs.
     "provider-ytmusic": "simple-icons:youtubemusic",
+    # Public Spotify playlists by link: the Spotify glyph, as for the
+    # linked accounts. A separate source id, so a separate entry.
+    "provider-spotify_public": "simple-icons:spotify",
+    # Music Assistant, an extra playlist source: no Simple Icons entry,
+    # selfh.st has one. The -dark variant is the single-colour drawing,
+    # normalized to currentColor like the other selfhst icons.
+    "provider-music_assistant": "selfhst:music-assistant-dark",
     # integrations / suggestion sources
     "lastfm": "simple-icons:lastdotfm",
     "listenbrainz": "selfhst:listenbrainz-dark",
+    "maloja": "selfhst:maloja-dark",
     "source-recent": "lucide:music",
     # chrome
     "settings": "lucide:settings",
@@ -109,6 +124,25 @@ def normalize(body: str) -> str:
     return f'<g fill="currentColor">{body}</g>'
 
 
+# This project's own drawings, in the same form the Iconify API gives
+# Lucide's: 24 grid, 2 px stroke, round caps. A few rects and circles each,
+# under the project's licence. Not fetched.
+_STROKE = '<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">{}</g>'
+OWN_DRAWINGS = {
+    # a phone with a home button
+    "phone-button": _STROKE.format('<rect width="14" height="20" x="5" y="2" rx="2"/><circle cx="12" cy="17.5" r="1.5"/>'),
+    # a tablet held landscape: at 16 px it no longer reads as the phone
+    "tablet": _STROKE.format('<rect width="20" height="16" x="2" y="4" rx="2"/><path d="M18 12h.01"/>'),
+    # a small tablet, portrait, with a bar at the bottom: the bar, not a dot,
+    # keeps it apart from the phones at 16 px
+    "tablet-small": _STROKE.format('<rect width="16" height="18" x="4" y="3" rx="2"/><path d="M9 18h6"/>'),
+    # a click-wheel player: a small screen over a wheel
+    "clickwheel": _STROKE.format('<rect width="12" height="20" x="6" y="2" rx="2"/><rect width="6" height="4" x="9" y="5" rx="1"/><circle cx="12" cy="15.5" r="2.5"/>'),
+    # a player with a screen and a direction pad
+    "dap-buttons": _STROKE.format('<rect width="12" height="20" x="6" y="2" rx="2"/><rect width="6" height="5" x="9" y="5" rx="1"/><path d="M12 14v4m-2-2h4"/>'),
+}
+
+
 def main() -> None:
     by_set: dict[str, list[str]] = defaultdict(list)
     for full in ICONS.values():
@@ -117,6 +151,9 @@ def main() -> None:
 
     bodies: dict[str, str] = {}
     sizes: dict[str, tuple[int, int]] = {}
+    for name in by_set.pop("own", []):
+        bodies[f"own:{name}"] = OWN_DRAWINGS[name]
+        sizes[f"own:{name}"] = (24, 24)
     for prefix, names in sorted(by_set.items()):
         url = f"https://api.iconify.design/{prefix}.json?icons={','.join(sorted(set(names)))}"
         req = urllib.request.Request(url, headers={"User-Agent": "trobar-fetch-icons/1.0"})
@@ -135,17 +172,27 @@ def main() -> None:
     # REUSE-IgnoreStart: this is the generated *output* file's own header,
     # not a license declaration for fetch-icons.py — reuse's file scanner is
     # a plain-text match and can't tell the difference, so without this
-    # marker it reads the two lines below as a second, garbled SPDX tag on
-    # this file (the trailing Python string-literal syntax after
-    # "AGPL-3.0-or-later" gets swept into the parsed expression).
+    # marker it reads the lines below as more, garbled SPDX tags on this
+    # file (the trailing Python string-literal syntax gets swept into the
+    # parsed expression).
+    #
+    # The file is this project's code wrapping three sets' artwork, so it
+    # declares all four: the code's licence and each set's, with each set's
+    # holders named. A set added to ICONS from another source adds its
+    # licence and holder here, and its text under LICENSES/.
     lines = [
         "// SPDX-FileCopyrightText: 2026 missing-foss",
+        "// SPDX-FileCopyrightText: Lucide Contributors",
+        "// SPDX-FileCopyrightText: Simple Icons contributors",
+        "// SPDX-FileCopyrightText: selfh.st",
+        "// SPDX-FileCopyrightText: 2020-2024 Paweł Kuna",
         "//",
-        "// SPDX-License-Identifier: AGPL-3.0-or-later",
+        "// SPDX-License-Identifier: AGPL-3.0-or-later AND ISC AND CC0-1.0 AND CC-BY-4.0 AND MIT",
         # REUSE-IgnoreEnd
         "",
         "// GENERATED by dev/fetch-icons.py - do not edit by hand.",
-        "// Icon artwork: Lucide (ISC), Simple Icons (CC0), selfh.st/icons (CC BY 4.0) - see THIRD_PARTY_NOTICES.md.",
+        "// Icon artwork: Lucide (ISC), Simple Icons (CC0), selfh.st/icons (CC BY 4.0), Tabler (MIT),",
+        "// and this project's own device drawings - see THIRD_PARTY_NOTICES.md.",
         "// Each entry is inner SVG markup for a 24x24 viewBox, rendered via",
         '// <svg viewBox="0 0 24 24" x-html="ICONS[name]">.',
         "const ICONS = {",

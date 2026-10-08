@@ -47,6 +47,7 @@ import threading
 import requests
 
 import db
+import provider_config
 import matching
 
 _API_VERSION = "1.16.1"
@@ -57,6 +58,10 @@ _artist_image_key_map_lock = threading.Lock()
 
 
 def _current_config() -> tuple[str, str, str]:
+    # An unsaved connection the switch preview reads through: provider_config.
+    unsaved = provider_config.override("subsonic")
+    if unsaved is not None:
+        return unsaved
     conn = db.get_conn()
     try:
         url = db.get_config(conn, "subsonic_url") or ""

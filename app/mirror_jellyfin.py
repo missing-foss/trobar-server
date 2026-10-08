@@ -45,6 +45,45 @@ def _set_error(conn, playlist_id: int, code: str, detail: str | None = None) -> 
     )
 
 
+
+def _mirror_account() -> str | None:
+    """The configured mirror account's user id."""
+    config = db.get_mirror_jellyfin_config()
+    return config[2] if config else None
+
+
+def _same_server(cache: dict | None) -> bool | None:
+    """Whether the mirror target is the library server, asked once per sync
+    run: `cache` is the run's tag-index cache dict (None for a one-off
+    write, which asks afresh)."""
+    if cache is None:
+        return jellyfin_client.mirror_target_is_library_server()
+    if "same_server" not in cache:
+        cache["same_server"] = jellyfin_client.mirror_target_is_library_server()
+    return cache["same_server"]
+
+
+def _target_account(conn, row, cache: dict | None) -> str | None:
+    """The Jellyfin account this playlist's copy belongs in: its owner's mapped
+    account (users.jellyfin_user_id) when the owner has one and the mirror
+    target is the library server the mapping was made on; otherwise the
+    configured mirror account, as for an unowned playlist. When it can't be
+    told whether the servers match (one didn't answer), an existing copy
+    stays in the account it is in rather than being moved on a passing
+    error."""
+    if row["owner_user_id"] is None:
+        return _mirror_account()
+    same = _same_server(cache)
+    if same is None:
+        return row["jellyfin_mirror_owner_id"] or _mirror_account()
+    if same:
+        mapped = conn.execute("SELECT jellyfin_user_id FROM users WHERE id = ?",
+                              (row["owner_user_id"],)).fetchone()
+        if mapped is not None and mapped[0]:
+            return mapped[0]
+    return _mirror_account()
+
+
 def _get_tag_index(tag_index_cache: dict | None):
     """Builds the target's tag index, or returns the one already built this
     sync run. `tag_index_cache` is a plain dict the CALLER owns and passes
@@ -106,7 +145,7 @@ def delete_mirror(conn, playlist_id: int) -> None:
             row["jellyfin_mirror_remote_id"], playlist_id,
         )
     conn.execute(
-        "UPDATE playlists SET jellyfin_mirror_remote_id = NULL, "
+        "UPDATE playlists SET jellyfin_mirror_remote_id = NULL, jellyfin_mirror_owner_id = NULL, "
         "jellyfin_mirror_last_written_at = NULL WHERE id = ?", (playlist_id,),
     )
 
@@ -124,7 +163,7 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
     dict across every playlist in one sync run to build the target index
     only once."""
     row = conn.execute(
-        "SELECT title, jellyfin_mirror_enabled, jellyfin_mirror_remote_id "
+        "SELECT title, owner_user_id, jellyfin_mirror_enabled, jellyfin_mirror_remote_id, jellyfin_mirror_owner_id "
         "FROM playlists WHERE id = ?", (playlist_id,),
     ).fetchone()
     if row is None or not row["jellyfin_mirror_enabled"]:
@@ -178,10 +217,23 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
         _set_error(conn, playlist_id, "no_target_matches")
         return
 
-    result = jellyfin_client.mirror_create_or_replace_playlist(
-        row["title"], song_ids, row["jellyfin_mirror_remote_id"])
+    # The account the copy belongs in (_target_account). A copy written
+    # into another one (the mapping changed, or the mirror account did)
+    # moves: the old copy is deleted by its id, which the admin key can do
+    # whoever owns it, and a fresh one is made in the right account. A copy
+    # from before this was tracked counts as being in the mirror account.
+    target = _target_account(conn, row, tag_index_cache)
+    remote_id = row["jellyfin_mirror_remote_id"]
+    if remote_id is not None and (row["jellyfin_mirror_owner_id"] or _mirror_account()) != target:
+        if not jellyfin_client.mirror_delete_playlist(remote_id):
+            _set_error(conn, playlist_id, "write_failed", "the copy in the previous account could not be removed")
+            return
+        conn.execute("UPDATE playlists SET jellyfin_mirror_remote_id = NULL, jellyfin_mirror_owner_id = NULL "
+                     "WHERE id = ?", (playlist_id,))
+        remote_id = None
+    result = jellyfin_client.mirror_create_or_replace_playlist(row["title"], song_ids, remote_id, target)
     if result["status"] != "ok" and result.get("code") == _ERROR_NOT_FOUND \
-            and row["jellyfin_mirror_remote_id"] is not None:
+            and remote_id is not None:
         # The remote playlist Trobar remembers was deleted target-side —
         # clear the stale id up front (so even if this retry also fails for
         # an unrelated reason, the next write tries a fresh create rather
@@ -190,7 +242,7 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
         # for its own unlink failure.
         conn.execute(
             "UPDATE playlists SET jellyfin_mirror_remote_id = NULL WHERE id = ?", (playlist_id,))
-        result = jellyfin_client.mirror_create_or_replace_playlist(row["title"], song_ids, None)
+        result = jellyfin_client.mirror_create_or_replace_playlist(row["title"], song_ids, None, target)
     if result["status"] != "ok":
         _set_error(conn, playlist_id, "write_failed", result.get("reason"))
         return
@@ -202,9 +254,9 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
     )
 
     conn.execute(
-        "UPDATE playlists SET jellyfin_mirror_remote_id = ?, "
+        "UPDATE playlists SET jellyfin_mirror_remote_id = ?, jellyfin_mirror_owner_id = ?, "
         "jellyfin_mirror_last_written_at = datetime('now'), "
         "jellyfin_mirror_last_error = NULL, jellyfin_mirror_last_error_code = NULL "
         "WHERE id = ?",
-        (remote_id, playlist_id),
+        (remote_id, target, playlist_id),
     )

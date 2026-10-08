@@ -32,11 +32,15 @@ active at a time.
 | Plex | Playlists | Server URL + token |
 | Lyrion Music Server | Playlists | Server URL (+ user/password if secured) |
 | Subsonic | Playlists | Server URL + user + password (Navidrome, Gonic, Airsonic, …) |
+| Music Assistant | Playlists, artist images where it has them | Server URL + long-lived token |
 
 Each has its own page under [Providers](../providers/index.md), including the
-[Roon pairing dance](../providers/roon.md). Switching provider later (from the
-[Administration](../administration.md) panel) clears playlists and the
-artist-image cache — selections, devices, and users survive.
+[Roon pairing dance](../providers/roon.md). You can switch provider later,
+through [Change library source](../administration.md#changing-the-library-source):
+it carries over the playlists the new provider also has, removes the old
+provider's other playlists and the artist-image cache, and shows what that
+touches before you confirm. Users, devices and your library
+survive.
 
 !!! note "Artist images are separate"
     Artist pictures are configured independently of the provider: set a free

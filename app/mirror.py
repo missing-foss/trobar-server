@@ -5,11 +5,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """#285: playlist mirroring MVP — the buildable first slice of #189's
 cross-provider mirroring RFC. Writes a Trobar-managed `.m3u` file into a
-separately-configured folder (never MUSIC_ROOT itself — Trobar never
-writes to the library, and filesystem_client.py's own `.m3u` discovery
-walks the whole of MUSIC_ROOT with no exclusion mechanism, so a mirror
-written there would be picked back up as a new source playlist on the
-next sync) for any playlist with `mirror_enabled=1`.
+separately-configured folder (never MUSIC_ROOT itself: Trobar never
+writes to the library) for any playlist with `mirror_enabled=1`. The
+folder may still be visible inside MUSIC_ROOT through another mount of the
+same share; filesystem_client.py's `.m3u` discovery skips files carrying
+the marker below, so a mirror is never read back as a source playlist.
 
 Scenario A only: one-way, golden-wins, full idempotent rewrite (never a
 delta). Managed-copy identity is a distinctive visible filename suffix
@@ -17,10 +17,25 @@ plus a hidden machine-readable marker line — the marker (M3U_MARKER,
 reused from sync_state.py's own device-`.m3u` convention, same purpose)
 is what makes "never clobber a user's own playlist file" safe: every
 write and delete here is gated on that single check.
+
+Per-user layout: each playlist goes to <mirror folder>/<owner's folder>/
+music/, beside an empty mixed/ (user_folder_name(); SHARED_FOLDER for
+unowned playlists), so one Kodi profile can read one user's playlists by
+pointing its Playlists folder (`system.playlistspath`) at that user's
+folder. With the mirror folder's place in the music share configured
+(db.get_mirror_share_location()), entries are relative to the file
+(entry_path()). Verified on Kodi 21.2 over SMB, with this writer's own
+output: two profiles, each pointed at its user's folder, each list only
+their own playlist under Music -> Playlists and play its track through the
+relative entry. Kodi needs both music/ and mixed/ ("share not available"
+otherwise) and creates neither. The setting is internal in Kodi (level 4,
+absent from its settings screens), set per profile in guisettings.xml or
+over JSON-RPC: docs/providers/kodi.md.
 """
 
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 from werkzeug.utils import secure_filename
@@ -94,7 +109,7 @@ def _is_marker_safe(path: Path) -> bool:
         return False
 
 
-def _compute_filename(conn, playlist_id: int, title: str) -> str:
+def _compute_filename(conn, playlist_id: int, title: str, subfolder: str = "") -> str:
     """Same collision-disambiguation-by-id trick as
     sync_state._device_playlists() — append the id if another playlist's
     title sanitizes to the same name. Reaches into sync_state's own
@@ -120,11 +135,83 @@ def _compute_filename(conn, playlist_id: int, title: str) -> str:
     base = secure_filename(f"{segment}{MIRROR_SUFFIX}.m3u")
     clash = conn.execute(
         "SELECT 1 FROM playlists WHERE id != ? AND mirror_filename = ?",
-        (playlist_id, base),
+        (playlist_id, subfolder + base),
     ).fetchone()
     if clash is None:
         return base
     return secure_filename(f"{segment}{MIRROR_SUFFIX} ({playlist_id}).m3u")
+
+
+# Kodi reads a playlists folder's music/ and mixed/ subfolders, and shows
+# "share not available" if either is missing; it doesn't create them.
+_KODI_SUBFOLDERS = ("music", "mixed")
+
+
+def _stored_path(folder: Path, stored: str) -> Path | None:
+    """The file a stored mirror_filename names: "<user>/music/<file>" since
+    the per-user layout, a bare "<file>" for a mirror written before it.
+    Each segment is joined through _safe_path(), so every step must be a
+    direct child of the one before; None if any isn't."""
+    path: Path | None = folder
+    for segment in stored.split("/"):
+        path = _safe_path(path, segment) if path is not None else None
+    return path
+
+
+# Unowned (provider-wide, shared) playlists go here, beside the per-user
+# folders. The leading underscore keeps it out of what secure_filename()
+# can derive from a username: it strips leading underscores.
+SHARED_FOLDER = "_shared"
+
+
+def user_folder_name(conn, user_id: int | None) -> str:
+    """The folder, under the mirror root, for playlists owned by `user_id`
+    (SHARED_FOLDER for None). Derived from the username once, through
+    secure_filename() as titles are, and stored on the user, so later
+    writes reuse it unchanged. A username that sanitizes to nothing, or
+    to a name another user already holds, gets its id instead or added.
+    Does not commit."""
+    if user_id is None:
+        return SHARED_FOLDER
+    row = conn.execute("SELECT username, mirror_folder_name FROM users WHERE id = ?", (user_id,)).fetchone()
+    if row is None:
+        return SHARED_FOLDER
+    if row["mirror_folder_name"]:
+        return row["mirror_folder_name"]
+    name = secure_filename(row["username"] or "") or f"user-{user_id}"
+    taken = conn.execute("SELECT 1 FROM users WHERE id != ? AND lower(mirror_folder_name) = lower(?)",
+                         (user_id, name)).fetchone()
+    if taken is not None:
+        name = f"{name}-{user_id}"
+    conn.execute("UPDATE users SET mirror_folder_name = ? WHERE id = ?", (name, user_id))
+    return name
+
+
+def entry_path(music_root: Path, relative_path: str, location: str | None) -> str:
+    """One m3u entry for a track. Without a location: the absolute path
+    under MUSIC_ROOT, as always. With one (the mirror root's place inside
+    the music share, e.g. "UserPlaylists"): a path relative to the playlist
+    file at <root>/<user>/music/, so it climbs the location's own depth
+    plus those two folders. Kodi resolves such an entry against the
+    playlist file's folder, on any machine that mounts the share."""
+    if not location:
+        return str(music_root / relative_path)
+    depth = len(Path(location).parts) + 2
+    return "../" * depth + Path(relative_path).as_posix()
+
+
+def seen_in_library(mirror_folder: Path, music_root: Path, location: str) -> bool:
+    """True if `mirror_folder` and MUSIC_ROOT/`location` are the same folder,
+    reached through two mounts of one share. Checked with a file rather
+    than by comparing paths or inodes, which differ between mount types: a
+    uniquely named probe is written through the mirror mount and looked
+    for under the library, then removed. False when it can't be written."""
+    try:
+        mirror_folder.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=mirror_folder, prefix=".trobar-probe-") as probe:
+            return (music_root / location / Path(probe.name).name).is_file()
+    except OSError:
+        return False
 
 
 def _set_error(conn, playlist_id: int, code: str, detail: str | None = None) -> None:
@@ -157,7 +244,7 @@ def delete_mirror(conn, playlist_id: int) -> None:
     folder = db.get_mirror_folder()
     if folder is None:
         return
-    path = _safe_path(folder, row["mirror_filename"])
+    path = _stored_path(folder, row["mirror_filename"])
     if path is None:
         _log.warning("refusing to delete %r — resolves outside the mirror folder",
                      row["mirror_filename"])
@@ -184,7 +271,7 @@ def write_mirror(conn, playlist_id: int) -> None:
     runs inline in playlist_sync.py's per-playlist commit and must not
     itself abort or fragment that transaction)."""
     row = conn.execute(
-        "SELECT title, mirror_enabled, mirror_filename FROM playlists WHERE id = ?",
+        "SELECT title, owner_user_id, mirror_enabled, mirror_filename FROM playlists WHERE id = ?",
         (playlist_id,),
     ).fetchone()
     if row is None or not row["mirror_enabled"]:
@@ -194,31 +281,43 @@ def write_mirror(conn, playlist_id: int) -> None:
     if folder is None:
         _set_error(conn, playlist_id, "unset_folder")
         return
+    # The owner's folder, holding Kodi's two subfolders; unowned playlists
+    # go to SHARED_FOLDER.
+    user_dir = _safe_path(folder, user_folder_name(conn, row["owner_user_id"]))
+    music_dir = _safe_path(user_dir, "music") if user_dir is not None else None
+    if user_dir is None or music_dir is None:
+        _set_error(conn, playlist_id, "bad_filename", str(user_dir))
+        return
     try:
-        folder.mkdir(parents=True, exist_ok=True)
+        for sub in _KODI_SUBFOLDERS:
+            (user_dir / sub).mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         _set_error(conn, playlist_id, "not_writable", str(exc))
         return
 
-    new_filename = _compute_filename(conn, playlist_id, row["title"])
+    prefix = f"{user_dir.name}/music/"
+    file_name = _compute_filename(conn, playlist_id, row["title"], prefix)
+    new_filename = prefix + file_name
     old_filename = row["mirror_filename"]
     if old_filename and old_filename != new_filename:
-        old_path = _safe_path(folder, old_filename)
+        # A rename, or a flat file from before the per-user layout.
+        old_path = _stored_path(folder, old_filename)
         if old_path is not None:
             if _is_marker_safe(old_path):
                 old_path.unlink(missing_ok=True)
             else:
                 _log.warning("refusing to delete non-Trobar-marked file %s", old_path)
 
-    target = _safe_path(folder, new_filename)
+    target = _safe_path(music_dir, file_name)
     if target is None:
-        _set_error(conn, playlist_id, "bad_filename", new_filename)
+        _set_error(conn, playlist_id, "bad_filename", file_name)
         return
     if not _is_marker_safe(target):
         _set_error(conn, playlist_id, "marker_unsafe", new_filename)
         return
 
     music_root = db.get_music_root()
+    location = db.get_mirror_share_location()
     entries = conn.execute(
         "SELECT t.artist, t.title, t.duration, t.relative_path "
         "FROM playlist_tracks pt JOIN tracks t ON t.id = pt.matched_track_id "
@@ -238,10 +337,21 @@ def write_mirror(conn, playlist_id: int) -> None:
     for e in entries:
         duration = int(e["duration"]) if e["duration"] else -1
         lines.append(f"#EXTINF:{duration},{e['artist']} - {e['title']}")
-        lines.append(str(music_root / e["relative_path"]))
+        lines.append(entry_path(music_root, e["relative_path"], location))
 
+    content = "\n".join(lines) + "\n"
     try:
-        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # A rerun with nothing changed leaves the file alone, modification
+        # time included, so a player watching the folder has nothing to
+        # re-read; mirror_last_written_at keeps naming the last real write.
+        if target.is_file() and target.read_text(encoding="utf-8", errors="replace") == content:
+            conn.execute(
+                "UPDATE playlists SET mirror_filename = ?, mirror_last_error = NULL, "
+                "mirror_last_error_code = NULL WHERE id = ?",
+                (new_filename, playlist_id),
+            )
+            return
+        target.write_text(content, encoding="utf-8")
     except OSError as exc:
         _set_error(conn, playlist_id, "write_failed", str(exc))
         return

@@ -58,7 +58,8 @@ services:
       # mount above. Defaults to a local ./mirrors folder so this line
       # doesn't require MIRROR_VOLUME to be set; harmless and unused
       # unless you also set a mirror folder in Administration >
-      # Configuration.
+      # Configuration. It may be a folder inside your music share (a
+      # second, writable mount of it): docs/providers/kodi.md.
       - ${MIRROR_VOLUME:-./mirrors}:/mirrors
       # Optional extra playlist folder — read-only, and defaulting to a
       # local ./playlists folder for the same reason the mirror mount

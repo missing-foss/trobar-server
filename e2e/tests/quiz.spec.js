@@ -24,23 +24,23 @@ async function gotoAbout(page) {
 }
 
 test.describe("duel-the-bard trigger (#508)", () => {
-  test("five taps on the bard mark opens the quiz", async ({ page }) => {
+  test("five taps on the mark opens the quiz", async ({ page }) => {
     await gotoAbout(page);
-    const bard = page.getByRole("button", { name: "Trobar bard mark" });
+    const bard = page.getByRole("button", { name: "Trobar rosette mark" });
     for (let i = 0; i < 5; i++) await bard.click();
     await expect(page.getByText("Duel the bard")).toBeVisible();
   });
 
   test("fewer than five taps does nothing", async ({ page }) => {
     await gotoAbout(page);
-    const bard = page.getByRole("button", { name: "Trobar bard mark" });
+    const bard = page.getByRole("button", { name: "Trobar rosette mark" });
     for (let i = 0; i < 4; i++) await bard.click();
     await expect(page.getByText("Duel the bard")).not.toBeVisible();
   });
 
   test("a gap longer than the tap window resets the count instead of accumulating forever", async ({ page }) => {
     await gotoAbout(page);
-    const bard = page.getByRole("button", { name: "Trobar bard mark" });
+    const bard = page.getByRole("button", { name: "Trobar rosette mark" });
     await bard.click();
     await bard.click();
     // Longer than tapBard()'s own 1500ms reset window.

@@ -12,8 +12,8 @@ road can be done from the phone without one. Every route lives under
 `/api/app/` and is called with the **device token the phone already holds
 from pairing**, acting as the device's **owner**.
 
-Not in any release as of **2.14.0**; it is on the development branch and
-ships with the next release cut after it. A client does not check the
+The App API is not in 2.14.0. The first release that carries it is
+**2.15.0**. A client does not check the
 server version: it checks the **`app_api` level** (below), which is what
 the server advertises and what a breaking change bumps.
 
@@ -49,14 +49,19 @@ Authorization: Bearer <device token>
 
 ```json
 {"user_id": 1, "username": "alice", "is_admin": false,
- "device_id": 3, "device_name": "Phone", "app_api": 1}
+ "device_id": 3, "device_name": "Phone", "app_api": 2}
 ```
 
 ## Versioning: the `app_api` level
 
 `GET /api/device/info` carries `"app_api": <integer>` beside the fields it
 always had. It is the level of this contract the server speaks —
-**1** today. A server from before the App API sends no such field.
+**2** today. A server from before the App API sends no such field.
+
+| level | brought |
+|---|---|
+| 1 | the library, the basket and the staging loop, selections and devices, the owner's display preferences, the Home dashboard |
+| 2 | the playlist section |
 
 The rule for a client: read it as an integer and as nothing else — absent,
 `0` or anything that is not a number means *no App API*, and the screens
@@ -65,14 +70,19 @@ The Android app does exactly this; the sync screens keep working against
 any server, since they never touch this prefix.
 
 The rule for the server: **a breaking change to any route under the
-prefix bumps the level.** Adding a route or a field is not breaking;
-removing or renaming one, or changing a field's type or meaning, is. A
-client written against level *n* refuses a server below *n* and works on
-any server at or above it.
+prefix bumps the level, and so does a new section a client gates a whole
+screen on.** Adding a route or a field is not breaking; removing or
+renaming one, or changing a field's type or meaning, is. A section is a
+set of routes that only make sense together, such as the playlist
+section, which the Android app shows as a tab of its own: with a level of
+its own, a client can say "update the server" for that tab and leave
+everything else working. A client written against level *n* refuses a
+server below *n* for what needs *n*, and works on any server at or above
+it.
 
-The consequence of reserving bumps for breaking changes: **a client
-cannot tell from the level whether a route added later exists** on the
-level-*n* server in front of it — the answer is a `404` at call time. So
+The consequence of reserving bumps for those two cases: **a client
+cannot tell from the level whether a single route added later exists** on
+the level-*n* server in front of it — the answer is a `404` at call time. So
 the client's rule is two rules: refuse a server below its level, and
 treat a `404` on a route it can live without as *not here*, never as an
 error to surface.
@@ -81,7 +91,7 @@ error to surface.
 
 | Route | Returns |
 |---|---|
-| `GET /api/app/library/artists` | `[{artist, track_count, album_count}]`, by name |
+| `GET /api/app/library/artists` | `[{artist, track_count, album_count, albums}]`, by name; `albums` is the artist's album titles, for searching by album, and is absent from servers before it was added |
 | `GET /api/app/library/albums?artist=` | `[{album, year, reissue_year, track_count}]`, newest first; the two years are `null` when no track carries one |
 | `GET /api/app/library/similar-artists?artist=` | `["Name", …]` — artists the similarity source names that are also in this library, up to eight; `[]` when the source is not configured or nothing matches |
 | `GET /api/app/library/cover?artist=&album=` | the album's cover image bytes (`Content-Type` is the image's); `404` when the album has none |
@@ -219,6 +229,34 @@ The administration numbers are **counts only**. The full user and
 delegation listings stay behind the admin routes and do not reach a
 phone.
 
+## Playlists
+
+Everything the web UI's playlist section does except mirroring. Each route
+is the browser route's own handler, so who sees which playlist, how a
+playlist reached through two sources is attributed, and who may change
+what are one rule for both, not two.
+
+| Route | Returns |
+|---|---|
+| `GET /api/app/playlists` | the playlists the owner may see, as the browser lists them for that user, **without the mirror fields**, plus `can_share`: whether the owner may change `shared` (the playlist has an owner, and it is them or they are an admin) |
+| `GET /api/app/playlists/<id>/tracks` | `[{position, artist, title, album, matched}]` in playlist order; `matched` is whether the entry resolved to a track in the library. `403`/`404` as for the playlist itself |
+| `POST /api/app/playlists/sync` | starts a provider playlist sync in the background: `202`, or `409` while one runs |
+| `GET /api/app/playlists/sync/status` | `{"running": bool, "last_result": …}` |
+| `PATCH /api/app/playlists/<id>` `{shared}` | the only editable field. `403` unless owner or admin; `400` for a playlist with no owner. Unsharing revokes other users' selections of it |
+| `GET /api/app/playlists/<id>/unresolved-tracks` | the entries that did not resolve, with their row ids and `excluded` |
+| `POST /api/app/playlists/<id>/unresolved-tracks/exclude` `{ids, excluded}` | marks them as not a gap (or not any more); returns `{"unresolved_count"}` |
+| `POST /api/app/playlists/<id>/lidarr-requests` `{enabled}` | the per-playlist toggle: on, it requests the missing albums now and on each sync; off stops future requests only |
+| `GET /api/app/playlist-subscriptions` | `{"subscriptions": [...]}` — the owner's own, admin included |
+| `POST /api/app/playlist-subscriptions` `{url}` | subscribes and imports at once; returns `{"status", "subscription"}`. The link is a YouTube Music or Spotify playlist link; `400` for anything else. A subscription's `provider` is `ytmusic` or `spotify_public`, and its `track_limit` is the most tracks the source returns (`100` for Spotify), or `null` when it returns them all |
+| `POST /api/app/playlist-subscriptions/<id>/refresh` | re-fetches one; owner or admin |
+| `DELETE /api/app/playlist-subscriptions/<id>` | unsubscribes and removes the playlist it produced; owner or admin |
+
+A playlist is staged like anything else: `POST /api/app/basket` with
+`type: "playlist"` and the playlist's id as `target`.
+
+These routes are **level 2**: a server that reports level 1 does not have
+them, and a client shows the section as needing a server update.
+
 ## What the browser has that the phone does not
 
 Listed so a client author does not assume them away:
@@ -231,3 +269,5 @@ Listed so a client author does not assume them away:
 - The admin listings — counts only, above.
 - The session routes' `device_ids` shape on selections is a string; the
   phone must accept both shapes, above.
+- Mirroring: no App API route turns a playlist's mirror on or off, and the
+  playlist list leaves the mirror fields out.

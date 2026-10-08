@@ -52,6 +52,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 import db
+import provider_config
 
 # Large enough for a typical home-library playlist/playlist-count without
 # real pagination — LMS's own "start count" params require a concrete
@@ -60,6 +61,10 @@ _MAX_ITEMS = 999
 
 
 def _current_config() -> tuple[str, str, str]:
+    # An unsaved connection the switch preview reads through: provider_config.
+    unsaved = provider_config.override("lms")
+    if unsaved is not None:
+        return unsaved
     conn = db.get_conn()
     try:
         url = db.get_config(conn, "lms_url") or ""

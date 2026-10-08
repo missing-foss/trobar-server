@@ -270,6 +270,18 @@ CREATE TABLE IF NOT EXISTS lidarr_requested_albums (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_lidarr_requested_albums_identity
     ON lidarr_requested_albums(normalized_artist, normalized_album);
 
+-- One row per MusicBrainz album lookup for a playlist gap whose source gave
+-- no album (album_lookup.py), keyed by the gap's ISRC ("isrc:...") or its
+-- normalized artist and title ("at:..."). album is NULL when MusicBrainz
+-- answered with no studio album. Every answer is kept and never asked
+-- again: the same gap reappears on every sync, and in several playlists.
+-- A failed request is not an answer and leaves no row.
+CREATE TABLE IF NOT EXISTS musicbrainz_album_lookups (
+    lookup_key TEXT PRIMARY KEY,
+    album TEXT,
+    looked_up_at TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
+
 -- admin-granted "grantee can fully manage target's devices" rights.
 -- Not a hierarchy — the admin can grant multiple independent delegations
 -- over the same target (e.g. both mum and dad managing kid1's devices).
@@ -661,6 +673,9 @@ _MIGRATIONS = [
     ("users", "lastfm_username", "TEXT"),
     ("users", "lastfm_api_key", "TEXT"),
     ("users", "listenbrainz_username", "TEXT"),
+    # A third listening-history source: the URL of the user's own Maloja
+    # (one instance is one person's history, so per user, not app-wide).
+    ("users", "maloja_url", "TEXT"),
     ("users", "cover_view_mode", "TEXT NOT NULL DEFAULT 'list'"),
     ("users", "is_admin", "INTEGER NOT NULL DEFAULT 0"),
     # NULL unless: AUTH_MODE=local (every user), or the admin has set a
@@ -721,11 +736,20 @@ _MIGRATIONS = [
     # aren't in the library (content the server doesn't know about). NULL = no
     # manifest uploaded yet; surfaced in the web UI so the owner can notice it.
     ("devices", "unknown_track_count", "INTEGER"),
+    # One of main.DEVICE_ICONS, a picture only: NULL = the device type's own
+    # icon. device_type keeps driving behaviour (enrollment, transcoding);
+    # this never does. No backfill: NULL is how every existing device looks.
+    ("devices", "icon", "TEXT"),
     # JSON {"disabled": [...widget ids...], "settings": {widget_id: {...}}}.
     # NULL/unset = nothing disabled (every existing user keeps today's
     # "four fixed cards" behaviour with no backfill needed) — see
     # _profile_dict's dashboard_widgets handling in main.py.
     ("users", "dashboard_widgets", "TEXT"),
+    # The same JSON shape, a paired device's own Home widget set -- the
+    # app's, apart from the browser's. NULL = never read or saved: the first
+    # read copies the account's browser set here (main.py,
+    # _device_dashboard_widgets). Deleted with the device.
+    ("devices", "dashboard_widgets", "TEXT"),
     # Best-effort YYYY-MM-DD, from the same originaldate/date tag `year`
     # already reads — but kept at full precision instead of truncated to a
     # bare year, since "recently released" needs real month granularity.
@@ -1023,6 +1047,32 @@ _MIGRATIONS = [
     ("playlists", "emby_mirror_last_written_at", "TEXT"),
     ("playlists", "emby_mirror_last_error", "TEXT"),
     ("playlists", "emby_mirror_last_error_code", "TEXT"),
+    # A fifth sink after all: Music Assistant. Columns again, the same way
+    # as the four above, rather than the child table the comment above
+    # keeps deferring; that refactor is still its own change.
+    # The account each Jellyfin/Emby copy was written into, so a copy that
+    # belongs in another account (the mirror account changed, or a member's
+    # mapping did) is moved rather than written into the wrong one. NULL for
+    # a copy from before this was tracked: the configured mirror account.
+    ("playlists", "jellyfin_mirror_owner_id", "TEXT"),
+    ("playlists", "emby_mirror_owner_id", "TEXT"),
+    ("playlists", "music_assistant_mirror_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("playlists", "music_assistant_mirror_remote_id", "TEXT"),
+    ("playlists", "music_assistant_mirror_last_written_at", "TEXT"),
+    ("playlists", "music_assistant_mirror_last_error", "TEXT"),
+    ("playlists", "music_assistant_mirror_last_error_code", "TEXT"),
+    # A sixth: Plex. Columns once more, the same way; the child-table
+    # refactor above is still its own change.
+    ("playlists", "plex_mirror_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("playlists", "plex_mirror_remote_id", "TEXT"),
+    ("playlists", "plex_mirror_last_written_at", "TEXT"),
+    ("playlists", "plex_mirror_last_error", "TEXT"),
+    ("playlists", "plex_mirror_last_error_code", "TEXT"),
+    # The machineIdentifier of the server holding the copy: Plex keys are
+    # small integers numbered per server, so a key alone could name another
+    # server's playlist once the mirror target changes, or the library
+    # server's when the two differ. See mirror_plex.write_mirror.
+    ("playlists", "plex_mirror_machine", "TEXT"),
     # #262: the Roon per-user profile mapping above, generalized to
     # Jellyfin/Emby -- both already do userId-scoped fetches for their own
     # read side (the admin API key can query ANY user's Items directly),
@@ -1036,6 +1086,11 @@ _MIGRATIONS = [
     # from this epic (#262): it has no per-user accounts to map to.
     ("users", "jellyfin_user_id", "TEXT"),
     ("users", "emby_user_id", "TEXT"),
+    # The folder this user's mirrors go to, under the mirror root: derived
+    # from the username once (secure_filename, or user-<id>) and kept, so
+    # it never changes under a Kodi profile pointed at it. NULL until the
+    # first per-user write. See mirror.user_folder_name().
+    ("users", "mirror_folder_name", "TEXT"),
     # #494: a fifth outbound writer, but NOT a mirror sink -- it doesn't
     # copy the playlist anywhere, it requests missing ALBUMS from a Lidarr
     # instance. Deliberately its own column set rather than reusing the
@@ -1057,6 +1112,11 @@ _MIGRATIONS = [
     # lidarr_requested_albums is for. NULL = the last run had no failures.
     ("playlists", "lidarr_request_last_error", "TEXT"),
     ("playlists", "lidarr_request_last_error_code", "TEXT"),
+    # The album MusicBrainz names for a gap whose source gave none
+    # (album_lookup.py). Kept apart from `album`, which is part of the row's
+    # identity across resyncs; readers take `album` first, this otherwise.
+    # NULL = not looked up, or no studio album found.
+    ("unresolved_playlist_tracks", "inferred_album", "TEXT"),
 ]
 
 
@@ -1407,9 +1467,8 @@ def _migrate_unresolved_playlist_tracks_strict(conn: sqlite3.Connection) -> None
     tables STRICT from now on" set, but it already existed by then (unlike
     those two), so an existing DB's copy still needs the same
     create-new/copy/drop/rename rebuild as _migrate_tracks_strict — SQLite
-    can't ALTER a table into STRICT. No column here has ever needed an
-    _MIGRATIONS entry, so unlike that function this one has nothing to add
-    beyond SCHEMA's own 9 columns.
+    can't ALTER a table into STRICT. Its columns are SCHEMA's 9 plus
+    inferred_album, which _MIGRATIONS adds before this runs.
 
     playlist_id's own FK (REFERENCES playlists(id) ON DELETE CASCADE) is
     preserved verbatim in the rebuilt table. Nothing else has a FK *into*
@@ -1427,6 +1486,8 @@ def _migrate_unresolved_playlist_tracks_strict(conn: sqlite3.Connection) -> None
         ("id", "INTEGER"), ("playlist_id", "INTEGER"), ("position", "INTEGER"),
         ("artist", "TEXT"), ("title", "TEXT"), ("album", "TEXT"),
         ("isrc", "TEXT"), ("excluded", "INTEGER"), ("first_seen_at", "TEXT"),
+        # Added by _MIGRATIONS, which runs before this rebuild.
+        ("inferred_album", "TEXT"),
     ]
 
     for name, decl in columns:
@@ -1617,6 +1678,21 @@ def get_extra_playlist_folder() -> Path | None:
     return Path(path_str) if path_str else None
 
 
+
+def get_mirror_share_location() -> str | None:
+    """Where the mirror folder sits inside the music share, as a path
+    relative to MUSIC_ROOT (e.g. "UserPlaylists"). Inside the container the
+    two are separate mounts, so Trobar can't work this out; the admin says
+    it, and main._apply_folder_settings() checks it against the files. Set,
+    mirrors list tracks relative to the playlist file (mirror.entry_path);
+    unset (None), they keep absolute paths."""
+    conn = get_conn()
+    try:
+        return get_config(conn, "mirror_share_location") or None
+    finally:
+        conn.close()
+
+
 def get_mirror_subsonic_config() -> tuple[str, str, str] | None:
     """#189: the Subsonic/Navidrome mirror-TARGET connection — a distinct
     write destination from the active-provider subsonic_url/username/
@@ -1683,6 +1759,40 @@ def get_mirror_emby_config() -> tuple[str, str, str] | None:
     return url, api_key, user_id
 
 
+def get_mirror_music_assistant_config() -> tuple[str, str] | None:
+    """The Music Assistant mirror target: Music Assistant's one connection
+    (music_assistant_url/token), the same one it is read through as a
+    provider or an extra source, since its playlists are server-wide.
+    None when it isn't configured."""
+    conn = get_conn()
+    try:
+        url = get_config(conn, "music_assistant_url")
+        token = get_config(conn, "music_assistant_token")
+    finally:
+        conn.close()
+    if not url or not token:
+        return None
+    return url, token
+
+
+def get_mirror_plex_config() -> tuple[str, str] | None:
+    """The Plex mirror target: its own server URL and X-Plex-Token
+    (mirror_plex_url/mirror_plex_token), a distinct write destination from
+    the active-provider plex_url/plex_token even when both point at the
+    same server, as for the other server sinks. Plex playlists belong to
+    the token's account, so that is where the copies land. None when it
+    isn't configured."""
+    conn = get_conn()
+    try:
+        url = get_config(conn, "mirror_plex_url")
+        token = get_config(conn, "mirror_plex_token")
+    finally:
+        conn.close()
+    if not url or not token:
+        return None
+    return url, token
+
+
 def get_lidarr_connection() -> tuple[str, str] | None:
     """#494: just url + api_key — this pair is what
     lidarr_client.status()/the admin dropdown-options route need, and it's
@@ -1700,7 +1810,7 @@ def get_lidarr_connection() -> tuple[str, str] | None:
     return url, api_key
 
 
-def get_lidarr_config() -> tuple[str, str, str, int, int] | None:
+def get_lidarr_config(conn: sqlite3.Connection | None = None) -> tuple[str, str, str, int, int] | None:
     """#494: the full connection needed to actually request an album —
     url, api_key, root_folder_path, quality_profile_id, metadata_profile_id.
     Unlike every mirror-target config above (three plain strings, all
@@ -1709,8 +1819,11 @@ def get_lidarr_config() -> tuple[str, str, str, int, int] | None:
     guess, so they can only be *chosen* from GET /api/admin/lidarr-options'
     live lists, never defaulted. Same "any missing means not configured,
     return None rather than a partial tuple" contract as the mirror
-    targets."""
-    conn = get_conn()
+    targets. Reads through `conn` when given (a caller mid-transaction, or
+    on a connection of its own), else through a connection of its own."""
+    own = conn is None
+    if conn is None:
+        conn = get_conn()
     try:
         url = get_config(conn, "lidarr_url")
         api_key = get_config(conn, "lidarr_api_key")
@@ -1718,7 +1831,8 @@ def get_lidarr_config() -> tuple[str, str, str, int, int] | None:
         quality_profile_id = get_config(conn, "lidarr_quality_profile_id")
         metadata_profile_id = get_config(conn, "lidarr_metadata_profile_id")
     finally:
-        conn.close()
+        if own:
+            conn.close()
     if not url or not api_key or not root_folder_path \
             or not quality_profile_id or not metadata_profile_id:
         return None

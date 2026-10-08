@@ -9,15 +9,8 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<script>
-  (function () {
-    var pref = localStorage.getItem('trobar-theme') || 'auto';
-    var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    document.documentElement.setAttribute('data-theme', pref === 'auto' ? (systemDark ? 'dark' : 'light') : pref);
-  })();
-</script>
+{% include "_theme_head.html" %}
 <title>{{ _("Trobar — Login") }}</title>
-<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/favicon.svg') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/fonts.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/logo.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
@@ -27,7 +20,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
   <main class="w-full max-w-sm">
     <div class="flex flex-col items-center gap-3 mb-6">
       <div class="ss-mark" style="width:64px;height:64px;">
-        <img class="ss-bard" src="{{ url_for('static', filename='img/bard-mark.svg') }}" alt="">
+        {% include "_trobar_mark.html" %}
       </div>
       <span class="font-display font-semibold text-xl">Trob<span class="text-accent">ar</span></span>
     </div>
@@ -41,7 +34,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       {% endif %}
       {% if auth_mode == 'oidc' %}
       <a href="{{ url_for('oidc_login') }}"
-        class="block w-full text-center text-sm px-3 py-2 rounded bg-burgundy text-white hover:bg-burgundy-lo">
+        class="block w-full text-center text-sm px-3 py-2 rounded bg-burgundy text-on-primary hover:bg-burgundy-lo">
         {{ _("Sign in with SSO") }}
       </a>
       <div class="flex items-center gap-2 my-4">
@@ -62,7 +55,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
             class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm bg-transparent">
         </div>
         <button type="submit"
-          class="w-full text-sm px-3 py-2 rounded {% if auth_mode == 'oidc' %}border border-gray-300 hover:bg-gray-100/10{% else %}bg-burgundy text-white hover:bg-burgundy-lo{% endif %}">
+          class="w-full text-sm px-3 py-2 rounded {% if auth_mode == 'oidc' %}border border-gray-300 hover:bg-gray-100/10{% else %}bg-burgundy text-on-primary hover:bg-burgundy-lo{% endif %}">
           {{ _("Create account") if bootstrap else _("Log in") }}
         </button>
       </form>

@@ -25,10 +25,16 @@ releases: [trobar-desktop](https://github.com/missing-foss/trobar-desktop).
 
 ## Pair a target
 
-1. Create the device in the web UI (type: SD card / USB storage) and download
- its `trobar-device.json`.
-2. In the app: **Open folder…** → pick the mounted card → **Load
-   trobar-device.json…**.
+1. In the web UI, **Profile → Devices → Add device**, choose **Removable
+   storage** (or **Local folder**), enter a name, and **Create device**. The
+   dialog shows the server URL and an 8-character code, valid for an hour.
+   For a device that already exists, **Re-pair in app** shows the same.
+2. In the app: **Open folder…** → pick the mounted card → enter the server
+   URL and the code → **Pair**.
+
+A desktop app too old to ask for a code pairs with a config file instead:
+in the code dialog, **Older desktop app? Get a config file instead**, then
+**Load trobar-device.json…** in the app.
 
 The pairing is written **onto the card** (`.trobar/device.json`), so the card
 carries its own identity — plug it into any computer running Trobar and it's
@@ -42,7 +48,9 @@ Both are opt-in and off by default, and only act while the app itself is
 open — there's no background daemon. Files are written atomically, each
 track is acknowledged with the real byte count written, folders left empty
 by removals are pruned, and playlist `.m3u8` files are maintained at the
-card root exactly like on Android.
+card root exactly like on Android. Playlists made on the player itself are
+read off the card and sent to Trobar:
+[Playlists made on a device](../using/playlists.md#playlists-made-on-a-device).
 
 ## Transcoding
 

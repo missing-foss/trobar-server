@@ -23,7 +23,7 @@ Source strings live in Python (`_("...")`) and Jinja templates
 1. Initialize a new catalog (first time for that language) or update an
  existing one — **run from inside `app/`**, not the repo root: extracting
  from the root prefixes every `#:` path comment in the `.pot`/`.po` files
- with `app/` and drops their SPDX header, which then fails `reuse lint`.
+ with `app/`.
    ```sh
    cd app
    pybabel extract -F babel.cfg -o translations/messages.pot .
@@ -31,6 +31,13 @@ Source strings live in Python (`_("...")`) and Jinja templates
    # or, updating an existing catalog after new strings were added:
    pybabel update -i translations/messages.pot -d translations -l <lang>
    ```
+   `pybabel extract` rewrites the `.pot`'s header from its own template
+   **wherever it runs**, dropping the `SPDX-FileCopyrightText` and
+   `SPDX-License-Identifier` lines, and `reuse lint` then fails. Put the
+   header back as it was before committing (`git diff` on the `.pot` shows
+   it). `pybabel update` leaves each `.po`'s header alone. It can also mark
+   a new string fuzzy with a guessed translation from a similar one; check
+   every `#, fuzzy` entry and translate it properly.
 2. Translate every entry in
  `app/translations/<lang>/LC_MESSAGES/messages.po`.
 3. Compile it: `pybabel compile -d app/translations`.

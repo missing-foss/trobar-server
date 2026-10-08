@@ -4,52 +4,78 @@ SPDX-FileCopyrightText: 2026 missing-foss
 SPDX-License-Identifier: AGPL-3.0-or-later
 -->
 
-# Trobar brand assets — "The Bard"
+# Trobar brand assets — the Occitan rosette
 
-The Trobar mark: an original troubadour character mid-strum on a lute whose
-rosette carries the "Side A" burgundy label. Chosen 2026-07-08
-from a six-proposal identity round; artwork refined 2026-07-09 (instrument
-geometry pivoted on the soundhole, simplified bard, new favicon reduction).
-Original artwork, own copyright — licensed with the repo
-(AGPL-3.0-or-later); not derived from any existing character.
+The Trobar mark is a lute's sound-hole rosette read as a seal: a disc carrying
+an eight-point star, ringed by twelve pommels (a nod to the twelve-pommel
+Occitan cross), with a hub and centre dot. It replaced "the bard" in brand kit
+2.0 (October 2026). The wordmark is unchanged: Fredoka Bold, "Trob" in the
+text colour and "ar" in the accent colour, outlined to paths in every asset.
 
-SVG is the source of truth; everything scales from one file. The mark never
-theme-inverts (same artwork in light and dark UI).
+**`BRAND.md` is the specification**: geometry, the five themes and their
+colours, contrast, sync states, and the don'ts (no outlines, shadows or
+gradients; only the star rotates, only while syncing). Read it before
+changing anything here.
 
-Palette: burgundy #A83250 (hi #E28AA0, lo #6E1A2E), rose #D76A83,
-cream #F9EFDF, warm white #F2EDE1 (skin/hand), ink #17140E/#0E0C08,
-canvas #100E08, warm grey #A9A08F/#5F584C, lute wood #8a7f6b.
-Wordmark: Fredoka SemiBold, "Trob" in ink/cream + "ar" in rose #D76A83.
+This directory is the canonical source for every Trobar client. Original
+artwork, own copyright, licensed with this repository (AGPL-3.0-or-later);
+the outlined wordmark glyphs are Fredoka, under the SIL Open Font License
+(`licenses/Fredoka-OFL.txt`, and `REUSE.toml` at the repository root).
 
-Files:
+## Files
 
-- `mark.svg` / `mark-on-dark.svg` — full-colour mark (transparent / on canvas)
-- `mono-cream.svg` / `mono-on-burgundy.svg` — single-colour silhouette
-- `favicon.svg` — cream tile + full bard (launcher-icon look, tighter
-  12/108 inset; replaced the 16px lute-body reduction per)
-- `android-adaptive-foreground.svg` — 108-grid cream tile + bard, content
-  inside the 66/108 safe zone (launcher layers: bard foreground rendered
-  transparent, cream tile as the background drawable)
-- `android-adaptive-lute-only.svg` — adaptive variant, instrument only
-- `lockup-horizontal-*.svg` / `lockup-stacked-*.svg` — icon + "Trobar" wordmark
+- `tokens/trobar-themes.json` — **the single source of the five themes'
+  colours** (`troubadour`, the default; `nuech`; `garriga`; `peira`;
+  `contraste`), six roles each plus `watch`. Nothing else holds a brand hex
+  by hand: the web UI's theme CSS is generated from this file (below), and the
+  clients generate theirs from it too. `trobar-themes.css` is the kit's own
+  rendering of it, keyed on `data-theme`; the web UI does not use it (there
+  `data-theme` already means light/dark).
+- `svg/mark/` — the mark per theme, the small variant (under 24 px), the
+  single-colour `trobar-mark-mono.svg`, and `trobar-mark-themable.svg`, whose
+  fills read the `--tb-*` CSS variables. `trobar-mark-mono.svg` is not the
+  kit's file: the kit's is a 50 KB flattened outline, over Android's limit for
+  a resource string. This one is the same mark drawn exactly, as one 951-byte
+  even-odd path; trobar-android's `dev/gen_mono_mark.py` generates it.
+- `svg/lockup/` — horizontal and stacked lockups and the wordmark alone, per
+  theme, transparent; `on-ground/` has the horizontal lockups on each theme's
+  own ground.
+- `svg/states/<theme>/` — the sync-state icons: idle, syncing (the star turns
+  90° every 2.4 s), success, error.
+- `png/` — rasters of the marks (128, 512, 1024) and horizontal lockups.
+- `web/` — favicons (`favicon.svg`, `.ico`, 16/32/48 PNGs) and
+  `apple-touch-icon.png`, plus the web marks.
+- `exports/` — ready-to-upload repository images: `trobar-mark-512.png` and
+  `social-preview-1280x640.png` (the Troubadour lockup on its own ground).
 
-Deployed copies (keep in sync with these sources):
+## Deployed copies
 
-- `app/static/img/bard-mark.svg` (web header + login/setup hero)
-- `app/static/img/favicon.svg` (web favicon)
-- `android/.../drawable-nodpi/logo_bard.png` (in-app logo, 512px render)
-- `android/.../drawable-nodpi/ic_launcher_foreground_bard.png` (launcher, 432px render)
+Copies of these sources live in each client. Change them here first, then in
+each place below.
 
-Sync-state animation ("notes from the soundhole"): musical notes spawn at the
-lute's soundhole, rise ~0.4 x mark height with a slight horizontal drift,
-fading in then out; ~2.5s loop, staggered copies. Implemented in CSS
-(`app/static/css/logo.css`) and Compose (`MainActivity.kt` `AppLogo`).
+- **Web UI (this repository)**
+  - `app/static/css/brand-themes.css` — generated by `dev/gen_brand_css.py`
+    from `tokens/trobar-themes.json`: the `--tb-*` brand roles and the whole
+    UI palette derived from them, per theme and light/dark variant.
+    `dev/verify.sh` fails when it is stale or any pair misses WCAG AA.
+  - `app/templates/_trobar_mark.html` — `svg/mark/trobar-mark-themable.svg`
+    inlined, the two star paths grouped for the syncing animation in
+    `app/static/css/logo.css`.
+  - `app/static/img/favicon.*`, `favicon-*.png`, `apple-touch-icon.png` —
+    from `web/`.
+  - `app/static/img/brand/lockup-<theme>.svg` — from `svg/lockup/on-ground/`,
+    the theme picker's previews.
+- **trobar-android** — the kit's `android/res/**` (themable drawables, theme
+  overlays, adaptive launcher icons), with colours generated from
+  `tokens/trobar-themes.json`.
+- **trobar-desktop** — the mark through `flutter_svg`, colours generated from
+  `tokens/trobar-themes.json`; the OS icons rendered from the Troubadour mark.
+- **trobar-garmin** — `resources/drawables/launcher_icon.png`, the Troubadour
+  mark at 40×40 quantised to the 64-colour MIP palette, and `store/troubadour/`.
+- **trobar-ha** — `custom_components/trobar/brand/*.png`, rendered by that
+  repository's `dev/render_brand.sh` from `svg/`.
 
-Ready-to-upload GitHub exports live in `exports/`:
-`bard-mark-512.png` (mark-on-dark, 512px raster of the bard) and
-`social-preview-1280x640.png` (horizontal lockup on canvas, rendered with
-the real Fredoka) — the social preview for the three Trobar repos.
-
-The GitHub *org* avatar is NOT the bard: the org uses the Missing FOSS
-design set (app-grid mark), hosted in the org's `.github` repo under
-`profile/brand/`. The bard identifies Trobar; the grid identifies the org.
+The GitHub *organisation* avatar is not the rosette: the organisation uses
+the Missing FOSS design set (app-grid mark), hosted in the organisation's
+`.github` repository under `profile/brand/`. The rosette identifies Trobar;
+the grid identifies the organisation.

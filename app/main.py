@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Trobar — Flask web app + device-facing sync API."""
 
+import concurrent.futures
 import difflib
 import hashlib
 import json
@@ -17,7 +18,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 from urllib.parse import urlsplit
 
 import click
@@ -29,6 +30,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 from authlib.integrations.flask_client import OAuth
 
+import album_lookup
 import artist_images
 import covers
 import db
@@ -42,12 +44,17 @@ import library_quiz
 import lidarr_client
 import lidarr_requests
 import listenbrainz
+import maloja
 import lms_client
+import music_assistant_client
 import mirror
 import mirror_emby
 import mirror_jellyfin
+import mirror_music_assistant
+import mirror_plex
 import mirror_subsonic
 import playlist_sync
+import provider_config
 import plex_client
 import provenance
 import roon_client
@@ -56,8 +63,10 @@ import subsonic_client
 import suggestions
 import sync_state
 import spotify_client
+import spotify_public_client
 import tidal_client
 import transcode
+import url_guard
 import ytmusic_client
 
 # #297: wire job types to their handlers at import, in ONE place. Registration
@@ -90,9 +99,10 @@ import ytmusic_client
 # http.client.HTTPConnection.debuglevel, which nothing here sets. Don't set it.
 _APP_LOGGERS = (
     "main",  # also Flask's app.logger, since the app is named after this module
-    "db", "fingerprint", "jobs", "mirror", "mirror_emby", "mirror_jellyfin", "mirror_subsonic",
-    "playlist_sync", "provenance", "scanner", "spotify_client", "tidal_client", "transcode",
-    "ytmusic_client",
+    "album_lookup", "db", "fingerprint", "jobs", "mirror", "mirror_emby", "mirror_jellyfin",
+    "mirror_music_assistant", "mirror_plex", "mirror_subsonic",
+    "playlist_sync", "provenance", "scanner", "spotify_client", "spotify_public_client",
+    "tidal_client", "transcode", "ytmusic_client",
 )
 
 
@@ -137,6 +147,10 @@ _configure_logging()
 # jobs._LANE_BY_TYPE.
 jobs.register(scanner.JOB_TYPE, scanner.run_job, lane=jobs.LANE_LONG)
 jobs.register(fingerprint.JOB_TYPE, fingerprint.run_job, lane=jobs.LANE_LONG)
+# Network-bound like the fingerprint lookup, and on the same lane for the
+# same service: one job at a time per lane keeps the two from querying
+# MusicBrainz at once. It drains every pending gap in one run.
+jobs.register(album_lookup.JOB_TYPE, album_lookup.run_job, lane=jobs.LANE_LONG)
 # #356: both of these decode audio (rematch's per-candidate re-verification,
 # device_fingerprints' per-track compute) — genuinely SHORT anyway, because
 # both are one _BATCH_LIMIT=100 batch per execution, not a drain-the-backlog
@@ -195,10 +209,20 @@ def _run_playlist_sync(payload, _report):
     single natural denominator the way a file walk does (multiple merge
     passes — primary provider, filesystem, Roon profiles, Tidal, Spotify —
     each a different size), so `report` is accepted and ignored, exactly the
-    case jobs.register's docstring names as normal."""
-    provider_id = payload["provider_id"]
-    provider = _PROVIDERS.get(provider_id, roon_client)
-    return playlist_sync.sync_playlists(provider, provider_id)
+    case jobs.register's docstring names as normal.
+
+    The provider is the one active when the job RUNS, not the
+    `provider_id` the payload recorded when it was queued: a sync queued
+    just before a library-source switch and run after it would otherwise
+    list the old provider and write back the playlists the switch removed,
+    which nothing would ever clean up (each sync cleans only its own
+    sources). The payload keeps the id for the jobs view."""
+    conn = db.get_conn()
+    try:
+        provider_id = _active_provider_id(conn)
+    finally:
+        conn.close()
+    return playlist_sync.sync_playlists(_PROVIDERS[provider_id], provider_id)
 
 
 jobs.register(playlist_sync.JOB_TYPE, _run_playlist_sync)
@@ -482,7 +506,7 @@ app.jinja_env.globals["get_locale"] = get_locale
 _PROVIDERS = {
     "roon": roon_client, "subsonic": subsonic_client, "jellyfin": jellyfin_client,
     "emby": emby_client, "plex": plex_client, "lms": lms_client,
-    "filesystem": filesystem_client,
+    "filesystem": filesystem_client, "music_assistant": music_assistant_client,
 }
 
 
@@ -1015,6 +1039,15 @@ def _build_js_i18n() -> dict:
             "light": _("Light"),
             "dark": _("Dark"),
         },
+        # The brand themes' names are proper names (brand/BRAND.md) and stay
+        # as they are in every language; their one-line character translates.
+        "brandOptions": {
+            "troubadour": _("Default · cream"),
+            "nuech": _("Night · dark only"),
+            "garriga": _("Sage · olive"),
+            "peira": _("Stone · terracotta"),
+            "contraste": _("High contrast · dark only"),
+        },
         "deviceType": {
             "phone": _("Phone"), "android": _("Phone"), "tablet": _("Tablet"),
             "watch": _("Smartwatch"), "dap": _("Dedicated audio player"),
@@ -1065,6 +1098,172 @@ def _build_js_i18n() -> dict:
             "pending_approval": _("Awaiting approval"),
             "disconnected": _("Disconnected"),
         },
+        # Administration > Configuration's collapsible sections: the names
+        # (for "unsaved changes in …"), the one-line summary each header
+        # shows, and the warnings that stay on a header even when its
+        # section is collapsed.
+        "configSectionNames": {
+            "library": _("Library"),
+            "sources": _("Playlist sources"),
+            "playlists": _("Playlists"),
+            "listening": _("Listening"),
+            "devices": _("Devices"),
+            "maintenance": _("Maintenance"),
+            "security": _("Security"),
+        },
+        # Change library source dialog.
+        "switchSteps": {
+            "choose": _("Choose"),
+            "connect": _("Connect"),
+            "review": _("Review and confirm"),
+            "done": _("Done"),
+        },
+        "switchChooseIntro": _("Where should Trobar read your library's playlists from? {current}, the current source, isn't listed."),
+        "switchNeeds": _("Needs: {needs}"),
+        # The providers docs table's "What you get / What it needs".
+        "switchProviders": {
+            "filesystem": {"gets": _("Library browsing and sync, zero dependencies"),
+                           "needs": _("nothing, just the music folder")},
+            "roon": {"gets": _("Playlists, live pairing status"), "needs": _("a Roon Core on the LAN")},
+            "jellyfin": {"gets": _("Playlists"), "needs": _("server URL, API key and username")},
+            "emby": {"gets": _("Playlists"), "needs": _("server URL, API key and username")},
+            "plex": {"gets": _("Playlists"), "needs": _("server URL and token")},
+            "lms": {"gets": _("Playlists"), "needs": _("server URL (and user and password if secured)")},
+            "subsonic": {"gets": _("Playlists"), "needs": _("server URL, user and password")},
+            "music_assistant": {"gets": _("Playlists, and a mirror target"),
+                                "needs": _("server URL and a long-lived token")},
+        },
+        "switchField": {
+            "host": _("Roon host"),
+            "port": _("Port"),
+            "url": _("Server URL"),
+            "username": _("Username"),
+            "password": _("Password"),
+            "api_key": _("API key"),
+            "token": _("Token"),
+            "usernameOptional": _("Username (optional)"),
+            "passwordOptional": _("Password (optional)"),
+        },
+        "switchConnectIntro": _("Enter {provider}'s connection details and test them."),
+        "switchFilesystemNothing": _("Nothing to connect: Filesystem reads playlists from the music folder Trobar already uses."),
+        "switchSetupGuide": _("{provider} setup guide"),
+        "switchTest": _("Test connection"),
+        "switchTesting": _("Testing…"),
+        "switchTestFirst": _("Test the connection to continue."),
+        "switchTestOk": _("✓ Connected"),
+        "switchTestReachable": _("✓ Roon Core reachable. After the switch, approve Trobar in Roon (Settings, Extensions)."),
+        "switchTestFailed": _("Couldn't connect with these details."),
+        "switchReviewIntro": _("Nothing has changed yet. This is what switching from {from} to {to} does, counted on this server just now. Only {from}'s own playlists are affected."),
+        "switchRemovedHead": {
+            "one": _("Removed: {n} playlist from {from}"),
+            "other": _("Removed: {n} playlists from {from}"),
+        },
+        "switchRemovedNone": _("Removed: no playlists, {from} has none of its own"),
+        "switchCarriedHead": {
+            "one": _("Carried over: {n} of {from}'s {of} playlists"),
+            "other": _("Carried over: {n} of {from}'s {of} playlists"),
+        },
+        "switchCarriedWhat": _("{to} has a playlist with the same name, owner and most of the same tracks. Each keeps its device selections, mirroring, shared/private choice and excluded gaps. Its tracks are refreshed from {to} on the first sync."),
+        "switchRemovedNotThere": {
+            "one": _("Removed: {n} playlist {to} doesn't have"),
+            "other": _("Removed: {n} playlists {to} doesn't have"),
+        },
+        "switchCarryNone": _("{to} has no playlist with the same name, owner and most of the same tracks."),
+        "switchCarryRoon": _("None can be carried over: Roon can't list its playlists until Trobar is approved in Roon, after the switch."),
+        "switchCarryFailed": _("None can be carried over: {to} couldn't list its playlists just now. Go back and test again to retry."),
+        "switchCarryListed": _("None can be carried over: {to}'s playlists are already in Trobar as playlists of their own."),
+        "switchDoneCarried": {
+            "one": _("{n} playlist was carried over, with its settings."),
+            "other": _("{n} playlists were carried over, with their settings."),
+        },
+        "switchRemovedNoneMerged": _("Removed: no playlists. The .m3u folder's playlists stay: they are read whichever source is active."),
+        "switchRemovedMirrored": {
+            "one": _("Mirroring was on for {n} of them; its mirrored copies are removed too."),
+            "other": _("Mirroring was on for {n} of them; their mirrored copies are removed too."),
+        },
+        "switchDeviceHas": {
+            "one": _("{name} has {n} of them selected."),
+            "other": _("{name} has {n} of them selected."),
+        },
+        "switchDevicesConsequence": _("Those selections are removed with the playlists. On each device's next sync, Trobar removes those playlist files, and any tracks no other selection keeps on the device."),
+        "switchImages": _("Also the artist-image cache: images are fetched again from {to}."),
+        "switchUntouchedPlaylists": {
+            "one": _("{n} playlist from other sources, with its settings: {sources}."),
+            "other": _("{n} playlists from other sources, with all their settings: {sources}."),
+        },
+        "switchKeptFrom": _("{n} from {source}"),
+        "switchSources": {
+            "filesystem": _("the .m3u folder and iTunes"),
+            "music_assistant": _("Music Assistant"),
+            "tidal": _("linked Tidal accounts"),
+            "spotify": _("linked Spotify accounts"),
+            "ytmusic": _("YouTube Music subscriptions"),
+            "spotify_public": _("Spotify playlist links"),
+            "other": _("no recorded source"),
+        },
+        "switchUntouchedRest": _("The library, users and devices; artist, album and track selections; listening history; every other setting on this page."),
+        "switchNothingSaved": _("Nothing is saved until the last step."),
+        "switchConfirm": _("Switch to {provider}"),
+        "switchSwitching": _("Switching…"),
+        "switchDoneHead": _("✓ Switched to {provider}"),
+        "switchDoneRemoved": {
+            "one": _("{n} playlist from the old source was removed."),
+            "other": _("{n} playlists from the old source were removed."),
+        },
+        "switchDoneDevices": {
+            "one": _("{n} device had playlist selections removed; its next sync drops those files."),
+            "other": _("{n} devices had playlist selections removed; their next sync drops those files."),
+        },
+        "switchDoneRoon": _("Approve Trobar in Roon (Settings, Extensions) so it can read your playlists."),
+        "switchSyncRunning": _("First playlist sync from {provider}: running…"),
+        "switchSyncDone": {
+            "one": _("First playlist sync: {n} playlist."),
+            "other": _("First playlist sync: {n} playlists."),
+        },
+        "switchSyncPrimaryFailed": _("First playlist sync: {provider} couldn't list its playlists yet; the other sources synced ({n})."),
+        "switchSyncFailed": _("The first playlist sync failed: {error}. Run it again from Playlists once the connection works."),
+        "switchSyncNotStarted": _("The first playlist sync didn't start: another one is running. Its result appears in Playlists."),
+        "switchDoneHint": _("Open Playlists to check them, or select playlists for a device again from its page."),
+        "configUnsavedChange": _("Unsaved change"),
+        # Administration > Users headers.
+        "usersSumAccounts": {"one": _("{n} user"), "other": _("{n} users")},
+        "usersSumAdmins": {"one": _("{n} admin"), "other": _("{n} admins")},
+        "usersSumBreakGlassOk": _("break-glass ✓"),
+        "usersWarnNoBreakGlass": _("No break-glass account"),
+        "usersSumDelegations": {"one": _("{n} delegation"), "other": _("{n} delegations")},
+        "usersSumNoDelegations": _("none"),
+        "userManages": _("manages: {names}"),
+        "userManagedBy": _("managed by: {names}"),
+        "configUnsavedIn": _("Unsaved changes in: {sections}"),
+        "cfgSumLibrary": _("{provider} · {state}"),
+        "cfgSumRescanEvery": _("rescan every {n} h"),
+        "cfgSumRescanOff": _("automatic rescan off"),
+        "cfgSumSources": _("{n} of {total} set up"),
+        "cfgSumAcoustidOn": _("AcoustID matching on"),
+        "cfgSumAcoustidOff": _("AcoustID matching off"),
+        "cfgSumMirrorTargets": {
+            "one": _("mirroring to {n} target"),
+            "other": _("mirroring to {n} targets"),
+        },
+        "cfgSumMirrorNone": _("no mirror target"),
+        "cfgSumLidarrOn": _("Lidarr connected"),
+        "cfgSumLidarrOff": _("no Lidarr"),
+        "cfgSumLastfmKey": _("default Last.fm key set"),
+        "cfgSumLastfmNoKey": _("no default Last.fm key"),
+        "cfgSumListenStandard": _("standard Last.fm and ListenBrainz servers"),
+        "cfgSumListenCustom": _("custom listening-history servers"),
+        "cfgSumTranscode": _("{n} transcodes at a time, priority {nice}"),
+        "cfgSumJobs": _("job history kept {n} days"),
+        "cfgSumSignIn": _("sign-in: {mode}"),
+        "cfgWarnFieldToFix": _("A field to fix"),
+        "cfgWarnWritable": _("Library mounted writable"),
+        "cfgWarnProviderDown": _("Library source disconnected"),
+        "cfgWarnProviderPending": _("Library source awaiting approval"),
+        "cfgWarnMaDown": _("Music Assistant unreachable"),
+        "cfgWarnMirrorDown": _("{target} mirror target unreachable"),
+        "cfgWarnLidarrDown": _("Lidarr unreachable"),
+        "cfgWarnLidarrIncomplete": _("Lidarr: profiles not chosen"),
+        "cfgWarnBreakGlass": _("Break-glass password not set"),
         # #509: Lidarr-specific — the only provider config in Administration
         # with a post-pairing step (root folder + quality/metadata
         # profiles). "Connected" alone used to be shown as soon as
@@ -1120,6 +1319,11 @@ def _build_js_i18n() -> dict:
         "subscriptionAddFailed": _("Couldn't add that playlist."),
         "subscriptionUnavailable": _("Unavailable — deleted, made private, or the link is wrong."),
         "subscriptionFetchFailed": _("Couldn't reach YouTube Music. Nothing already imported was changed."),
+        "subscriptionFetchFailedSpotify": _("Couldn't read this playlist from Spotify. Nothing already imported was changed."),
+        # Spotify's embed page lists a playlist's first 100 tracks and gives
+        # no total, so a playlist at the limit may be longer. Said on the row
+        # so the missing tail doesn't read as tracks that failed to match.
+        "subscriptionAtLimit": _("Spotify shares only the first {limit} tracks of a playlist, so this one may be longer."),
         "subscriptionNoMatches": _("Fetched, but none of its tracks are in your library."),
         "subscriptionMatchCount": _("{matched} of {total} tracks in your library"),
         "subscriptionRemoveConfirm": _("Remove \"{title}\" and the playlist it created?"),
@@ -1153,6 +1357,8 @@ def _build_js_i18n() -> dict:
         "unresolvedTrackExcluded": _("Excluded"),
         "unresolvedTracksExcludeAll": _("Exclude all"),
         "unresolvedTracksError": _("Couldn't load or save — try again."),
+        # After an album the source didn't give, found in MusicBrainz instead.
+        "unresolvedAlbumInferred": _("{album} (from MusicBrainz)"),
         # #507: the four per-sink mirror buttons collapsed into one button
         # that opens a picker — these three are the picker's own generic
         # strings; the per-sink to/on/off/hint strings below are unchanged
@@ -1168,9 +1374,51 @@ def _build_js_i18n() -> dict:
         "mirroring": _("Mirroring"),
         "mirrorOnHint": _("Kept in sync as a local .m3u file. Click to stop mirroring."),
         "mirrorOffHint": _("Mirror this playlist to a local .m3u file, kept in sync as your library grows."),
-        "mirrorFolderIs": _("Mirror folder: {folder}"),
         "mirrorFolderUnset": _("No mirror folder configured — set one in Administration > Configuration."),
         "mirrorLastWritten": _("Last written {when}"),
+        # Admin > Playlist mirrors: each target by name, what it is (in the
+        # nothing-configured explanation), its state, and the two sections'
+        # header summaries and warnings.
+        "mirrorSinkNames": {
+            "filesystem": _(".m3u folder"),
+            "subsonic": "Subsonic",
+            "jellyfin": "Jellyfin",
+            "emby": "Emby",
+            "music_assistant": "Music Assistant",
+            "plex": "Plex",
+        },
+        "mirrorSinkWhat": {
+            "filesystem": _("for players that read playlist files"),
+            "server": _("a playlist on that server"),
+        },
+        "mirrorStateReady": _("Ready"),
+        "mirrorStateConnected": _("Connected"),
+        "mirrorStateUnreachable": _("Unreachable"),
+        "mirrorStateNotWritable": _("Can't write to the folder"),
+        "mirrorStateWriteFailed": {
+            "one": _("{n} playlist failed its last write"),
+            "other": _("{n} playlists failed their last write"),
+        },
+        "mirrorStateLidarrIncomplete": _("Needs attention: root folder and profiles not chosen"),
+        "mirrorStateRequestFailed": {
+            "one": _("{n} playlist's last request failed"),
+            "other": _("{n} playlists' last request failed"),
+        },
+        "mirrorSumTargets": {
+            "one": _("{n} mirror target"),
+            "other": _("{n} mirror targets"),
+        },
+        "mirrorSumNoTarget": _("No mirror target"),
+        "mirrorNoTargetChip": _("No mirror target set up"),
+        "mirrorAlsoAvailable": _("Also available: {names}."),
+        "mirrorSumPlaylists": {
+            "one": _("{n} playlist"),
+            "other": _("{n} playlists"),
+        },
+        "mirrorFailedChip": {
+            "one": _("{n} playlist with a failed write"),
+            "other": _("{n} playlists with a failed write"),
+        },
         # #428: mirror.py stores a machine-readable mirror_last_error_code
         # alongside mirror_last_error now — a background job has no user
         # locale to translate into, and the same row is read by users with
@@ -1192,7 +1440,6 @@ def _build_js_i18n() -> dict:
         "subsonicMirroring": _("Mirroring to Subsonic"),
         "subsonicMirrorOnHint": _("Kept in sync with your Subsonic/Navidrome mirror-target server. Click to stop mirroring."),
         "subsonicMirrorOffHint": _("Mirror this playlist to your Subsonic/Navidrome mirror-target server, kept in sync as your library grows."),
-        "subsonicMirrorUrlIs": _("Subsonic mirror target: {url}"),
         "subsonicMirrorUrlUnset": _("No Subsonic mirror target configured — set one in Administration > Configuration."),
         "subsonicMirrorErrorUnreachable": _("Could not reach the Subsonic mirror target:"),
         "subsonicMirrorErrorWriteFailed": _("Failed to write the Subsonic mirror playlist:"),
@@ -1214,7 +1461,6 @@ def _build_js_i18n() -> dict:
         "jellyfinMirroring": _("Mirroring to Jellyfin"),
         "jellyfinMirrorOnHint": _("Kept in sync with your Jellyfin mirror-target server. Click to stop mirroring."),
         "jellyfinMirrorOffHint": _("Mirror this playlist to your Jellyfin mirror-target server, kept in sync as your library grows."),
-        "jellyfinMirrorUrlIs": _("Jellyfin mirror target: {url}"),
         "jellyfinMirrorUrlUnset": _("No Jellyfin mirror target configured — set one in Administration > Configuration."),
         "jellyfinMirrorErrorUnreachable": _("Could not reach the Jellyfin mirror target:"),
         "jellyfinMirrorErrorWriteFailed": _("Failed to write the Jellyfin mirror playlist:"),
@@ -1225,32 +1471,43 @@ def _build_js_i18n() -> dict:
         "embyMirroring": _("Mirroring to Emby"),
         "embyMirrorOnHint": _("Kept in sync with your Emby mirror-target server. Click to stop mirroring."),
         "embyMirrorOffHint": _("Mirror this playlist to your Emby mirror-target server, kept in sync as your library grows."),
-        "embyMirrorUrlIs": _("Emby mirror target: {url}"),
         "embyMirrorUrlUnset": _("No Emby mirror target configured — set one in Administration > Configuration."),
         "embyMirrorErrorUnreachable": _("Could not reach the Emby mirror target:"),
         "embyMirrorErrorWriteFailed": _("Failed to write the Emby mirror playlist:"),
         "embyMirrorErrorNoTargetMatches": _("None of this playlist's tracks were found on the Emby mirror target."),
-        # #494: "Request missing albums" — not a mirror sink (Lidarr isn't
-        # a copy destination, it's asked to acquire what's missing), but
-        # the button follows the same shown-but-disabled shape as the four
-        # sinks above. Two distinct disabled reasons need two distinct
-        # hints: not configured (server-side gate, same as the mirror
-        # buttons) vs. this playlist's provider giving no album data at
-        # all on its unresolved rows (every Roon/iTunes playlist).
+        "maMirrorTo": _("Mirror to Music Assistant…"),
+        "maMirroring": _("Mirroring to Music Assistant"),
+        "maMirrorOnHint": _("Kept in sync with a copy in Music Assistant. Click to stop mirroring."),
+        "maMirrorOffHint": _("Mirror this playlist to Music Assistant, kept in sync as your library grows."),
+        "maMirrorUrlUnset": _("Music Assistant isn't connected: set it up in Administration > Configuration."),
+        "maMirrorErrorUnreachable": _("Could not reach Music Assistant:"),
+        "maMirrorErrorWriteFailed": _("Failed to write the Music Assistant copy:"),
+        "maMirrorErrorNoTargetMatches": _("None of this playlist's tracks were found in Music Assistant's library."),
+        "maMirrorErrorReadback": _("Music Assistant's copy doesn't hold what was written:"),
+        "plexMirrorTo": _("Mirror to Plex…"),
+        "plexMirroring": _("Mirroring to Plex"),
+        "plexMirrorOnHint": _("Kept in sync with your Plex mirror-target server. Click to stop mirroring."),
+        "plexMirrorOffHint": _("Mirror this playlist to your Plex mirror-target server, kept in sync as your library grows."),
+        "plexMirrorUrlUnset": _("No Plex mirror target configured — set one in Administration > Configuration."),
+        "plexMirrorErrorUnreachable": _("Could not reach the Plex mirror target:"),
+        "plexMirrorErrorWriteFailed": _("Failed to write the Plex mirror playlist:"),
+        "plexMirrorErrorNoTargetMatches": _("None of this playlist's tracks were found on the Plex mirror target."),
+        "plexMirrorErrorReadback": _("Plex's copy doesn't hold what was written:"),
+        # "Request missing albums" — not a mirror sink (Lidarr isn't a
+        # copy destination, it's asked to acquire what's missing), and,
+        # unlike the sinks, not shown at all until Lidarr is configured.
+        # Shown, an off button is disabled only when there is nothing to
+        # ask for, with a hint for each case: no gaps at all, or gaps with
+        # no album, neither from their provider nor found in MusicBrainz.
+        # The not-configured hint names a run's unset_target error.
         "lidarrRequestTo": _("Request missing albums…"),
         "lidarrRequesting": _("Requesting missing albums"),
         "lidarrRequestOnHint": _("Missing albums are requested from Lidarr as new gaps appear. Click to stop."),
         "lidarrRequestOffHint": _("Request this playlist's missing albums from your configured Lidarr instance, monitor-only — Lidarr's own scheduled search finds them later."),
         "lidarrRequestNotConfiguredHint": _("Lidarr requests aren't set up yet — ask an admin to configure a Lidarr connection in Administration."),
-        # #509: distinct from the hint above — the connection itself works
-        # (Administration shows green "Connected"), but the root folder and
-        # quality/metadata profiles were never chosen, so there's still
-        # nowhere to request an album TO. Splitting this out means the hint
-        # actually matches what Administration would show if the admin went
-        # to go look, instead of both states reading as "not set up" while
-        # one of them is showing green.
-        "lidarrRequestSetupIncompleteHint": _("Lidarr is connected, but the root folder and profiles haven't been chosen yet — ask an admin to finish setup in Administration."),
         "lidarrRequestNoAlbumDataHint": _("This playlist's source doesn't provide album information for unresolved tracks, so nothing here can be requested."),
+        # A playlist with no gaps at all is not short of album data.
+        "lidarrRequestNothingMissingHint": _("Nothing is missing from this playlist, so there is nothing to request."),
         "lidarrRequestLastRun": _("Requested {n} albums, last run {when}"),
         # lidarr_request_last_error_code is one of 'unset_target' (reuses
         # lidarrRequestNotConfiguredHint above, same as mirrorFolderUnset's
@@ -1262,10 +1519,6 @@ def _build_js_i18n() -> dict:
         # translated prefix, same shape as the mirror sinks' own error keys.
         "lidarrRequestErrorPartial": _("An album was added to Lidarr but couldn't be put on the wanted list:"),
         "lidarrRequestErrorFailed": _("Failed to request an album from Lidarr:"),
-        # Admin overview panel's own top summary line, same
-        # UrlIs/UrlUnset pair shape as the mirror sinks above.
-        "lidarrRequestUrlIs": _("Lidarr target: {url}"),
-        "lidarrRequestUrlUnset": _("No Lidarr connection configured — set one in Administration > Configuration."),
         # #297 step 2: background-jobs admin panel.
         "jobsRunning": _("Running"),
         "jobsQueued": _("Queued"),
@@ -1325,6 +1578,8 @@ def _build_js_i18n() -> dict:
         "inferredOriginHint": _("Its tracks closely match a {provider} playlist — likely imported into Roon from there."),
         "sharedByOwner": _("shared by {name}"),
         "unknownProvider": _("Unknown source"),
+        # A playlist made on one of the user's devices: the device's name.
+        "fromDevice": _("From {name}"),
         "syncToDevice": _("Sync {item} to {device}"),
         "roonProfileForUser": _("Roon profile for {name}"),
         "save": _("Save"),
@@ -1429,11 +1684,14 @@ def _build_js_i18n() -> dict:
         "genericFailure": _("Failed ({error})"),
         "confirmRevokeDelegation": _("{grantee} will no longer be able to manage {target}'s devices. Continue?"),
         "confirmUnpinDevice": _('Remove "{name}" from your list? You will no longer manage it until you add it again.'),
-        "confirmRegenerateToken": _('Regenerate the token for "{name}"? The old token will stop working immediately — the already-paired device will need to rescan the new QR code.'),
+        "confirmRegenerateToken": _('Get a config file for "{name}", for a desktop app too old to read pairing codes? A new token is issued: the current one stops working immediately, and whatever is paired with it must be paired again.'),
         "addMobileDevice": _("Add a mobile device"),
-        "enrollHelp": _("In the Trobar app, scan this QR or enter the code below. It works once and expires in a few minutes."),
+        "enrollHelp": _("In the Trobar app, scan this QR or enter the code below. It works once and expires after an hour."),
         "repairDeviceTitle": _('Re-pair "{name}"'),
-        "repairDeviceHelp": _("In the Trobar app, scan this QR or enter the code below. The app reconnects to this device and keeps its music, settings and history. It works once and expires in a few minutes."),
+        "repairDeviceHelp": _("In the Trobar app, scan this QR or enter the code below. The app reconnects to this device and keeps its music, settings and history. It works once and expires after an hour."),
+        "pairDeviceTitle": _('Pair "{name}"'),
+        # The desktop app: no QR scanner, so the dialog also shows the URL.
+        "pairDesktopHelp": _("In the Trobar desktop app, open the card or folder and enter this server's URL and the code below. The device keeps its name, music and settings. The code works once and expires after an hour."),
         "confirmRepairDevice": _('Re-pair "{name}" with a fresh app install? The app keeps this device\'s music, settings and history. Whatever is currently paired stops working and must be re-paired too.'),
         "repairFailed": _("Could not create a re-pairing code ({error})"),
         "confirmDeleteDevice": _('Permanently delete "{name}"? Its assigned selections will be unassigned (not deleted) and its token will stop working immediately.'),
@@ -1612,7 +1870,7 @@ def _unlink_avatar(stored: str) -> None:
 
 
 def _safe_referrer() -> str:
-    """The referrer, but only if it points back into this app — otherwise the
+    r"""The referrer, but only if it points back into this app — otherwise the
     home page. Prevents an open redirect from a crafted Referer.
 
     Two conditions, and the second is the one a host check alone does not
@@ -1654,7 +1912,16 @@ def _library_artists(conn) -> list[dict]:
         "COUNT(DISTINCT album) AS album_count FROM tracks "
         "WHERE deleted_at IS NULL GROUP BY artist ORDER BY artist"
     ).fetchall()
-    return [dict(r) for r in rows]
+    # Each artist's album titles, so a client can search them without one
+    # request per artist. A second query rather than GROUP_CONCAT: a title
+    # may contain any separator.
+    albums: dict[str, list[str]] = {}
+    for r in conn.execute(
+        "SELECT artist, album FROM tracks WHERE deleted_at IS NULL AND album != '' "
+        "GROUP BY artist, album ORDER BY artist, album"
+    ):
+        albums.setdefault(r["artist"], []).append(r["album"])
+    return [{**dict(r), "albums": albums.get(r["artist"], [])} for r in rows]
 
 
 def _library_albums(conn, artist: str) -> list[dict]:
@@ -1894,8 +2161,9 @@ def api_provider_pair():
         conn.close()
 
 
-@app.route("/api/provider/playlists/sync", methods=["POST"])
-def api_provider_playlists_sync():
+def _start_playlist_sync():
+    """Start a provider playlist sync in the background: 202, or 409 while
+    one runs. Shared by both prefixes; the caller has authenticated."""
     conn = db.get_conn()
     try:
         provider_id = _active_provider_id(conn)
@@ -1912,10 +2180,149 @@ def api_provider_playlists_sync():
     return jsonify(result), 202
 
 
+@app.route("/api/provider/playlists/sync", methods=["POST"])
+def api_provider_playlists_sync():
+    return _start_playlist_sync()
+
+
 @app.route("/api/provider/playlists/sync/status")
 def api_provider_playlists_sync_status():
     # #138: running/idle + the last completed run's counts, polled by the UI.
     return jsonify(playlist_sync.sync_status())
+
+
+def _visible_playlists(conn, user_id: int) -> list:
+    """The playlists this user may see, attributed for them: #28 and #81 as the
+    browser route's docstring describes. Shared by the browser route and the
+    App API, so the two can never disagree about who sees what."""
+    admin = _is_admin(conn, user_id)
+    rows = conn.execute(
+        "SELECT p.id, p.title, p.source_provider, p.inferred_origin_provider, p.last_synced_at, "
+        "p.owner_user_id, u.username AS owner_username, p.shared, "
+        "(p.owner_user_id = :uid) AS is_own, "
+        "sd.name AS source_device_name, sd.device_type AS source_device_type, "
+        "sd.icon AS source_device_icon, "
+        "p.mirror_enabled, p.mirror_last_error, p.mirror_last_error_code, "
+        "p.subsonic_mirror_enabled, p.subsonic_mirror_last_error, "
+        "p.subsonic_mirror_last_error_code, "
+        "p.jellyfin_mirror_enabled, p.jellyfin_mirror_last_error, "
+        "p.jellyfin_mirror_last_error_code, "
+        "p.emby_mirror_enabled, p.emby_mirror_last_error, "
+        "p.emby_mirror_last_error_code, "
+        "p.music_assistant_mirror_enabled, p.music_assistant_mirror_last_error, "
+        "p.music_assistant_mirror_last_error_code, "
+        "p.plex_mirror_enabled, p.plex_mirror_last_error, p.plex_mirror_last_error_code, "
+        "p.lidarr_request_enabled, p.lidarr_request_last_run_at, "
+        "p.lidarr_request_last_count, p.lidarr_request_last_error, "
+        "p.lidarr_request_last_error_code, "
+        "p.golden_source_id, "
+        "g.owner_user_id AS golden_owner_user_id, g.shared AS golden_shared, "
+        "gu.username AS golden_owner_username, "
+        "COUNT(t.id) AS track_count, "
+        "SUM(CASE WHEN t.matched_track_id IS NOT NULL THEN 1 ELSE 0 END) AS matched_count, "
+        # #200: a correlated subquery, not a third LEFT JOIN — joining
+        # both playlist_tracks and unresolved_playlist_tracks here would
+        # fan out (each unresolved row multiplying every playlist_tracks
+        # row it's grouped alongside), corrupting track_count/
+        # matched_count above too.
+        "(SELECT COUNT(*) FROM unresolved_playlist_tracks u "
+        " WHERE u.playlist_id = p.id AND u.excluded = 0) AS unresolved_count, "
+        # #494: same correlated-subquery reasoning as unresolved_count
+        # just above — this is the "does this playlist have anything
+        # Lidarr-requestable at all" eligibility flag (album IS NOT NULL
+        # is always false for every Roon/iTunes unresolved row, so those
+        # playlists naturally get 0 here without a provider-specific
+        # special case).
+        # An album looked up in MusicBrainz (inferred_album) counts as much
+        # as the source's own.
+        "(SELECT COUNT(*) FROM unresolved_playlist_tracks u "
+        " WHERE u.playlist_id = p.id AND u.excluded = 0 "
+        " AND COALESCE(NULLIF(u.album, ''), u.inferred_album, '') != '') AS unresolved_with_album_count "
+        "FROM playlists p LEFT JOIN playlist_tracks t ON t.playlist_id = p.id "
+        "LEFT JOIN users u ON u.id = p.owner_user_id "
+        "LEFT JOIN playlists g ON g.id = p.golden_source_id "
+        "LEFT JOIN users gu ON gu.id = g.owner_user_id "
+        # A playlist made on a device names it in its key, "<device id>:<path>".
+        "LEFT JOIN devices sd ON p.source_provider = 'device' AND sd.id = "
+        " CAST(substr(p.source_playlist_id, 1, instr(p.source_playlist_id, ':') - 1) AS INTEGER) "
+        "WHERE :admin OR p.owner_user_id IS NULL OR p.shared = 1 OR p.owner_user_id = :uid "
+        "GROUP BY p.id ORDER BY p.title",
+        {"uid": user_id, "admin": admin},
+    ).fetchall()
+
+    # #410: lets the row disable "Mirror to…" (rather than let it
+    # succeed and only fail — silently, per-row — on the next write)
+    # when there's nothing configured to mirror into. One query outside
+    # the loop; the value is the same for every row.
+    mirror_folder_configured = db.get_mirror_folder() is not None
+    # #189: same reasoning, for the Subsonic/Jellyfin/Emby sinks' own connections.
+    subsonic_mirror_configured = db.get_mirror_subsonic_config() is not None
+    jellyfin_mirror_configured = db.get_mirror_jellyfin_config() is not None
+    emby_mirror_configured = db.get_mirror_emby_config() is not None
+    music_assistant_mirror_configured = db.get_mirror_music_assistant_config() is not None
+    plex_mirror_configured = db.get_mirror_plex_config() is not None
+    # #494: same reasoning, for "Request missing albums" — not a
+    # mirror target, but the same "disable rather than let it fail
+    # silently later" posture.
+    lidarr_request_configured = db.get_lidarr_config() is not None
+    # #509: get_lidarr_config() needs FIVE values (url, api_key, root
+    # folder, quality profile, metadata profile) — get_lidarr_connection()
+    # needs only the first two, which is also what Administration's own
+    # "Connected" indicator reflects. Without this split, "not
+    # configured" collapsed two genuinely different situations into one
+    # hint: no Lidarr connection at all, vs. connected fine but the
+    # three profile fields were never chosen — the second one is
+    # invisible from Administration (which shows green "Connected" the
+    # moment url+api_key work), so the per-playlist hint was sending
+    # the admin to look at a screen that agreed with nothing was wrong.
+    lidarr_request_connected = db.get_lidarr_connection() is not None
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        # #449: same SQLite-integer-vs-JSON-boolean coercion as
+        # is_own/is_pinned in _device_rows_for_user() -- mirror_enabled
+        # already got this treatment, is_own/shared hadn't. The App
+        # API reads these too (a non-JS consumer), and "booleans are
+        # booleans" throughout the API is the rule either way.
+        d["is_own"] = bool(d["is_own"])
+        d["shared"] = bool(d["shared"])
+        d["mirror_enabled"] = bool(d["mirror_enabled"])
+        d["mirror_folder_configured"] = mirror_folder_configured
+        d["subsonic_mirror_enabled"] = bool(d["subsonic_mirror_enabled"])
+        d["subsonic_mirror_configured"] = subsonic_mirror_configured
+        d["jellyfin_mirror_enabled"] = bool(d["jellyfin_mirror_enabled"])
+        d["jellyfin_mirror_configured"] = jellyfin_mirror_configured
+        d["emby_mirror_enabled"] = bool(d["emby_mirror_enabled"])
+        d["emby_mirror_configured"] = emby_mirror_configured
+        d["music_assistant_mirror_enabled"] = bool(d["music_assistant_mirror_enabled"])
+        d["music_assistant_mirror_configured"] = music_assistant_mirror_configured
+        d["plex_mirror_enabled"] = bool(d["plex_mirror_enabled"])
+        d["plex_mirror_configured"] = plex_mirror_configured
+        d["lidarr_request_enabled"] = bool(d["lidarr_request_enabled"])
+        d["lidarr_request_configured"] = lidarr_request_configured
+        d["lidarr_request_connected"] = lidarr_request_connected
+        # #494: exactly the eligibility flag the disabled-button hint
+        # needs client-side — popped rather than left as a raw count,
+        # since the UI only ever needs "is there anything at all", not
+        # the number itself.
+        d["lidarr_request_has_albums"] = d.pop("unresolved_with_album_count") > 0
+        golden_owner = d.pop("golden_owner_user_id")
+        golden_shared = d.pop("golden_shared")
+        # golden_owner is non-NULL only when the row is dual-source AND
+        # its golden Tidal row still exists (the LEFT JOIN gives NULL
+        # once that row is gone — ON DELETE SET NULL also clears the ref
+        # on the next sync).
+        if d["golden_source_id"] is not None and golden_owner is not None:
+            viewer_sees_golden = admin or golden_shared == 1 or golden_owner == user_id
+            if viewer_sees_golden:
+                continue  # suppress the Roon duplicate; viewer sees the Tidal golden copy
+            # else keep + expose golden_owner_username for the "shared by X" badge
+        else:
+            d["golden_owner_username"] = None
+        d.pop("golden_source_id", None)
+        result.append(d)
+    return result
 
 
 @app.route("/api/provider/playlists")
@@ -1943,122 +2350,31 @@ def api_provider_playlists():
     #28 privacy untouched."""
     conn = db.get_conn()
     try:
-        user_id = get_current_user_id(conn)
-        admin = _is_admin(conn, user_id)
-        rows = conn.execute(
-            "SELECT p.id, p.title, p.source_provider, p.inferred_origin_provider, p.last_synced_at, "
-            "p.owner_user_id, u.username AS owner_username, p.shared, "
-            "(p.owner_user_id = :uid) AS is_own, "
-            "p.mirror_enabled, p.mirror_last_error, p.mirror_last_error_code, "
-            "p.subsonic_mirror_enabled, p.subsonic_mirror_last_error, "
-            "p.subsonic_mirror_last_error_code, "
-            "p.jellyfin_mirror_enabled, p.jellyfin_mirror_last_error, "
-            "p.jellyfin_mirror_last_error_code, "
-            "p.emby_mirror_enabled, p.emby_mirror_last_error, "
-            "p.emby_mirror_last_error_code, "
-            "p.lidarr_request_enabled, p.lidarr_request_last_run_at, "
-            "p.lidarr_request_last_count, p.lidarr_request_last_error, "
-            "p.lidarr_request_last_error_code, "
-            "p.golden_source_id, "
-            "g.owner_user_id AS golden_owner_user_id, g.shared AS golden_shared, "
-            "gu.username AS golden_owner_username, "
-            "COUNT(t.id) AS track_count, "
-            "SUM(CASE WHEN t.matched_track_id IS NOT NULL THEN 1 ELSE 0 END) AS matched_count, "
-            # #200: a correlated subquery, not a third LEFT JOIN — joining
-            # both playlist_tracks and unresolved_playlist_tracks here would
-            # fan out (each unresolved row multiplying every playlist_tracks
-            # row it's grouped alongside), corrupting track_count/
-            # matched_count above too.
-            "(SELECT COUNT(*) FROM unresolved_playlist_tracks u "
-            " WHERE u.playlist_id = p.id AND u.excluded = 0) AS unresolved_count, "
-            # #494: same correlated-subquery reasoning as unresolved_count
-            # just above — this is the "does this playlist have anything
-            # Lidarr-requestable at all" eligibility flag (album IS NOT NULL
-            # is always false for every Roon/iTunes unresolved row, so those
-            # playlists naturally get 0 here without a provider-specific
-            # special case).
-            "(SELECT COUNT(*) FROM unresolved_playlist_tracks u "
-            " WHERE u.playlist_id = p.id AND u.excluded = 0 "
-            " AND u.album IS NOT NULL AND u.album != '') AS unresolved_with_album_count "
-            "FROM playlists p LEFT JOIN playlist_tracks t ON t.playlist_id = p.id "
-            "LEFT JOIN users u ON u.id = p.owner_user_id "
-            "LEFT JOIN playlists g ON g.id = p.golden_source_id "
-            "LEFT JOIN users gu ON gu.id = g.owner_user_id "
-            "WHERE :admin OR p.owner_user_id IS NULL OR p.shared = 1 OR p.owner_user_id = :uid "
-            "GROUP BY p.id ORDER BY p.title",
-            {"uid": user_id, "admin": admin},
-        ).fetchall()
-
-        # #410: lets the row disable "Mirror to…" (rather than let it
-        # succeed and only fail — silently, per-row — on the next write)
-        # when there's nothing configured to mirror into. One query outside
-        # the loop; the value is the same for every row.
-        mirror_folder_configured = db.get_mirror_folder() is not None
-        # #189: same reasoning, for the Subsonic/Jellyfin/Emby sinks' own connections.
-        subsonic_mirror_configured = db.get_mirror_subsonic_config() is not None
-        jellyfin_mirror_configured = db.get_mirror_jellyfin_config() is not None
-        emby_mirror_configured = db.get_mirror_emby_config() is not None
-        # #494: same reasoning, for "Request missing albums" — not a
-        # mirror target, but the same "disable rather than let it fail
-        # silently later" posture.
-        lidarr_request_configured = db.get_lidarr_config() is not None
-        # #509: get_lidarr_config() needs FIVE values (url, api_key, root
-        # folder, quality profile, metadata profile) — get_lidarr_connection()
-        # needs only the first two, which is also what Administration's own
-        # "Connected" indicator reflects. Without this split, "not
-        # configured" collapsed two genuinely different situations into one
-        # hint: no Lidarr connection at all, vs. connected fine but the
-        # three profile fields were never chosen — the second one is
-        # invisible from Administration (which shows green "Connected" the
-        # moment url+api_key work), so the per-playlist hint was sending
-        # the admin to look at a screen that agreed with nothing was wrong.
-        lidarr_request_connected = db.get_lidarr_connection() is not None
-
-        result = []
-        for r in rows:
-            d = dict(r)
-            # #449: same SQLite-integer-vs-JSON-boolean coercion as
-            # is_own/is_pinned in _device_rows_for_user() -- mirror_enabled
-            # already got this treatment, is_own/shared hadn't. This
-            # endpoint is session-only today (JS truthiness covers 0/1
-            # fine), but "booleans are booleans" throughout the API is the
-            # rule now, not just where a non-JS consumer happens to exist.
-            d["is_own"] = bool(d["is_own"])
-            d["shared"] = bool(d["shared"])
-            d["mirror_enabled"] = bool(d["mirror_enabled"])
-            d["mirror_folder_configured"] = mirror_folder_configured
-            d["subsonic_mirror_enabled"] = bool(d["subsonic_mirror_enabled"])
-            d["subsonic_mirror_configured"] = subsonic_mirror_configured
-            d["jellyfin_mirror_enabled"] = bool(d["jellyfin_mirror_enabled"])
-            d["jellyfin_mirror_configured"] = jellyfin_mirror_configured
-            d["emby_mirror_enabled"] = bool(d["emby_mirror_enabled"])
-            d["emby_mirror_configured"] = emby_mirror_configured
-            d["lidarr_request_enabled"] = bool(d["lidarr_request_enabled"])
-            d["lidarr_request_configured"] = lidarr_request_configured
-            d["lidarr_request_connected"] = lidarr_request_connected
-            # #494: exactly the eligibility flag the disabled-button hint
-            # needs client-side — popped rather than left as a raw count,
-            # since the UI only ever needs "is there anything at all", not
-            # the number itself.
-            d["lidarr_request_has_albums"] = d.pop("unresolved_with_album_count") > 0
-            golden_owner = d.pop("golden_owner_user_id")
-            golden_shared = d.pop("golden_shared")
-            # golden_owner is non-NULL only when the row is dual-source AND
-            # its golden Tidal row still exists (the LEFT JOIN gives NULL
-            # once that row is gone — ON DELETE SET NULL also clears the ref
-            # on the next sync).
-            if d["golden_source_id"] is not None and golden_owner is not None:
-                viewer_sees_golden = admin or golden_shared == 1 or golden_owner == user_id
-                if viewer_sees_golden:
-                    continue  # suppress the Roon duplicate; viewer sees the Tidal golden copy
-                # else keep + expose golden_owner_username for the "shared by X" badge
-            else:
-                d["golden_owner_username"] = None
-            d.pop("golden_source_id", None)
-            result.append(d)
-        return jsonify(result)
+        return jsonify(_visible_playlists(conn, get_current_user_id(conn)))
     finally:
         conn.close()
+
+
+def _set_playlist_shared(conn, user_id: int, playlist_id: int):
+    """The `shared` toggle, owner or admin only; shared by both prefixes."""
+    row = conn.execute("SELECT owner_user_id FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+    if row is None:
+        abort(404, description=_("Playlist not found"))
+    if row["owner_user_id"] is None:
+        abort(400, description=_("This playlist has no owner to change sharing for."))
+    if row["owner_user_id"] != user_id and not _is_admin(conn, user_id):
+        abort(403, description=_("Unauthorized access to this playlist"))
+    body = request.get_json(force=True)
+    if "shared" not in body:
+        abort(400, description=_("Nothing to update."))
+    new_shared = 1 if body["shared"] else 0
+    conn.execute("UPDATE playlists SET shared = ? WHERE id = ?", (new_shared, playlist_id))
+    conn.commit()
+    if new_shared == 0:
+        # #73: retroactive, not just forward-looking — see the
+        # helper's own docstring.
+        _revoke_non_owner_playlist_selections(conn, playlist_id, row["owner_user_id"])
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/provider/playlists/<int:playlist_id>", methods=["PATCH"])
@@ -2069,25 +2385,7 @@ def api_provider_playlist_update(playlist_id: int):
     reorder."""
     conn = db.get_conn()
     try:
-        user_id = get_current_user_id(conn)
-        row = conn.execute("SELECT owner_user_id FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
-        if row is None:
-            abort(404, description=_("Playlist not found"))
-        if row["owner_user_id"] is None:
-            abort(400, description=_("This playlist has no owner to change sharing for."))
-        if row["owner_user_id"] != user_id and not _is_admin(conn, user_id):
-            abort(403, description=_("Unauthorized access to this playlist"))
-        body = request.get_json(force=True)
-        if "shared" not in body:
-            abort(400, description=_("Nothing to update."))
-        new_shared = 1 if body["shared"] else 0
-        conn.execute("UPDATE playlists SET shared = ? WHERE id = ?", (new_shared, playlist_id))
-        conn.commit()
-        if new_shared == 0:
-            # #73: retroactive, not just forward-looking — see the
-            # helper's own docstring.
-            _revoke_non_owner_playlist_selections(conn, playlist_id, row["owner_user_id"])
-        return jsonify({"status": "ok"})
+        return _set_playlist_shared(conn, get_current_user_id(conn), playlist_id)
     finally:
         conn.close()
 
@@ -2117,7 +2415,20 @@ def _subscription_json(row) -> dict:
         "title": row["title"], "last_synced_at": row["last_synced_at"],
         "last_error": row["last_error"], "last_error_at": row["last_error_at"],
         "track_count": row["last_track_count"], "matched_count": row["last_matched_count"],
+        # The most tracks the source can return, or None when it returns
+        # them all. The page says a playlist at the limit may be longer.
+        "track_limit": spotify_public_client.LIMIT
+        if row["provider"] == spotify_public_client.PROVIDER_ID else None,
     }
+
+
+def _own_subscriptions(conn, user_id: int):
+    """This user's own subscriptions; shared by both prefixes."""
+    rows = conn.execute(
+        "SELECT * FROM playlist_subscriptions WHERE owner_user_id = ? ORDER BY id",
+        (user_id,),
+    ).fetchall()
+    return jsonify({"subscriptions": [_subscription_json(r) for r in rows]})
 
 
 @app.route("/api/playlist-subscriptions")
@@ -2130,14 +2441,53 @@ def api_playlist_subscriptions():
     for one household member's tastes to leak to another."""
     conn = db.get_conn()
     try:
-        user_id = get_current_user_id(conn)
-        rows = conn.execute(
-            "SELECT * FROM playlist_subscriptions WHERE owner_user_id = ? ORDER BY id",
-            (user_id,),
-        ).fetchall()
-        return jsonify({"subscriptions": [_subscription_json(r) for r in rows]})
+        return _own_subscriptions(conn, get_current_user_id(conn))
     finally:
         conn.close()
+
+
+def _add_subscription(conn, user_id: int):
+    """Subscribe by URL and import at once; shared by both prefixes."""
+    body = request.get_json(force=True)
+    raw_url = (body.get("url") or "").strip()
+    # Spotify first: its parser takes only links, while YouTube Music's
+    # also takes a bare id, which would otherwise swallow anything.
+    provider = spotify_public_client.PROVIDER_ID
+    external_id = spotify_public_client.parse_playlist_url(raw_url)
+    if external_id is None:
+        provider = ytmusic_client.PROVIDER_ID
+        external_id = ytmusic_client.parse_playlist_url(raw_url)
+    if external_id is None:
+        abort(400, description=_(
+            "That doesn't look like a YouTube Music or Spotify playlist link. "
+            "Copy the playlist's Share link, or the address bar while it's open."))
+    existing = conn.execute(
+        "SELECT id FROM playlist_subscriptions "
+        "WHERE owner_user_id = ? AND provider = ? AND external_id = ?",
+        (user_id, provider, external_id),
+    ).fetchone()
+    if existing is None:
+        cur = conn.execute(
+            "INSERT INTO playlist_subscriptions (owner_user_id, provider, external_id, url) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, provider, external_id, raw_url),
+        )
+        conn.commit()
+        sub_id = cur.lastrowid
+    else:
+        sub_id = existing["id"]
+        conn.execute(
+            "UPDATE playlist_subscriptions SET url = ? WHERE id = ?", (raw_url, sub_id))
+        conn.commit()
+
+    sub = conn.execute(
+        "SELECT id, owner_user_id, provider, external_id, title "
+        "FROM playlist_subscriptions WHERE id = ?", (sub_id,)
+    ).fetchone()
+    outcome = playlist_sync.sync_one_subscription(conn, sub)
+    row = conn.execute(
+        "SELECT * FROM playlist_subscriptions WHERE id = ?", (sub_id,)).fetchone()
+    return jsonify({"status": outcome["status"], "subscription": _subscription_json(row)})
 
 
 @app.route("/api/playlist-subscriptions", methods=["POST"])
@@ -2160,44 +2510,22 @@ def api_playlist_subscriptions_add():
     same either way."""
     conn = db.get_conn()
     try:
-        user_id = get_current_user_id(conn)
-        body = request.get_json(force=True)
-        raw_url = (body.get("url") or "").strip()
-        external_id = ytmusic_client.parse_playlist_url(raw_url)
-        if external_id is None:
-            abort(400, description=_(
-                "That doesn't look like a YouTube Music playlist link. Copy the "
-                "playlist's Share link, or the address bar while it's open."))
-        provider = ytmusic_client.PROVIDER_ID
-        existing = conn.execute(
-            "SELECT id FROM playlist_subscriptions "
-            "WHERE owner_user_id = ? AND provider = ? AND external_id = ?",
-            (user_id, provider, external_id),
-        ).fetchone()
-        if existing is None:
-            cur = conn.execute(
-                "INSERT INTO playlist_subscriptions (owner_user_id, provider, external_id, url) "
-                "VALUES (?, ?, ?, ?)",
-                (user_id, provider, external_id, raw_url),
-            )
-            conn.commit()
-            sub_id = cur.lastrowid
-        else:
-            sub_id = existing["id"]
-            conn.execute(
-                "UPDATE playlist_subscriptions SET url = ? WHERE id = ?", (raw_url, sub_id))
-            conn.commit()
-
-        sub = conn.execute(
-            "SELECT id, owner_user_id, provider, external_id, title "
-            "FROM playlist_subscriptions WHERE id = ?", (sub_id,)
-        ).fetchone()
-        outcome = playlist_sync.sync_one_subscription(conn, sub)
-        row = conn.execute(
-            "SELECT * FROM playlist_subscriptions WHERE id = ?", (sub_id,)).fetchone()
-        return jsonify({"status": outcome["status"], "subscription": _subscription_json(row)})
+        return _add_subscription(conn, get_current_user_id(conn))
     finally:
         conn.close()
+
+
+def _refresh_subscription(conn, user_id: int, sub_id: int):
+    """Re-fetch one subscription, owner or admin; shared by both prefixes."""
+    _subscription_row(conn, sub_id, user_id)
+    sub = conn.execute(
+        "SELECT id, owner_user_id, provider, external_id, title "
+        "FROM playlist_subscriptions WHERE id = ?", (sub_id,)
+    ).fetchone()
+    outcome = playlist_sync.sync_one_subscription(conn, sub)
+    row = conn.execute(
+        "SELECT * FROM playlist_subscriptions WHERE id = ?", (sub_id,)).fetchone()
+    return jsonify({"status": outcome["status"], "subscription": _subscription_json(row)})
 
 
 @app.route("/api/playlist-subscriptions/<int:sub_id>/refresh", methods=["POST"])
@@ -2207,18 +2535,16 @@ def api_playlist_subscription_refresh(sub_id: int):
     before the next scheduled sync."""
     conn = db.get_conn()
     try:
-        user_id = get_current_user_id(conn)
-        _subscription_row(conn, sub_id, user_id)
-        sub = conn.execute(
-            "SELECT id, owner_user_id, provider, external_id, title "
-            "FROM playlist_subscriptions WHERE id = ?", (sub_id,)
-        ).fetchone()
-        outcome = playlist_sync.sync_one_subscription(conn, sub)
-        row = conn.execute(
-            "SELECT * FROM playlist_subscriptions WHERE id = ?", (sub_id,)).fetchone()
-        return jsonify({"status": outcome["status"], "subscription": _subscription_json(row)})
+        return _refresh_subscription(conn, get_current_user_id(conn), sub_id)
     finally:
         conn.close()
+
+
+def _delete_subscription(conn, user_id: int, sub_id: int):
+    """Unsubscribe and remove its playlist, owner or admin; shared by both prefixes."""
+    _subscription_row(conn, sub_id, user_id)
+    playlist_sync.delete_subscription(conn, sub_id)
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/playlist-subscriptions/<int:sub_id>", methods=["DELETE"])
@@ -2232,10 +2558,7 @@ def api_playlist_subscription_delete(sub_id: int):
     silently on some later sync."""
     conn = db.get_conn()
     try:
-        user_id = get_current_user_id(conn)
-        _subscription_row(conn, sub_id, user_id)
-        playlist_sync.delete_subscription(conn, sub_id)
-        return jsonify({"status": "ok"})
+        return _delete_subscription(conn, get_current_user_id(conn), sub_id)
     finally:
         conn.close()
 
@@ -2260,6 +2583,12 @@ def _require_playlist_visible_by_id(conn, user_id: int, playlist_id: int) -> Non
     abort(403, description=_("Unauthorized access to this playlist"))
 
 
+def _unresolved_tracks_of(conn, user_id: int, playlist_id: int):
+    """A visible playlist's unresolved entries; shared by both prefixes."""
+    _require_playlist_visible_by_id(conn, user_id, playlist_id)
+    return jsonify(sync_state.list_unresolved_playlist_tracks(conn, playlist_id))
+
+
 @app.route("/api/provider/playlists/<int:playlist_id>/unresolved-tracks")
 def api_playlist_unresolved_tracks(playlist_id: int):
     """#200: this playlist's unresolved entries (identity.py's resolver
@@ -2267,11 +2596,21 @@ def api_playlist_unresolved_tracks(playlist_id: int):
     playlist itself."""
     conn = db.get_conn()
     try:
-        user_id = get_current_user_id(conn)
-        _require_playlist_visible_by_id(conn, user_id, playlist_id)
-        return jsonify(sync_state.list_unresolved_playlist_tracks(conn, playlist_id))
+        return _unresolved_tracks_of(conn, get_current_user_id(conn), playlist_id)
     finally:
         conn.close()
+
+
+def _exclude_unresolved_tracks(conn, user_id: int, playlist_id: int):
+    """Exclude or un-exclude unresolved entries of a visible playlist; shared by both prefixes."""
+    _require_playlist_visible_by_id(conn, user_id, playlist_id)
+    body = request.get_json(force=True)
+    ids = body.get("ids")
+    if not isinstance(ids, list):
+        abort(400, description=_("ids must be a list of unresolved-track row ids."))
+    excluded = bool(body.get("excluded", True))
+    count = sync_state.set_unresolved_playlist_tracks_excluded(conn, playlist_id, ids, excluded)
+    return jsonify({"unresolved_count": count})
 
 
 @app.route("/api/provider/playlists/<int:playlist_id>/unresolved-tracks/exclude", methods=["POST"])
@@ -2286,15 +2625,7 @@ def api_playlist_unresolved_tracks_exclude(playlist_id: int):
     `adopted` has to that other review surface."""
     conn = db.get_conn()
     try:
-        user_id = get_current_user_id(conn)
-        _require_playlist_visible_by_id(conn, user_id, playlist_id)
-        body = request.get_json(force=True)
-        ids = body.get("ids")
-        if not isinstance(ids, list):
-            abort(400, description=_("ids must be a list of unresolved-track row ids."))
-        excluded = bool(body.get("excluded", True))
-        count = sync_state.set_unresolved_playlist_tracks_excluded(conn, playlist_id, ids, excluded)
-        return jsonify({"unresolved_count": count})
+        return _exclude_unresolved_tracks(conn, get_current_user_id(conn), playlist_id)
     finally:
         conn.close()
 
@@ -2302,7 +2633,7 @@ def api_playlist_unresolved_tracks_exclude(playlist_id: int):
 @app.route("/api/provider/playlists/<int:playlist_id>/mirror", methods=["POST"])
 def api_playlist_mirror_toggle(playlist_id: int):
     """#285/#189: {"enabled": true|false, "sink": "filesystem"|"subsonic"|
-    "jellyfin"|"emby"} — toggle this playlist's mirror to one sink. `sink`
+    "jellyfin"|"emby"|"music_assistant"|"plex"} — toggle this playlist's mirror to one sink. `sink`
     defaults to "filesystem" (the shape this route originally had, before
     #189 added more sinks) so an old cached frontend mid-deploy keeps
     working. Same #28 visibility as the unresolved-tracks routes (any user
@@ -2322,7 +2653,7 @@ def api_playlist_mirror_toggle(playlist_id: int):
             abort(400, description=_("Nothing to update."))
         enabled = bool(body["enabled"])
         sink = body.get("sink", "filesystem")
-        if sink not in ("filesystem", "subsonic", "jellyfin", "emby"):
+        if sink not in ("filesystem", "subsonic", "jellyfin", "emby", "music_assistant", "plex"):
             abort(400, description=_("Unknown mirror sink."))
 
         if sink == "filesystem":
@@ -2345,13 +2676,26 @@ def api_playlist_mirror_toggle(playlist_id: int):
             )
             (mirror_jellyfin.write_mirror if enabled else mirror_jellyfin.delete_mirror)(
                 conn, playlist_id)
-        else:
+        elif sink == "emby":
             conn.execute(
                 "UPDATE playlists SET emby_mirror_enabled = ? WHERE id = ?",
                 (1 if enabled else 0, playlist_id),
             )
             (mirror_emby.write_mirror if enabled else mirror_emby.delete_mirror)(
                 conn, playlist_id)
+        elif sink == "music_assistant":
+            conn.execute(
+                "UPDATE playlists SET music_assistant_mirror_enabled = ? WHERE id = ?",
+                (1 if enabled else 0, playlist_id),
+            )
+            (mirror_music_assistant.write_mirror if enabled else mirror_music_assistant.delete_mirror)(
+                conn, playlist_id)
+        else:
+            conn.execute(
+                "UPDATE playlists SET plex_mirror_enabled = ? WHERE id = ?",
+                (1 if enabled else 0, playlist_id),
+            )
+            (mirror_plex.write_mirror if enabled else mirror_plex.delete_mirror)(conn, playlist_id)
         conn.commit()
 
         row = conn.execute(
@@ -2365,7 +2709,12 @@ def api_playlist_mirror_toggle(playlist_id: int):
             "jellyfin_mirror_last_error_code, "
             "emby_mirror_enabled, emby_mirror_remote_id, "
             "emby_mirror_last_written_at, emby_mirror_last_error, "
-            "emby_mirror_last_error_code "
+            "emby_mirror_last_error_code, "
+            "music_assistant_mirror_enabled, music_assistant_mirror_remote_id, "
+            "music_assistant_mirror_last_written_at, music_assistant_mirror_last_error, "
+            "music_assistant_mirror_last_error_code, "
+            "plex_mirror_enabled, plex_mirror_remote_id, plex_mirror_last_written_at, "
+            "plex_mirror_last_error, plex_mirror_last_error_code "
             "FROM playlists WHERE id = ?", (playlist_id,),
         ).fetchone()
         return jsonify({
@@ -2374,9 +2723,40 @@ def api_playlist_mirror_toggle(playlist_id: int):
             "subsonic_mirror_enabled": bool(row["subsonic_mirror_enabled"]),
             "jellyfin_mirror_enabled": bool(row["jellyfin_mirror_enabled"]),
             "emby_mirror_enabled": bool(row["emby_mirror_enabled"]),
+            "music_assistant_mirror_enabled": bool(row["music_assistant_mirror_enabled"]),
+            "plex_mirror_enabled": bool(row["plex_mirror_enabled"]),
         })
     finally:
         conn.close()
+
+
+def _set_lidarr_requests(conn, user_id: int, playlist_id: int):
+    """The per-playlist Lidarr request toggle, for anyone who can see the
+    playlist; shared by both prefixes."""
+    _require_playlist_visible_by_id(conn, user_id, playlist_id)
+    body = request.get_json(force=True)
+    if "enabled" not in body:
+        abort(400, description=_("Nothing to update."))
+    enabled = bool(body["enabled"])
+    conn.execute(
+        "UPDATE playlists SET lidarr_request_enabled = ? WHERE id = ?",
+        (1 if enabled else 0, playlist_id),
+    )
+    conn.commit()
+    if enabled:
+        lidarr_requests.run_for_playlist(conn, playlist_id)
+        conn.commit()
+
+    row = conn.execute(
+        "SELECT lidarr_request_enabled, lidarr_request_last_run_at, "
+        "lidarr_request_last_count, lidarr_request_last_error, "
+        "lidarr_request_last_error_code FROM playlists WHERE id = ?",
+        (playlist_id,),
+    ).fetchone()
+    return jsonify({
+        **dict(row),
+        "lidarr_request_enabled": bool(row["lidarr_request_enabled"]),
+    })
 
 
 @app.route("/api/provider/playlists/<int:playlist_id>/lidarr-requests", methods=["POST"])
@@ -2395,31 +2775,7 @@ def api_playlist_lidarr_requests_toggle(playlist_id: int):
     equivalent to call here."""
     conn = db.get_conn()
     try:
-        user_id = get_current_user_id(conn)
-        _require_playlist_visible_by_id(conn, user_id, playlist_id)
-        body = request.get_json(force=True)
-        if "enabled" not in body:
-            abort(400, description=_("Nothing to update."))
-        enabled = bool(body["enabled"])
-        conn.execute(
-            "UPDATE playlists SET lidarr_request_enabled = ? WHERE id = ?",
-            (1 if enabled else 0, playlist_id),
-        )
-        conn.commit()
-        if enabled:
-            lidarr_requests.run_for_playlist(conn, playlist_id)
-            conn.commit()
-
-        row = conn.execute(
-            "SELECT lidarr_request_enabled, lidarr_request_last_run_at, "
-            "lidarr_request_last_count, lidarr_request_last_error, "
-            "lidarr_request_last_error_code FROM playlists WHERE id = ?",
-            (playlist_id,),
-        ).fetchone()
-        return jsonify({
-            **dict(row),
-            "lidarr_request_enabled": bool(row["lidarr_request_enabled"]),
-        })
+        return _set_lidarr_requests(conn, get_current_user_id(conn), playlist_id)
     finally:
         conn.close()
 
@@ -2442,7 +2798,7 @@ def _device_rows_for_user(conn, user_id: int, admin: bool) -> list[dict]:
     attribute would read 1 where every other boolean reads true. Matches
     the existing mirror_enabled precedent in api_provider_playlists()."""
     base = (
-        "SELECT d.id, d.name, d.device_type, d.max_size_bytes, d.transcode_format, d.artist_images, "
+        "SELECT d.id, d.name, d.device_type, d.icon, d.max_size_bytes, d.transcode_format, d.artist_images, "
         "d.source_of_truth, d.unknown_track_count, "
         "d.reported_free_bytes, "
         "d.reported_total_bytes, d.free_bytes_reported_at, "
@@ -2520,6 +2876,24 @@ def _validated_artist_images(value):
     return imgs
 
 
+# The icons a device can be shown with, whatever its type: a picture, never
+# behaviour. Generic shapes, no brand marks. A client that meets an id it
+# does not know draws the type's own icon, so the set can grow.
+DEVICE_ICONS = (
+    "phone", "phone-button", "tablet", "tablet-small", "clickwheel", "cassette",
+    "dap-buttons", "headphones", "watch", "sdcard", "usb", "folder",
+)
+
+
+def _validated_device_icon(value):
+    """None (follow the type) or one of DEVICE_ICONS; anything else is a 400."""
+    if value is None:
+        return None
+    if value not in DEVICE_ICONS:
+        abort(400, description=_("Unknown device icon."))
+    return value
+
+
 def _validated_source_of_truth(value):
     if value not in ("server", "device"):
         abort(400, description=_("source_of_truth must be 'server' or 'device'."))
@@ -2580,6 +2954,9 @@ def api_integrations_devices():
         out = []
         for r in rows:
             d = dict(r)
+            # The device icon is a web/app picture, not part of this published
+            # shape (integration-api.md); left out so the contract is unchanged.
+            d.pop("icon", None)
             d["autofit"] = sync_state.autofit_status(conn, d["id"])
             d["sync_status"] = sync_state.sync_status(conn, d["id"])
             out.append(d)
@@ -2652,6 +3029,9 @@ _MIRROR_SINK_COLUMNS = {
     "jellyfin": ("jellyfin_mirror_enabled", "jellyfin_mirror_last_error_code",
                  "jellyfin_mirror_last_written_at"),
     "emby": ("emby_mirror_enabled", "emby_mirror_last_error_code", "emby_mirror_last_written_at"),
+    "music_assistant": ("music_assistant_mirror_enabled", "music_assistant_mirror_last_error_code",
+                        "music_assistant_mirror_last_written_at"),
+    "plex": ("plex_mirror_enabled", "plex_mirror_last_error_code", "plex_mirror_last_written_at"),
 }
 
 # #498: unlike Health's 200 (opened occasionally, in a browser), this
@@ -2705,18 +3085,12 @@ def api_integrations_mirrors():
     conn = db.get_conn()
     try:
         _authenticated_integration_token(conn)
+        # Built from _MIRROR_SINK_COLUMNS (fixed identifiers, never input),
+        # so a sink added there is counted here without a second list.
+        columns = ", ".join(c for cols in _MIRROR_SINK_COLUMNS.values() for c in cols)
+        any_enabled = " OR ".join(f"{cols[0]} = 1" for cols in _MIRROR_SINK_COLUMNS.values())
         rows = conn.execute(
-            "SELECT id, title, "
-            "mirror_enabled, mirror_last_error_code, mirror_last_written_at, "
-            "subsonic_mirror_enabled, subsonic_mirror_last_error_code, "
-            "subsonic_mirror_last_written_at, "
-            "jellyfin_mirror_enabled, jellyfin_mirror_last_error_code, "
-            "jellyfin_mirror_last_written_at, "
-            "emby_mirror_enabled, emby_mirror_last_error_code, emby_mirror_last_written_at "
-            "FROM playlists "
-            "WHERE mirror_enabled = 1 OR subsonic_mirror_enabled = 1 "
-            "OR jellyfin_mirror_enabled = 1 OR emby_mirror_enabled = 1 "
-            "ORDER BY title"
+            f"SELECT id, title, {columns} FROM playlists WHERE {any_enabled} ORDER BY title"
         ).fetchall()
 
         by_sink = {sink: {"enabled": 0, "failing": 0} for sink in _MIRROR_SINK_COLUMNS}
@@ -2874,7 +3248,7 @@ def api_devices_delegatable():
     try:
         user_id = get_current_user_id(conn)
         rows = conn.execute(
-            "SELECT d.id, d.name, d.device_type, u.username AS owner_username "
+            "SELECT d.id, d.name, d.device_type, d.icon, u.username AS owner_username "
             "FROM devices d JOIN users u ON u.id = d.owner_user_id "
             "WHERE d.owner_user_id IN (SELECT target_user_id FROM device_delegations WHERE grantee_user_id = ?) "
             "AND d.id NOT IN (SELECT device_id FROM device_pins WHERE user_id = ?) "
@@ -2930,6 +3304,9 @@ def api_device_update(device_id: int):
                     (device_id,),
                 )
             ]
+            # Playlists made on this device go with it, the usual way, so
+            # devices they were sent to are told and their mirrors go too.
+            playlist_sync.remove_device_playlists(conn, device_id)
             conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
             # Not cascaded — users.basket_last_destinations is JSON, not a
             # join table. Same transaction as the delete, so the device and
@@ -2961,6 +3338,9 @@ def api_device_update(device_id: int):
         if "artist_images" in body:
             updates.append("artist_images = ?")
             params.append(_validated_artist_images(body.get("artist_images")))
+        if "icon" in body:
+            updates.append("icon = ?")
+            params.append(_validated_device_icon(body.get("icon")))
         transcode_changed = False
         if "transcode_format" in body:
             fmt = _validated_transcode_format(body.get("transcode_format"))
@@ -3024,11 +3404,13 @@ def api_device_repair_code(device_id: int):
     selections, track state and settings still on it.
 
     Deliberately a separate route from regenerate-token rather than a flag on
-    it. That one hands out a raw device token, which is trobar-desktop's
-    pairing format (pasted config, or .trobar/device.json on the card); this
-    one hands out a code, which is what the Android wizard reads. Same
-    outcome, two client contracts, and collapsing them would break the one
-    that already works."""
+    it. That one hands out a raw device token, the only format desktop builds
+    from before enrollment codes read (pasted config, or .trobar/device.json
+    on the card); this one hands out a code, which the Android app, current
+    desktop builds and the Garmin watch read. Same outcome, two client
+    contracts, and the older one still has users. The web UI's device action
+    and its new-device flow for DAPs, cards and folders both mint this; the
+    token is a secondary action for the older desktop builds."""
     conn = db.get_conn()
     try:
         user_id = get_current_user_id(conn)
@@ -3685,6 +4067,15 @@ DEFAULT_COVER_LIMIT = 15
 WIDGET_MONTHS_RANGE = (1, 24)
 MONTHS_WIDGETS = ("recently_added", "recently_released")
 
+# The three widgets that draw a cover grid, each with its own cover count,
+# settings[<widget>]["cover_limit"]. It used to be one value for all three,
+# settings["cover_limit"], and that key is kept in every answer, holding
+# Suggestions' count: an app built before the split reads it, and applies
+# it to all three. A stored set with only the old single value reads as
+# that value for each of the three, so nothing looks different after the
+# upgrade. A PATCH may still send the single value; it sets all three.
+COVER_WIDGETS = ("suggestions", "recently_added", "recently_released")
+
 
 def _widget_months(value):
     """The stored form of a months setting, or None if the value is not a
@@ -3702,15 +4093,24 @@ def _sanitize_widget_settings(settings) -> dict:
     route, is _validate_dashboard_widgets_patch below."""
     settings = settings if isinstance(settings, dict) else {}
     result: dict = {}
-    result["cover_limit"] = (settings.get("cover_limit")
-                             if settings.get("cover_limit") in DASHBOARD_COVER_LIMITS
-                             else DEFAULT_COVER_LIMIT)
-    for widget in MONTHS_WIDGETS:
-        entry = settings.get(widget)
-        months = _widget_months(entry.get("months")) if isinstance(entry, dict) else None
-        if months is not None:
-            result[widget] = {"months": months}
+    single = _cover_limit(settings.get("cover_limit")) or DEFAULT_COVER_LIMIT
+    for widget in COVER_WIDGETS:
+        entry = settings.get(widget) if isinstance(settings.get(widget), dict) else {}
+        result[widget] = {"cover_limit": _cover_limit(entry.get("cover_limit")) or single}
+        if widget in MONTHS_WIDGETS:
+            months = _widget_months(entry.get("months"))
+            if months is not None:
+                result[widget]["months"] = months
+    result["cover_limit"] = result[COVER_WIDGETS[0]]["cover_limit"]
     return result
+
+
+def _cover_limit(value):
+    """The stored form of a cover count, or None if it is not one of the
+    allowed values. bool is excluded: True == 1 in Python."""
+    if isinstance(value, bool) or value not in DASHBOARD_COVER_LIMITS:
+        return None
+    return value
 
 
 def _normalize_dashboard_widgets(parsed) -> dict:
@@ -3718,7 +4118,7 @@ def _normalize_dashboard_widgets(parsed) -> dict:
     any other JSON-decoded shape), tolerating garbage by falling back to
     "nothing disabled, no per-widget settings, no saved order" — same shape
     a brand-new user gets."""
-    default: dict = {"disabled": [], "order": [], "settings": {"cover_limit": DEFAULT_COVER_LIMIT}}
+    default: dict = {"disabled": [], "order": [], "settings": _sanitize_widget_settings(None)}
     if not isinstance(parsed, dict):
         return default
     disabled = parsed.get("disabled")
@@ -3749,7 +4149,7 @@ def _dashboard_widgets_dict(raw: str | None) -> dict:
 
 def _profile_dict(conn: sqlite3.Connection, user_id: int) -> dict:
     row = conn.execute(
-        "SELECT username, lastfm_username, lastfm_api_key, listenbrainz_username, "
+        "SELECT username, lastfm_username, lastfm_api_key, listenbrainz_username, maloja_url, "
         "cover_view_mode, show_reissue_year, dashboard_widgets, basket_last_destinations, "
         "hide_zero_match_playlists, "
         "is_admin, email, avatar_path, tidal_refresh_token, tidal_display_name, "
@@ -3817,12 +4217,25 @@ def api_profile():
                 # admin-only widget further, never un-hide one — see
                 # ADMIN_ONLY_WIDGETS.
                 widgets["disabled"] = sorted(set(widgets["disabled"]) | ADMIN_ONLY_WIDGETS)
+            maloja_url = (body.get("maloja_url") or "").strip() or None
+            if maloja_url is not None:
+                error: str | None
+                if not _is_valid_url(maloja_url):
+                    error = _invalid_url_message("Maloja URL")
+                else:
+                    blocked = url_guard.check_url(maloja_url)
+                    error = _blocked_url_message(blocked, "Maloja URL") if blocked else None
+                if error:
+                    resp = jsonify({"error": error, "field": "maloja_url"})
+                    resp.status_code = 400
+                    abort(resp)
             conn.execute(
                 "UPDATE users SET lastfm_username = ?, lastfm_api_key = ?, listenbrainz_username = ?, "
+                "maloja_url = ?, "
                 "cover_view_mode = ?, show_reissue_year = ?, dashboard_widgets = ?, "
                 "hide_zero_match_playlists = ? WHERE id = ?",
                 (body.get("lastfm_username") or None, body.get("lastfm_api_key") or None,
-                 body.get("listenbrainz_username") or None,
+                 body.get("listenbrainz_username") or None, maloja_url,
                  body.get("cover_view_mode", "list"), 1 if body.get("show_reissue_year") else 0,
                  json.dumps(widgets), 1 if body.get("hide_zero_match_playlists") else 0, user_id),
             )
@@ -3854,14 +4267,26 @@ def _validate_dashboard_widgets_patch(body: dict) -> dict:
         clean: dict = {}
         for key, value in settings.items():
             if key == "cover_limit":
-                if value not in DASHBOARD_COVER_LIMITS or isinstance(value, bool):
+                # The single value an app built before the split sends.
+                if _cover_limit(value) is None:
                     abort(400, description=_("Cover limit is not one of the allowed values"))
                 clean[key] = value
-            elif key in MONTHS_WIDGETS:
-                months = _widget_months(value.get("months")) if isinstance(value, dict) else None
-                if months is None:
-                    abort(400, description=_("Months must be a whole number from 1 to 24"))
-                clean[key] = {"months": months}
+            elif key in COVER_WIDGETS:
+                if not isinstance(value, dict) or not value:
+                    abort(400, description=_("Unknown widget setting"))
+                entry: dict = {}
+                for field, v in value.items():
+                    if field == "cover_limit":
+                        if _cover_limit(v) is None:
+                            abort(400, description=_("Cover limit is not one of the allowed values"))
+                        entry[field] = v
+                    elif field == "months" and key in MONTHS_WIDGETS:
+                        if _widget_months(v) is None:
+                            abort(400, description=_("Months must be a whole number from 1 to 24"))
+                        entry[field] = v
+                    else:
+                        abort(400, description=_("Unknown widget setting"))
+                clean[key] = entry
             else:
                 abort(400, description=_("Unknown widget setting"))
         patch["settings"] = clean
@@ -3888,23 +4313,43 @@ def api_profile_dashboard_widgets():
         conn.close()
 
 
-def _apply_dashboard_widgets_patch(conn, user_id: int, body) -> dict:
+def _apply_dashboard_widgets_patch(conn, user_id: int, body, device_id: int | None = None) -> dict:
+    """Applies a PATCH to the account's browser set, or with [device_id] to
+    that paired device's own set -- the same validation, merge and
+    admin-only union either way."""
     if not isinstance(body, dict):
         abort(400, description=_("Widget settings must be an object"))
     patch = _validate_dashboard_widgets_patch(body)
-    row = conn.execute("SELECT dashboard_widgets FROM users WHERE id = ?", (user_id,)).fetchone()
-    widgets = _dashboard_widgets_dict(row["dashboard_widgets"])
+    if device_id is None:
+        widgets = _stored_dashboard_widgets(conn, user_id)
+    else:
+        widgets = _device_dashboard_widgets(conn, device_id, user_id, commit=False)
     if "disabled" in patch:
         widgets["disabled"] = patch["disabled"]
     if "order" in patch:
         widgets["order"] = patch["order"]
     if "settings" in patch:
-        widgets["settings"] = {**widgets["settings"], **patch["settings"]}
+        # Field by field within each widget, so a months change keeps that
+        # widget's cover count and the other way round. The single value an
+        # older app sends sets all three counts.
+        merged = {k: (dict(v) if isinstance(v, dict) else v) for k, v in widgets["settings"].items()}
+        changes = patch["settings"]
+        if "cover_limit" in changes:
+            for widget in COVER_WIDGETS:
+                merged.setdefault(widget, {})["cover_limit"] = changes["cover_limit"]
+        for widget, fields in changes.items():
+            if isinstance(fields, dict):
+                merged.setdefault(widget, {}).update(fields)
+        widgets["settings"] = merged
     if not _is_admin(conn, user_id):
         widgets["disabled"] = sorted(set(widgets["disabled"]) | ADMIN_ONLY_WIDGETS)
     widgets = _normalize_dashboard_widgets(widgets)
-    conn.execute("UPDATE users SET dashboard_widgets = ? WHERE id = ?",
-                 (json.dumps(widgets), user_id))
+    if device_id is None:
+        conn.execute("UPDATE users SET dashboard_widgets = ? WHERE id = ?",
+                     (json.dumps(widgets), user_id))
+    else:
+        conn.execute("UPDATE devices SET dashboard_widgets = ? WHERE id = ?",
+                     (json.dumps(widgets), device_id))
     conn.commit()
     return widgets
 
@@ -3912,6 +4357,22 @@ def _apply_dashboard_widgets_patch(conn, user_id: int, body) -> dict:
 def _stored_dashboard_widgets(conn, user_id: int) -> dict:
     row = conn.execute("SELECT dashboard_widgets FROM users WHERE id = ?", (user_id,)).fetchone()
     return _dashboard_widgets_dict(row["dashboard_widgets"])
+
+
+def _device_dashboard_widgets(conn, device_id: int, user_id: int, *, commit: bool = True) -> dict:
+    """A paired device's own Home widget set. A device that has never had
+    one -- a new pairing, or an upgrade -- gets a copy of the account's
+    current browser set, stored on this first read, so nobody's Home
+    rearranges itself and a later browser change no longer moves it."""
+    row = conn.execute("SELECT dashboard_widgets FROM devices WHERE id = ?", (device_id,)).fetchone()
+    if row["dashboard_widgets"] is not None:
+        return _dashboard_widgets_dict(row["dashboard_widgets"])
+    widgets = _stored_dashboard_widgets(conn, user_id)
+    conn.execute("UPDATE devices SET dashboard_widgets = ? WHERE id = ? AND dashboard_widgets IS NULL",
+                 (json.dumps(widgets), device_id))
+    if commit:
+        conn.commit()
+    return widgets
 
 
 @app.route("/api/dashboard/catalog")
@@ -4245,6 +4706,22 @@ def api_lastfm_status():
         conn.close()
 
 
+@app.route("/api/maloja/status")
+def api_maloja_status():
+    """Maloja counterpart of /api/lastfm/status, for the header badge:
+    configured when the Profile has a URL, ok when a Maloja answers there."""
+    conn = db.get_conn()
+    try:
+        user = conn.execute(
+            "SELECT maloja_url FROM users WHERE id = ?", (get_current_user_id(conn),)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not user["maloja_url"]:
+        return jsonify({"configured": False, "ok": False})
+    return jsonify({"configured": True, "ok": maloja.check_connection(user["maloja_url"])})
+
+
 @app.route("/api/listenbrainz/status")
 def api_listenbrainz_status():
     """ListenBrainz counterpart of /api/lastfm/status — same
@@ -4311,7 +4788,8 @@ def _scrobble_sources(conn, user_id: int) -> tuple:
     (lastfm.top_albums also has its own LASTFM_API_KEY env var as a last
     resort, for deployments that haven't set either yet)."""
     user = conn.execute(
-        "SELECT lastfm_username, lastfm_api_key, listenbrainz_username FROM users WHERE id = ?", (user_id,)
+        "SELECT lastfm_username, lastfm_api_key, listenbrainz_username, maloja_url FROM users WHERE id = ?",
+        (user_id,)
     ).fetchone()
     api_key = user["lastfm_api_key"] or db.get_config(conn, "lastfm_api_key_default") or ""
     lastfm_base = db.get_config(conn, "lastfm_api_base") or ""
@@ -4325,7 +4803,7 @@ def _scrobble_configured(conn, user_id: int) -> bool:
     App API returns it beside the items rather than leaving an empty list
     to mean two different things."""
     user, _, _, _ = _scrobble_sources(conn, user_id)
-    return bool(user["lastfm_username"] or user["listenbrainz_username"])
+    return bool(user["lastfm_username"] or user["listenbrainz_username"] or user["maloja_url"])
 
 
 def _suggestions_for(conn, user_id: int, period: str) -> list[dict]:
@@ -4357,6 +4835,13 @@ def _suggestions_for(conn, user_id: int, period: str) -> list[dict]:
             conn, user["listenbrainz_username"], limit=100, user_device_ids=user_device_ids,
             api_base=listenbrainz_base,
         )
+    # Maloja uses Last.fm's period names itself (maloja._from) and names its
+    # suggestions as the library does, so the dedup below catches them.
+    if user["maloja_url"]:
+        combined += maloja.suggestions(conn, user["maloja_url"], period, limit=200,
+                                       user_device_ids=user_device_ids)
+        combined += maloja.recently_played_suggestions(conn, user["maloja_url"], limit=100,
+                                                       user_device_ids=user_device_ids)
 
     seen = set()
     deduped = []
@@ -4402,6 +4887,8 @@ def _most_played_for(conn, user_id: int, period: str, limit: int) -> list[dict]:
             user["listenbrainz_username"], _LASTFM_PERIOD_TO_LISTENBRAINZ_RANGE[period],
             limit=50, api_base=listenbrainz_base,
         )
+    if user["maloja_url"]:
+        combined += maloja.most_played(conn, user["maloja_url"], period, limit=50)
 
     # Both services can be configured at once — same "more sources, dedup
     # keeps one copy" reasoning as /api/suggestions, re-sorted by
@@ -4639,7 +5126,7 @@ def _network_data_dir_warning() -> str | None:
 def _is_valid_url(url: str) -> bool:
     """#509: a malformed URL in any of the admin config's provider fields
     (subsonic_url, jellyfin_url, emby_url, plex_url, lms_url,
-    mirror_subsonic_url, mirror_jellyfin_url, mirror_emby_url, lidarr_url,
+    mirror_subsonic_url, mirror_jellyfin_url, mirror_emby_url, mirror_plex_url, lidarr_url,
     lastfm_api_base, listenbrainz_api_base) used to save happily and only
     surface later, at request time, as a connection error indistinguishable
     from "the target is genuinely unreachable" — reading as "the server is
@@ -4651,6 +5138,27 @@ def _is_valid_url(url: str) -> bool:
     other schemes) and a host must be present."""
     parsed = urlsplit(url)
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _config_field_error(field: str, message: str) -> NoReturn:
+    """A 400 from PUT /api/admin/config that names the setting it rejects,
+    by its adminConfig key, so the page can open the section holding that
+    field and focus it. `error` is the same translated message as before."""
+    resp = jsonify({"error": message, "field": field})
+    resp.status_code = 400
+    abort(resp)
+
+
+def _blocked_url_message(kind: str, field_label: str) -> str:
+    """Why url_guard refused a user-settable URL, per kind of address,
+    with the field named as _invalid_url_message() names it."""
+    reasons = {
+        "loopback": _("Loopback addresses, which lead back to the Trobar server itself, aren't allowed."),
+        "link-local": _("Link-local addresses aren't allowed."),
+        "unspecified": _("The unspecified address (0.0.0.0 or ::) isn't allowed."),
+        "multicast": _("Multicast addresses aren't allowed."),
+    }
+    return f"{reasons[kind]} ({field_label})"
 
 
 def _invalid_url_message(field_label: str) -> str:
@@ -4741,7 +5249,7 @@ def _apply_folder_settings(conn, body: dict) -> None:
     moves, since that is precisely when a good pair can become a bad one.
     With neither field in the body this does nothing at all, including no
     commit."""
-    keys = ("extra_playlist_folder", "mirror_folder")
+    keys = ("extra_playlist_folder", "mirror_folder", "mirror_share_location")
     if not any(k in body for k in keys):
         return
 
@@ -4756,7 +5264,7 @@ def _apply_folder_settings(conn, body: dict) -> None:
     # every playlist under it is then discovered twice, once per root.
     if "extra_playlist_folder" in body and extra is not None \
             and _folders_overlap(extra, music_root):
-        abort(400, description=_(
+        _config_field_error("extra_playlist_folder", _(
             "The extra playlist folder can't overlap your music library "
             "(MUSIC_ROOT) — playlists there are already discovered, and a "
             "folder on either side of it would import each one twice."))
@@ -4767,7 +5275,7 @@ def _apply_folder_settings(conn, body: dict) -> None:
     # narrower rule of the two, not an oversight.
     if "mirror_folder" in body and mirror_folder is not None \
             and (mirror_folder == music_root or music_root in mirror_folder.parents):
-        abort(400, description=_(
+        _config_field_error("mirror_folder", _(
             "The mirror folder can't be inside your music library "
             "(MUSIC_ROOT) — choose a separate folder."))
 
@@ -4776,9 +5284,36 @@ def _apply_folder_settings(conn, body: dict) -> None:
     # above exists to prevent, reachable through a second root.
     if extra is not None and mirror_folder is not None \
             and _folders_overlap(extra, mirror_folder):
-        abort(400, description=_(
+        _config_field_error("extra_playlist_folder", _(
             "The extra playlist folder and the mirror output folder can't overlap — "
             "Trobar would re-import the playlists it just wrote there."))
+
+    # Where the mirror folder sits inside the music share, for relative
+    # entries. Re-checked when the mirror folder moves too, since that is
+    # when a good location can become a bad one.
+    if "mirror_share_location" in body:
+        location = (body.get("mirror_share_location") or "").strip().strip("/")
+        body["mirror_share_location"] = location
+    else:
+        location = db.get_mirror_share_location() or ""
+    if location and ("mirror_share_location" in body or "mirror_folder" in body):
+        parts = Path(location).parts
+        # Leading and trailing slashes were stripped above: "/UserPlaylists/"
+        # means UserPlaylists. A backslash would be one folder name on the
+        # share but a separator on a Windows client.
+        if ".." in parts or "\\" in location:
+            _config_field_error("mirror_share_location", _(
+                "Enter the mirror folder's location as a path inside your music folder, "
+                "e.g. Playlists/Trobar, with no \"..\" and no backslash."))
+        if mirror_folder is None:
+            _config_field_error("mirror_share_location", _(
+                "Set a mirror output folder first: the location says where that folder "
+                "sits inside your music share."))
+        if not mirror.seen_in_library(mirror_folder, music_root, location):
+            _config_field_error("mirror_share_location", _(
+                "That folder inside your music library isn't the mirror output folder: "
+                "a test file written to the mirror folder didn't appear there. Check that "
+                "both mounts point at the same folder on your share."))
 
     # Past every check: write only the fields this request actually sent,
     # and store the OVERRIDE (None for a cleared field) rather than the
@@ -4786,7 +5321,10 @@ def _apply_folder_settings(conn, body: dict) -> None:
     for key in keys:
         if key in body:
             raw = (body.get(key) or "").strip()
-            db.set_config(conn, key, os.path.normpath(raw) if raw else None)
+            if key == "mirror_share_location":
+                db.set_config(conn, key, raw or None)
+            else:
+                db.set_config(conn, key, os.path.normpath(raw) if raw else None)
     conn.commit()
 
 
@@ -4814,22 +5352,24 @@ def api_admin_config():
         if request.method == "PUT":
             body = request.get_json(force=True)
 
+            # Once setup is complete, the library source changes only
+            # through POST /api/admin/provider/switch, which tests the new
+            # connection first and reports what it removes. A different
+            # `provider` here (an old cached page, a script) is refused
+            # rather than ignored, so the caller learns the switch didn't
+            # happen. The same value is accepted: the page sends its whole
+            # config object on every Save.
             new_provider = body.get("provider")
-            if new_provider in _PROVIDERS:
-                old_provider = db.get_config(conn, "provider") or "roon"
-                if new_provider != old_provider:
-                    # Clean slate on switch — the previous provider's
-                    # playlist rows would otherwise look like stale/wrong
-                    # data under the new provider (title-keyed table is now
-                    # shared), and cached artist images are tied to
-                    # whichever provider supplied them, not to the artist
-                    # name alone.
-                    conn.execute("DELETE FROM playlist_tracks")
-                    conn.execute("DELETE FROM playlists")
-                    shutil.rmtree(artist_images.CACHE_DIR, ignore_errors=True)
-                    db.set_config(conn, "artist_images_epoch", str(int(time.time())))
-                db.set_config(conn, "provider", new_provider)
-                conn.commit()
+            if new_provider is not None and new_provider != _active_provider_id(conn):
+                if db.get_config(conn, "setup_completed"):
+                    _config_field_error("provider", _(
+                        "The library source can't be changed with Save. "
+                        "Use Change library source, which tests the new "
+                        "connection and shows what the switch removes first."))
+                # First-run setup's own picker: nothing synced yet worth
+                # a review, but the same scoped removal as a switch.
+                if new_provider in _PROVIDERS:
+                    _switch_provider_rows(conn, new_provider)
 
             host = (body.get("roon_host") or "").strip()
             port = body.get("roon_port")
@@ -4841,7 +5381,7 @@ def api_admin_config():
             subsonic_password = body.get("subsonic_password")
             if subsonic_url and subsonic_username and subsonic_password:
                 if not _is_valid_url(subsonic_url):
-                    abort(400, description=_invalid_url_message("Subsonic URL"))
+                    _config_field_error("subsonic_url", _invalid_url_message("Subsonic URL"))
                 subsonic_client.reconnect(subsonic_url, subsonic_username, subsonic_password)
 
             jellyfin_url = (body.get("jellyfin_url") or "").strip()
@@ -4849,7 +5389,7 @@ def api_admin_config():
             jellyfin_username = (body.get("jellyfin_username") or "").strip()
             if jellyfin_url and jellyfin_api_key and jellyfin_username:
                 if not _is_valid_url(jellyfin_url):
-                    abort(400, description=_invalid_url_message("Jellyfin URL"))
+                    _config_field_error("jellyfin_url", _invalid_url_message("Jellyfin URL"))
                 jellyfin_client.reconnect(jellyfin_url, jellyfin_api_key, jellyfin_username)
 
             # #168: Emby — Jellyfin's upstream, same config shape (url +
@@ -4859,7 +5399,7 @@ def api_admin_config():
             emby_username = (body.get("emby_username") or "").strip()
             if emby_url and emby_api_key and emby_username:
                 if not _is_valid_url(emby_url):
-                    abort(400, description=_invalid_url_message("Emby URL"))
+                    _config_field_error("emby_url", _invalid_url_message("Emby URL"))
                 emby_client.reconnect(emby_url, emby_api_key, emby_username)
 
             # #158: no username, unlike Jellyfin/Emby above — the token is
@@ -4868,7 +5408,7 @@ def api_admin_config():
             plex_token = (body.get("plex_token") or "").strip()
             if plex_url and plex_token:
                 if not _is_valid_url(plex_url):
-                    abort(400, description=_invalid_url_message("Plex URL"))
+                    _config_field_error("plex_url", _invalid_url_message("Plex URL"))
                 plex_client.reconnect(plex_url, plex_token)
 
             # #172: username/password optional — only sent as Basic Auth
@@ -4879,7 +5419,7 @@ def api_admin_config():
             lms_url = (body.get("lms_url") or "").strip()
             if lms_url:
                 if not _is_valid_url(lms_url):
-                    abort(400, description=_invalid_url_message("LMS URL"))
+                    _config_field_error("lms_url", _invalid_url_message("LMS URL"))
                 lms_client.reconnect(lms_url, (body.get("lms_username") or "").strip(),
                                       body.get("lms_password") or "")
 
@@ -4917,13 +5457,13 @@ def api_admin_config():
             if "lastfm_api_base" in body:
                 lastfm_api_base = (body.get("lastfm_api_base") or "").strip()
                 if lastfm_api_base and not _is_valid_url(lastfm_api_base):
-                    abort(400, description=_invalid_url_message("Last.fm API base URL"))
+                    _config_field_error("lastfm_api_base", _invalid_url_message("Last.fm API base URL"))
                 db.set_config(conn, "lastfm_api_base", lastfm_api_base or None)
                 conn.commit()
             if "listenbrainz_api_base" in body:
                 listenbrainz_api_base = (body.get("listenbrainz_api_base") or "").strip()
                 if listenbrainz_api_base and not _is_valid_url(listenbrainz_api_base):
-                    abort(400, description=_invalid_url_message("ListenBrainz API base URL"))
+                    _config_field_error("listenbrainz_api_base", _invalid_url_message("ListenBrainz API base URL"))
                 db.set_config(conn, "listenbrainz_api_base", listenbrainz_api_base or None)
                 conn.commit()
 
@@ -4974,7 +5514,7 @@ def api_admin_config():
                 try:
                     val = max(1, int(body.get("transcode_concurrency")))
                 except (TypeError, ValueError):
-                    return jsonify({"error": _("Concurrency must be a whole number of 1 or more.")}), 400
+                    _config_field_error("transcode_concurrency", _("Concurrency must be a whole number of 1 or more."))
                 db.set_config(conn, "transcode_concurrency", str(val))
                 conn.commit()
 
@@ -4982,9 +5522,9 @@ def api_admin_config():
                 try:
                     val = int(body.get("transcode_nice_level"))
                 except (TypeError, ValueError):
-                    return jsonify({"error": _("Nice level must be a whole number.")}), 400
+                    _config_field_error("transcode_nice_level", _("Nice level must be a whole number."))
                 if not (0 <= val <= 19):
-                    return jsonify({"error": _("Nice level must be between 0 and 19.")}), 400
+                    _config_field_error("transcode_nice_level", _("Nice level must be between 0 and 19."))
                 db.set_config(conn, "transcode_nice_level", str(val))
                 conn.commit()
 
@@ -4994,9 +5534,9 @@ def api_admin_config():
                 try:
                     val = int(body.get("job_retention_days"))
                 except (TypeError, ValueError):
-                    return jsonify({"error": _("Retention must be a whole number of days.")}), 400
+                    _config_field_error("job_retention_days", _("Retention must be a whole number of days."))
                 if not (1 <= val <= 3650):
-                    return jsonify({"error": _("Retention must be between 1 and 3650 days.")}), 400
+                    _config_field_error("job_retention_days", _("Retention must be between 1 and 3650 days."))
                 db.set_config(conn, "job_retention_days", str(val))
                 conn.commit()
 
@@ -5007,9 +5547,9 @@ def api_admin_config():
                 try:
                     val = int(body.get("scan_interval_hours"))
                 except (TypeError, ValueError):
-                    return jsonify({"error": _("Scan interval must be a whole number of hours.")}), 400
+                    _config_field_error("scan_interval_hours", _("Scan interval must be a whole number of hours."))
                 if not (0 <= val <= 8760):  # 8760h = 1 year; 0 = off
-                    return jsonify({"error": _("Scan interval must be between 0 (off) and 8760 hours.")}), 400
+                    _config_field_error("scan_interval_hours", _("Scan interval must be between 0 (off) and 8760 hours."))
                 db.set_config(conn, "scan_interval_hours", str(val))
                 conn.commit()
 
@@ -5044,7 +5584,7 @@ def api_admin_config():
             mirror_subsonic_password = body.get("mirror_subsonic_password") or ""
             if mirror_subsonic_url and mirror_subsonic_username and mirror_subsonic_password:
                 if not _is_valid_url(mirror_subsonic_url):
-                    abort(400, description=_invalid_url_message("Subsonic mirror-target URL"))
+                    _config_field_error("mirror_subsonic_url", _invalid_url_message("Subsonic mirror-target URL"))
                 subsonic_client.mirror_reconnect(
                     mirror_subsonic_url, mirror_subsonic_username, mirror_subsonic_password)
             elif "mirror_subsonic_url" in body and not mirror_subsonic_url \
@@ -5073,7 +5613,7 @@ def api_admin_config():
             mirror_jellyfin_username = (body.get("mirror_jellyfin_username") or "").strip()
             if mirror_jellyfin_url and mirror_jellyfin_api_key and mirror_jellyfin_username:
                 if not _is_valid_url(mirror_jellyfin_url):
-                    abort(400, description=_invalid_url_message("Jellyfin mirror-target URL"))
+                    _config_field_error("mirror_jellyfin_url", _invalid_url_message("Jellyfin mirror-target URL"))
                 jellyfin_client.mirror_reconnect(
                     mirror_jellyfin_url, mirror_jellyfin_api_key, mirror_jellyfin_username)
             elif "mirror_jellyfin_url" in body and not mirror_jellyfin_url \
@@ -5094,7 +5634,7 @@ def api_admin_config():
             mirror_emby_username = (body.get("mirror_emby_username") or "").strip()
             if mirror_emby_url and mirror_emby_api_key and mirror_emby_username:
                 if not _is_valid_url(mirror_emby_url):
-                    abort(400, description=_invalid_url_message("Emby mirror-target URL"))
+                    _config_field_error("mirror_emby_url", _invalid_url_message("Emby mirror-target URL"))
                 emby_client.mirror_reconnect(
                     mirror_emby_url, mirror_emby_api_key, mirror_emby_username)
             elif "mirror_emby_url" in body and not mirror_emby_url \
@@ -5103,6 +5643,22 @@ def api_admin_config():
                 db.set_config(conn, "mirror_emby_api_key", None)
                 db.set_config(conn, "mirror_emby_username", None)
                 db.set_config(conn, "mirror_emby_user_id", None)
+                conn.commit()
+
+            # The Plex mirror target: its own URL and token, the same shape
+            # as the Emby block above (a write destination distinct from
+            # plex_url/plex_token, cleared when both fields are blank).
+            mirror_plex_url = (body.get("mirror_plex_url") or "").strip()
+            mirror_plex_token = (body.get("mirror_plex_token") or "").strip()
+            if mirror_plex_url and mirror_plex_token:
+                if not _is_valid_url(mirror_plex_url):
+                    _config_field_error("mirror_plex_url", _invalid_url_message("Plex mirror-target URL"))
+                db.set_config(conn, "mirror_plex_url", mirror_plex_url)
+                db.set_config(conn, "mirror_plex_token", mirror_plex_token)
+                conn.commit()
+            elif "mirror_plex_url" in body and not mirror_plex_url and not mirror_plex_token:
+                db.set_config(conn, "mirror_plex_url", None)
+                db.set_config(conn, "mirror_plex_token", None)
                 conn.commit()
 
             # #494: the Lidarr connection for "Request missing albums" —
@@ -5118,7 +5674,7 @@ def api_admin_config():
             lidarr_api_key = (body.get("lidarr_api_key") or "").strip()
             if lidarr_url and lidarr_api_key:
                 if not _is_valid_url(lidarr_url):
-                    abort(400, description=_invalid_url_message("Lidarr URL"))
+                    _config_field_error("lidarr_url", _invalid_url_message("Lidarr URL"))
                 lidarr_client.reconnect(lidarr_url, lidarr_api_key)
             elif "lidarr_url" in body and not lidarr_url and not lidarr_api_key:
                 db.set_config(conn, "lidarr_url", None)
@@ -5140,11 +5696,27 @@ def api_admin_config():
                     quality_id = int(lidarr_quality_profile_id)
                     metadata_id = int(lidarr_metadata_profile_id)
                 except (TypeError, ValueError):
-                    abort(400, description=_("Invalid Lidarr profile selection."))
+                    _config_field_error("lidarr_quality_profile_id", _("Invalid Lidarr profile selection."))
                 db.set_config(conn, "lidarr_root_folder_path", lidarr_root_folder_path)
                 db.set_config(conn, "lidarr_quality_profile_id", str(quality_id))
                 db.set_config(conn, "lidarr_metadata_profile_id", str(metadata_id))
                 conn.commit()
+                # Gaps synced before Lidarr was set up get their albums
+                # looked up now, not at the next sync.
+                album_lookup.enqueue(conn)
+
+            # Music Assistant: an extra playlist source merged in whichever
+            # provider is active, so its connection sits outside the
+            # provider selector. URL and token are saved together; both
+            # blank disconnects.
+            ma_url = (body.get("music_assistant_url") or "").strip()
+            ma_token = (body.get("music_assistant_token") or "").strip()
+            if ma_url and ma_token:
+                if not _is_valid_url(ma_url):
+                    _config_field_error("music_assistant_url", _invalid_url_message("Music Assistant URL"))
+                music_assistant_client.reconnect(ma_url, ma_token)
+            elif "music_assistant_url" in body and not ma_url and not ma_token:
+                music_assistant_client.reconnect("", "")
 
         roon_status = roon_client.status()
         subsonic_status = subsonic_client.status()
@@ -5153,7 +5725,9 @@ def api_admin_config():
         jellyfin_mirror_status = jellyfin_client.mirror_status()
         emby_status = emby_client.status()
         emby_mirror_status = emby_client.mirror_status()
+        plex_mirror_status = plex_client.mirror_status()
         lidarr_status = lidarr_client.status()
+        music_assistant_status = music_assistant_client.status()
         plex_status = plex_client.status()
         lms_status = lms_client.status()
         filesystem_status = filesystem_client.status()
@@ -5182,6 +5756,7 @@ def api_admin_config():
             # only in the environment still shows in the admin form.
             "extra_playlist_folder": str(db.get_extra_playlist_folder() or "") or "",
             "mirror_folder": str(db.get_mirror_folder() or "") or "",
+            "mirror_share_location": db.get_mirror_share_location() or "",
             # #189: echoed back the same way every other provider's
             # connection is (subsonic_url/username/password above) — the
             # admin config form can't stay pre-filled across a reload
@@ -5205,6 +5780,9 @@ def api_admin_config():
             "mirror_emby_api_key": db.get_config(conn, "mirror_emby_api_key") or "",
             "mirror_emby_username": db.get_config(conn, "mirror_emby_username") or "",
             "mirror_emby_state": emby_mirror_status["state"],
+            "mirror_plex_url": plex_mirror_status["url"],
+            "mirror_plex_token": db.get_config(conn, "mirror_plex_token") or "",
+            "mirror_plex_state": plex_mirror_status["state"],
             # #494: not a mirror target — echoed the same way regardless,
             # same reasoning (the admin config form can't stay pre-filled
             # across a reload otherwise).
@@ -5214,6 +5792,9 @@ def api_admin_config():
             "lidarr_root_folder_path": db.get_config(conn, "lidarr_root_folder_path") or "",
             "lidarr_quality_profile_id": db.get_config(conn, "lidarr_quality_profile_id") or "",
             "lidarr_metadata_profile_id": db.get_config(conn, "lidarr_metadata_profile_id") or "",
+            "music_assistant_url": music_assistant_status["url"],
+            "music_assistant_token": db.get_config(conn, "music_assistant_token") or "",
+            "music_assistant_state": music_assistant_status["state"],
             "tidal_client_id": db.get_config(conn, "tidal_client_id") or "",
             "tidal_client_secret": db.get_config(conn, "tidal_client_secret") or "",
             "spotify_client_id": db.get_config(conn, "spotify_client_id") or "",
@@ -5283,8 +5864,10 @@ _TEST_CONNECTION_PROVIDERS: dict[str, tuple[Any, str, tuple[str, ...], tuple[str
     "mirror_emby": (emby_client, "test_connection", ("url", "api_key", "username"),
                     ("url", "api_key", "username")),
     "plex": (plex_client, "test_connection", ("url", "token"), ("url", "token")),
+    "mirror_plex": (plex_client, "test_connection", ("url", "token"), ("url", "token")),
     "lms": (lms_client, "test_connection", ("url", "username", "password"), ("url",)),
     "lidarr": (lidarr_client, "test_connection", ("url", "api_key"), ("url", "api_key")),
+    "music_assistant": (music_assistant_client, "test_connection", ("url", "token"), ("url", "token")),
 }
 
 
@@ -5326,6 +5909,198 @@ def api_admin_config_test_connection():
     args = [values[f].strip() if f != "password" else values[f] for f in field_names]
     args[0] = url
     return jsonify(getattr(module, fn_name)(*args))
+
+
+# The connection fields the Change library source flow sends per target,
+# and which of them are required. A subset of what PUT /api/admin/config
+# takes, under the same names test-connection uses. Filesystem needs none:
+# it reads the music folder Trobar already has.
+_SWITCH_FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "roon": (("host", "port"), ("host", "port")),
+    "subsonic": (("url", "username", "password"), ("url", "username", "password")),
+    "jellyfin": (("url", "api_key", "username"), ("url", "api_key", "username")),
+    "emby": (("url", "api_key", "username"), ("url", "api_key", "username")),
+    "plex": (("url", "token"), ("url", "token")),
+    "lms": (("url", "username", "password"), ("url",)),
+    "music_assistant": (("url", "token"), ("url", "token")),
+    "filesystem": ((), ()),
+}
+# test_connection states that let a switch go ahead. Roon can only be
+# "reachable" before the switch: see roon_client.test_connection.
+_SWITCH_OK_STATES = ("paired", "reachable")
+
+
+def _switch_values(target: str, body: dict) -> dict:
+    """The target's connection fields from the request, stripped (passwords
+    kept as typed), or a 400 naming what is missing or malformed."""
+    field_names, required = _SWITCH_FIELDS[target]
+    values = {}
+    for f in field_names:
+        raw = body.get(f)
+        raw = "" if raw is None else str(raw)
+        values[f] = raw if f == "password" else raw.strip()
+    if any(not values[f].strip() for f in required):
+        abort(400, description=_("All fields are required to test the connection."))
+    if "url" in values and not _is_valid_url(values["url"]):
+        abort(400, description=_invalid_url_message("Server URL"))
+    if target == "roon" and not values["port"].isdigit():
+        abort(400, description=_("The port must be a number."))
+    return values
+
+
+def _test_switch_target(target: str, values: dict) -> dict:
+    """The live check the flow's Connect step shows and the switch repeats,
+    against the values as typed and persisting nothing."""
+    if target == "filesystem":
+        return {"state": "paired", "provider": "filesystem"}
+    if target == "roon":
+        return roon_client.test_connection(values["host"], int(values["port"]))
+    module, fn_name, field_names, _required = _TEST_CONNECTION_PROVIDERS[target]
+    return getattr(module, fn_name)(*[values[f] for f in field_names])
+
+
+def _connect_switch_target(target: str, values: dict) -> None:
+    """Stores the target's connection and connects, through each client's
+    own reconnect(), the same call PUT /api/admin/config makes."""
+    if target == "roon":
+        roon_client.reconnect(values["host"], int(values["port"]))
+    elif target == "filesystem":
+        filesystem_client.reconnect()
+    else:
+        _PROVIDERS[target].reconnect(*[values[f] for f in _SWITCH_FIELDS[target][0]])
+
+
+def _switch_provider_rows(conn, target: str, carry_pairs=()) -> int:
+    """Makes `target` the library source: carries the paired playlists over
+    (playlist_sync.carry_over_playlists), removes the old provider's other
+    playlists (playlist_sync.remove_provider_playlists: only its own rows,
+    devices told), clears the artist-image cache, which holds whichever
+    provider supplied each image, and stores the new provider. Returns how
+    many playlists it removed."""
+    playlist_sync.carry_over_playlists(conn, target, carry_pairs)
+    removed = playlist_sync.remove_provider_playlists(conn, _active_provider_id(conn))
+    shutil.rmtree(artist_images.CACHE_DIR, ignore_errors=True)
+    db.set_config(conn, "artist_images_epoch", str(int(time.time())))
+    db.set_config(conn, "provider", target)
+    conn.commit()
+    return removed
+
+
+def _plan_carry_over(conn, target: str, values: dict | None = None) -> dict:
+    """playlist_sync.plan_carry_over against the target. With `values`, it
+    reads the target through those unsaved values (the preview, before
+    anything is stored); without, through its stored connection (the
+    switch, after storing it)."""
+    old = _active_provider_id(conn)
+    client = _PROVIDERS[target]
+    if values is None or target in ("roon", "filesystem"):
+        return playlist_sync.plan_carry_over(conn, old, target, client)
+    names = _SWITCH_FIELDS[target][0]
+    unsaved = tuple(values[f] for f in names)
+    if target in playlist_sync.PER_USER_COLUMNS:
+        # These clients' stored config holds the resolved user id.
+        url, api_key, username = unsaved
+        unsaved = (url, api_key, client._resolve_user_id(url, api_key, username))
+    with provider_config.using(target, unsaved):
+        return playlist_sync.plan_carry_over(conn, old, target, client)
+
+
+def _switch_target(conn, body: dict) -> str:
+    target = body.get("provider")
+    if target not in _SWITCH_FIELDS:
+        abort(400, description=_("Unknown provider."))
+    if target == _active_provider_id(conn):
+        abort(409, description=_("That is already the library source."))
+    return target
+
+
+@app.route("/api/admin/provider/switch/test", methods=["POST"])
+def api_admin_provider_switch_test():
+    """The Change library source flow's Connect step: test the target's
+    connection as typed, without saving anything."""
+    conn = db.get_conn()
+    try:
+        require_admin(conn)
+        body = request.get_json(force=True) or {}
+        target = _switch_target(conn, body)
+    finally:
+        conn.close()
+    result = _test_switch_target(target, _switch_values(target, body))
+    return jsonify({**result, "ok": result.get("state") in _SWITCH_OK_STATES})
+
+
+@app.route("/api/admin/provider/switch/preview", methods=["POST"])
+def api_admin_provider_switch_preview():
+    """The flow's review step: what switching to the target would carry
+    over, remove and keep, counted now. Takes the same body as the switch,
+    since the carry-over is computed from the target's own playlists, read
+    with the connection as typed. Changes nothing. A POST so the
+    credentials stay out of the URL."""
+    conn = db.get_conn()
+    try:
+        require_admin(conn)
+        body = request.get_json(force=True) or {}
+        target = _switch_target(conn, body)
+        values = _switch_values(target, body)
+        carry = _plan_carry_over(conn, target, values)
+        return jsonify(playlist_sync.switch_preview(conn, _active_provider_id(conn), carry))
+    finally:
+        conn.close()
+
+
+@app.route("/api/admin/provider/switch", methods=["POST"])
+def api_admin_provider_switch():
+    """Switch the library source: the flow's confirm step. Re-tests the
+    target's connection (the Connect step's result may be stale) and plans
+    the carry-over again, refusing (409, `code: plan_changed`) unless it
+    carries over exactly the old playlists the body's `carry` lists (the
+    ids the review step showed). Then it stores the connection, carries the
+    old provider's playlists over to their namesakes in the target, removes
+    the rest, makes the target active and starts the first playlist sync. Returns the preview as it
+    stood just before the switch, which is what it carried over and
+    removed, and the sync job. Refused while a playlist sync runs: that sync would write
+    the old provider's rows back after the removal."""
+    conn = db.get_conn()
+    try:
+        require_admin(conn)
+        body = request.get_json(force=True) or {}
+        target = _switch_target(conn, body)
+        values = _switch_values(target, body)
+        if playlist_sync.sync_status()["running"]:
+            abort(409, description=_(
+                "A playlist sync is running. Switch when it has finished."))
+        check = _test_switch_target(target, values)
+        if check.get("state") not in _SWITCH_OK_STATES:
+            return jsonify({"error": _("The connection test failed, so nothing was changed."),
+                            "state": check.get("state")}), 400
+        # Planned again, through the connection as typed (nothing stored
+        # yet), against the target as it is now. It must carry over exactly
+        # the playlists the review step showed and the admin confirmed
+        # (`carry`, their old ids): a target that answers differently now (a
+        # failed listing, a playlist renamed or edited there) would otherwise
+        # remove playlists the review promised to keep. So a different plan
+        # changes nothing and asks for a fresh review.
+        carry = _plan_carry_over(conn, target, values)
+        confirmed = {int(i) for i in body.get("carry") or [] if str(i).isdigit()}
+        if {old_id for old_id, _src, _title in carry["pairs"]} != confirmed:
+            resp = jsonify({"error": _("What can be carried over has changed since the review, so "
+                                       "nothing was changed. Review it again."),
+                            "code": "plan_changed"})
+            resp.status_code = 409
+            abort(resp)
+        # Again, now the test and the planning are done: both read over the
+        # network and can take seconds, and a sync started meanwhile would
+        # list the old provider (see _run_playlist_sync) mid-switch.
+        if playlist_sync.sync_status()["running"]:
+            abort(409, description=_(
+                "A playlist sync is running. Switch when it has finished."))
+        report = playlist_sync.switch_preview(conn, _active_provider_id(conn), carry)
+        _connect_switch_target(target, values)
+        _switch_provider_rows(conn, target, carry["pairs"])
+    finally:
+        conn.close()
+    sync = playlist_sync.start_sync(_PROVIDERS[target], target)
+    return jsonify({**report, "provider": target, "sync": sync})
 
 
 _HEALTH_ITEM_LIMIT = 200  # cap the per-category worklist so the payload stays small
@@ -5471,6 +6246,98 @@ def api_admin_health():
         conn.close()
 
 
+# The mirror sinks, in the order the Playlist mirrors tab lists them: key
+# (the prefix of each playlist's *_mirror_* columns, "mirror" for the
+# folder), and how to read the target's configuration and live status.
+# A new sink is one more entry here and in the page's mirrorSinkDefs.
+_MIRROR_SINKS = (
+    ("filesystem", "mirror", None),
+    ("subsonic", "subsonic_mirror", lambda: subsonic_client.mirror_status()),
+    ("jellyfin", "jellyfin_mirror", lambda: jellyfin_client.mirror_status()),
+    ("emby", "emby_mirror", lambda: emby_client.mirror_status()),
+    ("music_assistant", "music_assistant_mirror", lambda: music_assistant_client.mirror_status()),
+    ("plex", "plex_mirror", lambda: plex_client.mirror_status()),
+)
+
+
+def _failed_writes(rows: list, prefix: str) -> tuple[int, str | None]:
+    """How many of these playlists' last write to one sink failed, and the
+    most recent failure's message (the playlist written last first)."""
+    failed = [r for r in rows if r.get(f"{prefix}_enabled")
+              and (r.get(f"{prefix}_last_error_code") or r.get(f"{prefix}_last_error"))]
+    failed.sort(key=lambda r: r.get(f"{prefix}_last_written_at") or "", reverse=True)
+    return len(failed), (failed[0].get(f"{prefix}_last_error") if failed else None)
+
+
+def _mirror_targets(rows: list, lidarr_configured: bool) -> list:
+    """The configured targets, each with a state the tab can show at a
+    glance: "ok", "warning" (reachable, but something needs attention) or
+    "error" (unreachable, or the folder can't be written). Unconfigured
+    targets are listed with configured=false so the page can offer them,
+    never as a state.
+
+    The three servers and Lidarr are probed live, as the Configuration page
+    does on every load (nothing caches these statuses); only configured
+    ones, and in parallel, so one slow target doesn't add to the others.
+    The folder is checked locally. A reachable target whose last write
+    failed for some playlist is a warning, with that failure's message."""
+    folder = db.get_mirror_folder()
+    configured = {
+        "filesystem": folder is not None,
+        "subsonic": db.get_mirror_subsonic_config() is not None,
+        "jellyfin": db.get_mirror_jellyfin_config() is not None,
+        "emby": db.get_mirror_emby_config() is not None,
+        "music_assistant": db.get_mirror_music_assistant_config() is not None,
+        "plex": db.get_mirror_plex_config() is not None,
+        "lidarr": db.get_lidarr_connection() is not None,
+    }
+    probes = {key: probe for key, _prefix, probe in _MIRROR_SINKS if probe and configured[key]}
+    if configured["lidarr"]:
+        probes["lidarr"] = lambda: lidarr_client.status()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(probes))) as pool:
+        futures = {key: pool.submit(probe) for key, probe in probes.items()}
+        status = {key: f.result() for key, f in futures.items()}
+
+    targets = []
+    for key, prefix, _probe in _MIRROR_SINKS:
+        target = {"key": key, "kind": "mirror", "configured": configured[key],
+                  "state": None, "detail_code": None, "detail": None, "count": 0}
+        if configured[key]:
+            if key == "filesystem":
+                assert folder is not None  # configured["filesystem"] says so
+                reachable = folder.is_dir() and os.access(folder, os.W_OK)
+                target["where"] = str(folder)
+                unreachable_code = "not_writable"
+            else:
+                reachable = status[key]["state"] == "paired"
+                target["where"] = status[key].get("url") or ""
+                unreachable_code = "unreachable"
+            failed, message = _failed_writes(rows, prefix)
+            if not reachable:
+                target.update(state="error", detail_code=unreachable_code, detail=message)
+            elif failed:
+                target.update(state="warning", detail_code="write_failed", detail=message, count=failed)
+            else:
+                target["state"] = "ok"
+        targets.append(target)
+
+    lidarr = {"key": "lidarr", "kind": "request", "configured": configured["lidarr"],
+              "state": None, "detail_code": None, "detail": None, "count": 0}
+    if configured["lidarr"]:
+        failed_requests = [r for r in rows if r.get("lidarr_request_enabled") and r.get("lidarr_request_last_error_code")]
+        if status["lidarr"]["state"] != "paired":
+            lidarr.update(state="error", detail_code="unreachable")
+        elif not lidarr_configured:
+            lidarr.update(state="warning", detail_code="incomplete")
+        elif failed_requests:
+            lidarr.update(state="warning", detail_code="request_failed", count=len(failed_requests),
+                          detail=failed_requests[0].get("lidarr_request_last_error"))
+        else:
+            lidarr["state"] = "ok"
+    targets.append(lidarr)
+    return targets
+
+
 @app.route("/api/admin/mirrors")
 def api_admin_mirrors():
     """#285/#189: admin-only read-only overview of every playlist with ANY
@@ -5483,6 +6350,7 @@ def api_admin_mirrors():
     conn = db.get_conn()
     try:
         require_admin(conn)
+        lidarr_configured = db.get_lidarr_config() is not None
         rows = conn.execute(
             "SELECT p.id, p.title, "
             "p.mirror_enabled, p.mirror_filename, p.mirror_last_written_at, "
@@ -5496,6 +6364,11 @@ def api_admin_mirrors():
             "p.emby_mirror_enabled, p.emby_mirror_remote_id, "
             "p.emby_mirror_last_written_at, p.emby_mirror_last_error, "
             "p.emby_mirror_last_error_code, "
+            "p.music_assistant_mirror_enabled, p.music_assistant_mirror_remote_id, "
+            "p.music_assistant_mirror_last_written_at, p.music_assistant_mirror_last_error, "
+            "p.music_assistant_mirror_last_error_code, "
+            "p.plex_mirror_enabled, p.plex_mirror_remote_id, p.plex_mirror_last_written_at, "
+            "p.plex_mirror_last_error, p.plex_mirror_last_error_code, "
             # #494: not a mirror sink, but shown here for the same
             # full-admin-panel-visibility reason as the four above —
             # there's no single remote id (a run can request several
@@ -5509,8 +6382,12 @@ def api_admin_mirrors():
             "FROM playlists p LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id "
             "WHERE p.mirror_enabled = 1 OR p.subsonic_mirror_enabled = 1 "
             "OR p.jellyfin_mirror_enabled = 1 OR p.emby_mirror_enabled = 1 "
-            "OR p.lidarr_request_enabled = 1 "
-            "GROUP BY p.id ORDER BY p.title"
+            "OR p.music_assistant_mirror_enabled = 1 OR p.plex_mirror_enabled = 1 "
+            # A stale flag lists nothing while Lidarr requests are not
+            # configured: the flag does nothing then.
+            "OR (p.lidarr_request_enabled = 1 AND :lidarr_configured) "
+            "GROUP BY p.id ORDER BY p.title",
+            {"lidarr_configured": lidarr_configured},
         ).fetchall()
         out = []
         for r in rows:
@@ -5519,18 +6396,24 @@ def api_admin_mirrors():
             d["subsonic_mirror_enabled"] = bool(d["subsonic_mirror_enabled"])
             d["jellyfin_mirror_enabled"] = bool(d["jellyfin_mirror_enabled"])
             d["emby_mirror_enabled"] = bool(d["emby_mirror_enabled"])
+            d["music_assistant_mirror_enabled"] = bool(d["music_assistant_mirror_enabled"])
+            d["plex_mirror_enabled"] = bool(d["plex_mirror_enabled"])
             d["lidarr_request_enabled"] = bool(d["lidarr_request_enabled"])
             out.append(d)
         subsonic_config = db.get_mirror_subsonic_config()
         jellyfin_config = db.get_mirror_jellyfin_config()
         emby_config = db.get_mirror_emby_config()
+        plex_config = db.get_mirror_plex_config()
         lidarr_connection = db.get_lidarr_connection()
         return jsonify({
             "mirror_folder": str(db.get_mirror_folder() or "") or None,
             "subsonic_mirror_url": subsonic_config[0] if subsonic_config else None,
             "jellyfin_mirror_url": jellyfin_config[0] if jellyfin_config else None,
             "emby_mirror_url": emby_config[0] if emby_config else None,
+            "plex_mirror_url": plex_config[0] if plex_config else None,
             "lidarr_url": lidarr_connection[0] if lidarr_connection else None,
+            "lidarr_request_configured": lidarr_configured,
+            "targets": _mirror_targets(out, lidarr_configured),
             "playlists": out,
         })
     finally:
@@ -6112,9 +6995,11 @@ def _authenticated_device(conn):
 # own contract -- and never folded into get_current_user_id, for the same
 # reason the integration token is not: every session-authenticated route,
 # mutating ones included, resolves identity there. Bump APP_API_VERSION on
-# any breaking change to a route under the prefix; /api/device/info
-# advertises it so a client can refuse gracefully instead of probing.
-APP_API_VERSION = 1
+# any breaking change to a route under the prefix, and when a section
+# arrives that a client gates a whole screen on (2: the playlist section);
+# /api/device/info advertises it so a client can refuse gracefully instead
+# of probing.
+APP_API_VERSION = 2
 
 
 def _authenticated_app_user(conn):
@@ -6210,6 +7095,8 @@ def api_device_info():
     try:
         device = _authenticated_device(conn)
         return jsonify({"name": device["name"], "device_type": device["device_type"],
+                         # A picture only, alongside the type: null = the type's own.
+                         "icon": device["icon"],
                          "max_size_bytes": device["max_size_bytes"],
                          "transcode_format": device["transcode_format"],
                          "artist_images": device["artist_images"],
@@ -6416,10 +7303,12 @@ def api_app_dashboard_catalog():
 def api_app_dashboard_widgets():
     conn = db.get_conn()
     try:
-        _, user_id, _ = _authenticated_app_user(conn)
+        # The requesting device's own set, not the browser's.
+        device, user_id, _ = _authenticated_app_user(conn)
         if request.method == "PATCH":
-            return jsonify(_apply_dashboard_widgets_patch(conn, user_id, request.get_json(force=True, silent=True)))
-        return jsonify(_stored_dashboard_widgets(conn, user_id))
+            return jsonify(_apply_dashboard_widgets_patch(
+                conn, user_id, request.get_json(force=True, silent=True), device_id=device["id"]))
+        return jsonify(_device_dashboard_widgets(conn, device["id"], user_id))
     finally:
         conn.close()
 
@@ -6499,6 +7388,153 @@ def api_app_profile():
             "show_reissue_year": bool(row["show_reissue_year"]),
             "basket_last_destinations": _basket_last_destinations_dict(row["basket_last_destinations"]),
         })
+    finally:
+        conn.close()
+
+
+# --- /api/app/playlists*: the playlist section for the phone (#108) -------
+# Everything the browser's playlist section does except mirroring, behind
+# the device token, acting as the device's owner. Every handler below is the
+# browser route's own body (the shared _functions above), so #28 privacy,
+# #81 attribution and the owner-or-admin checks exist once. No route here
+# changes a mirror, and the list leaves the mirror fields out.
+
+_APP_PLAYLIST_OMITTED_PREFIXES = ("mirror_", "subsonic_mirror_", "jellyfin_mirror_", "emby_mirror_",
+                                  "music_assistant_mirror_", "plex_mirror_")
+
+
+@app.route("/api/app/playlists")
+def api_app_playlists():
+    """The browser list without its mirror fields, plus can_share: whether
+    this user may change the row's `shared` flag (it has an owner, and the
+    user is that owner or an admin), so the app hides a control it could
+    not use instead of letting it fail."""
+    conn = db.get_conn()
+    try:
+        _, user_id, is_admin = _authenticated_app_user(conn)
+        rows = []
+        for row in _visible_playlists(conn, user_id):
+            row = {k: v for k, v in row.items() if not k.startswith(_APP_PLAYLIST_OMITTED_PREFIXES)}
+            owner = row["owner_user_id"]
+            row["can_share"] = owner is not None and (owner == user_id or bool(is_admin))
+            rows.append(row)
+        return jsonify(rows)
+    finally:
+        conn.close()
+
+
+@app.route("/api/app/playlists/sync", methods=["POST"])
+def api_app_playlists_sync():
+    conn = db.get_conn()
+    try:
+        _authenticated_app_user(conn)
+    finally:
+        conn.close()
+    return _start_playlist_sync()
+
+
+@app.route("/api/app/playlists/sync/status")
+def api_app_playlists_sync_status():
+    conn = db.get_conn()
+    try:
+        _authenticated_app_user(conn)
+    finally:
+        conn.close()
+    return jsonify(playlist_sync.sync_status())
+
+
+@app.route("/api/app/playlists/<int:playlist_id>", methods=["PATCH"])
+def api_app_playlist_update(playlist_id: int):
+    conn = db.get_conn()
+    try:
+        _, user_id, _ = _authenticated_app_user(conn)
+        return _set_playlist_shared(conn, user_id, playlist_id)
+    finally:
+        conn.close()
+
+
+def _playlist_entries(conn, user_id: int, playlist_id: int) -> list:
+    """A visible playlist's entries in playlist order, each with whether it
+    resolved to a track in the library. New with the App API: the browser
+    shows no track list. The unresolved review stays its own route, since
+    it carries row ids and the excluded flag."""
+    _require_playlist_visible_by_id(conn, user_id, playlist_id)
+    rows = conn.execute(
+        "SELECT position, artist, title, album, matched_track_id IS NOT NULL AS matched "
+        "FROM playlist_tracks WHERE playlist_id = ? ORDER BY position, id",
+        (playlist_id,),
+    ).fetchall()
+    return [{**dict(r), "matched": bool(r["matched"])} for r in rows]
+
+
+@app.route("/api/app/playlists/<int:playlist_id>/tracks")
+def api_app_playlist_tracks(playlist_id: int):
+    conn = db.get_conn()
+    try:
+        _, user_id, _ = _authenticated_app_user(conn)
+        return jsonify(_playlist_entries(conn, user_id, playlist_id))
+    finally:
+        conn.close()
+
+
+@app.route("/api/app/playlists/<int:playlist_id>/unresolved-tracks")
+def api_app_playlist_unresolved_tracks(playlist_id: int):
+    conn = db.get_conn()
+    try:
+        _, user_id, _ = _authenticated_app_user(conn)
+        return _unresolved_tracks_of(conn, user_id, playlist_id)
+    finally:
+        conn.close()
+
+
+@app.route("/api/app/playlists/<int:playlist_id>/unresolved-tracks/exclude", methods=["POST"])
+def api_app_playlist_unresolved_tracks_exclude(playlist_id: int):
+    conn = db.get_conn()
+    try:
+        _, user_id, _ = _authenticated_app_user(conn)
+        return _exclude_unresolved_tracks(conn, user_id, playlist_id)
+    finally:
+        conn.close()
+
+
+@app.route("/api/app/playlists/<int:playlist_id>/lidarr-requests", methods=["POST"])
+def api_app_playlist_lidarr_requests(playlist_id: int):
+    conn = db.get_conn()
+    try:
+        _, user_id, _ = _authenticated_app_user(conn)
+        return _set_lidarr_requests(conn, user_id, playlist_id)
+    finally:
+        conn.close()
+
+
+@app.route("/api/app/playlist-subscriptions", methods=["GET", "POST"])
+def api_app_playlist_subscriptions():
+    conn = db.get_conn()
+    try:
+        _, user_id, _ = _authenticated_app_user(conn)
+        if request.method == "POST":
+            return _add_subscription(conn, user_id)
+        return _own_subscriptions(conn, user_id)
+    finally:
+        conn.close()
+
+
+@app.route("/api/app/playlist-subscriptions/<int:sub_id>/refresh", methods=["POST"])
+def api_app_playlist_subscription_refresh(sub_id: int):
+    conn = db.get_conn()
+    try:
+        _, user_id, _ = _authenticated_app_user(conn)
+        return _refresh_subscription(conn, user_id, sub_id)
+    finally:
+        conn.close()
+
+
+@app.route("/api/app/playlist-subscriptions/<int:sub_id>", methods=["DELETE"])
+def api_app_playlist_subscription_delete(sub_id: int):
+    conn = db.get_conn()
+    try:
+        _, user_id, _ = _authenticated_app_user(conn)
+        return _delete_subscription(conn, user_id, sub_id)
     finally:
         conn.close()
 
@@ -6627,6 +7663,52 @@ def api_device_manifest():
         if not isinstance(paths, list):
             abort(400, description=_("paths must be a list of relative paths."))
         return jsonify(sync_state.record_device_manifest(conn, device["id"], paths))
+    finally:
+        conn.close()
+
+
+# Bounds on one upload of device-made playlists: far above any real card,
+# low enough that a broken client can't hand the server unbounded work.
+_DEVICE_PLAYLISTS_MAX = 1000
+_DEVICE_PLAYLIST_ENTRIES_MAX = 20000
+
+
+def _valid_device_playlist_path(path) -> bool:
+    """A playlist file's path from the device's sync root: relative, no
+    "..", not inside Trobar's own .trobar/ folder, and a playlist file."""
+    if not isinstance(path, str) or not path or path.startswith("/") or "\\" in path:
+        return False
+    parts = path.split("/")
+    return (".." not in parts and "" not in parts and parts[0] != ".trobar"
+            and path.lower().endswith((".m3u", ".m3u8")))
+
+
+@app.route("/api/device/playlists", methods=["POST"])
+def api_device_playlists():
+    """Playlists a person made on this device, read off its storage by the
+    client: {"playlists": [{"path": "Playlists/Road Trip.m3u", "entries":
+    ["../Artist/Album/01 - Song.flac", ...]}]}, the whole set found this
+    sync (files carrying Trobar's marker left out). Each becomes a playlist
+    of the device's owner; one missing from a later upload is removed.
+    Device Bearer token. Returns {"playlists", "tracks", "matched",
+    "unknown"} counts. See playlist_sync.sync_device_playlists."""
+    conn = db.get_conn()
+    try:
+        device = _authenticated_device(conn)
+        body = request.get_json(force=True, silent=True)
+        playlists = body.get("playlists") if isinstance(body, dict) else None
+        if not isinstance(playlists, list) or len(playlists) > _DEVICE_PLAYLISTS_MAX:
+            abort(400, description=_("playlists must be a list of at most %(n)d playlists.",
+                                     n=_DEVICE_PLAYLISTS_MAX))
+        for pl in playlists:
+            entries = pl.get("entries") if isinstance(pl, dict) else None
+            if not isinstance(pl, dict) or not _valid_device_playlist_path(pl.get("path")) \
+                    or not isinstance(entries, list) or len(entries) > _DEVICE_PLAYLIST_ENTRIES_MAX \
+                    or not all(isinstance(e, str) for e in entries):
+                abort(400, description=_(
+                    "Each playlist needs a path (a .m3u or .m3u8 file, relative, no \"..\") "
+                    "and a list of entries."))
+        return jsonify(playlist_sync.sync_device_playlists(conn, device["id"], playlists))
     finally:
         conn.close()
 

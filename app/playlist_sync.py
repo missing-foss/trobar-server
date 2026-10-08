@@ -17,6 +17,10 @@ filesystem *is* the active provider (nothing to merge, it's already the only
 source), and any title collision with the active provider's own playlist is
 left alone — its curated copy wins over the filesystem-discovered one.
 
+A configured Music Assistant server merges in the same way, right after the
+filesystem files: its playlists are an extra source, never the active
+provider, so it is merged whichever provider is active.
+
 Direct per-user Tidal accounts (#21) merge in the same unconditional way,
 regardless of the active provider — see the dedicated block near the end of
 sync_playlists().
@@ -30,7 +34,9 @@ means something once its own server is the configured source."""
 
 import json
 import logging
+import posixpath
 
+import album_lookup
 import db
 import emby_client
 import filesystem_client
@@ -41,9 +47,13 @@ import lidarr_requests
 import mirror
 import mirror_emby
 import mirror_jellyfin
+import mirror_music_assistant
+import mirror_plex
 import mirror_subsonic
+import music_assistant_client
 import roon_client
 import spotify_client
+import spotify_public_client
 import sync_state
 import tidal_client
 import ytmusic_client
@@ -54,8 +64,8 @@ _log = logging.getLogger(__name__)
 # gets a row in `jobs` (survives a restart, observable/retryable from the
 # admin panel) instead of a bare module-level lock + daemon thread.
 #
-# The handler itself is NOT registered here. It needs to resolve `provider_id`
-# back to a live provider module, and only main.py's _PROVIDERS dict can do
+# The handler itself is NOT registered here. It needs to resolve the active
+# provider to a live provider module, and only main.py's _PROVIDERS dict can do
 # that (see jobs.register's docstring: cross-module wiring lives in main.py,
 # not in the module that does the work — same reason
 # provenance.ensure_library_fingerprints's wrapper lives there too).
@@ -120,7 +130,8 @@ def start_sync(provider, provider_id: str) -> dict:
     return {"status": "started", "job_id": job_id}
 
 
-_SUBSCRIPTION_CLIENTS = {ytmusic_client.PROVIDER_ID: ytmusic_client}
+_SUBSCRIPTION_CLIENTS = {ytmusic_client.PROVIDER_ID: ytmusic_client,
+                         spotify_public_client.PROVIDER_ID: spotify_public_client}
 
 
 def subscription_playlist_key(sub_id: int) -> str:
@@ -141,7 +152,9 @@ def subscription_playlist_key(sub_id: int) -> str:
 
 def sync_one_subscription(conn, sub, *, subsonic_mirror_cache: dict | None = None,
                           jellyfin_mirror_cache: dict | None = None,
-                          emby_mirror_cache: dict | None = None) -> dict:
+                          emby_mirror_cache: dict | None = None,
+                          music_assistant_mirror_cache: dict | None = None,
+                          plex_mirror_cache: dict | None = None) -> dict:
     """Fetches one URL subscription and syncs it, recording the outcome on
     the subscription row either way.
 
@@ -182,6 +195,7 @@ def sync_one_subscription(conn, sub, *, subsonic_mirror_cache: dict | None = Non
         subsonic_mirror_cache=subsonic_mirror_cache,
         jellyfin_mirror_cache=jellyfin_mirror_cache,
         emby_mirror_cache=emby_mirror_cache,
+        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
     )
     tracks, matched = outcome if outcome is not None else (0, 0)
     conn.execute(
@@ -239,13 +253,272 @@ def _remove_playlist_row(conn, playlist_id: int) -> None:
     mirror_subsonic.delete_mirror(conn, playlist_id)
     mirror_jellyfin.delete_mirror(conn, playlist_id)
     mirror_emby.delete_mirror(conn, playlist_id)
+    mirror_music_assistant.delete_mirror(conn, playlist_id)
+    mirror_plex.delete_mirror(conn, playlist_id)
     conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+
+
+_MIRROR_COPY_COLUMNS = {"jellyfin": "jellyfin_mirror_remote_id", "emby": "emby_mirror_remote_id"}
+
+
+def _carry_selections_from_mirror_copy(conn, row) -> None:
+    """Before the stale pass prunes a row that was one of Trobar's own
+    Jellyfin/Emby mirror copies read back as a source, moves its device
+    selections to the playlist it mirrors.
+
+    Older versions listed such a copy as a source when it sat in an account
+    the provider lists, so an install may hold a duplicate row a member
+    selected for a device. The listing now skips copies, so that row is
+    pruned once; moving its selections first means the device keeps the
+    files instead of being told to delete them. A device the original is
+    already selected for loses only the duplicate's link, and a selection
+    left with no device is dropped without telling any device anything.
+    A selection whose creator may not see the original stays behind and is
+    pruned with the duplicate."""
+    column = _MIRROR_COPY_COLUMNS.get(row["source_provider"])
+    if column is None or not row["source_playlist_id"]:
+        return
+    copy_id = str(row["source_playlist_id"]).replace("-", "").lower()
+    original = next((r["id"] for r in conn.execute(
+        f"SELECT id, {column} AS remote_id FROM playlists WHERE {column} IS NOT NULL")
+        if str(r["remote_id"]).replace("-", "").lower() == copy_id), None)
+    if original is None:
+        return
+    for sel in conn.execute(
+        "SELECT s.id FROM selections s JOIN users u ON u.id = s.created_by_user_id "
+        "JOIN playlists o ON o.id = ? "
+        "WHERE s.type = 'playlist' AND s.target = ? "
+        # Only where the selection's creator may see the original, by the
+        # rule main._visible_playlists uses. A duplicate read back through
+        # the default pass is unowned, so anyone could select it, including
+        # a copy of someone else's private playlist. Such a selection is
+        # left on the duplicate and goes with it, as before.
+        "AND (u.is_admin OR o.owner_user_id IS NULL OR o.shared = 1 "
+        "OR o.owner_user_id = s.created_by_user_id)",
+        (original, str(row["id"])),
+    ).fetchall():
+        conn.execute(
+            "DELETE FROM selection_devices WHERE selection_id = ? AND device_id IN ("
+            "SELECT sd.device_id FROM selection_devices sd JOIN selections s ON s.id = sd.selection_id "
+            "WHERE s.type = 'playlist' AND s.target = ?)", (sel["id"], str(original)))
+        if conn.execute("SELECT 1 FROM selection_devices WHERE selection_id = ?", (sel["id"],)).fetchone():
+            conn.execute("UPDATE selections SET target = ? WHERE id = ?", (str(original), sel["id"]))
+        else:
+            conn.execute("DELETE FROM selections WHERE id = ?", (sel["id"],))
+
+
+# Sources merged in under every library source, not only when they are the
+# active one: the next sync lists them again whichever provider replaces
+# them, so a switch away from one of these must leave its playlists alone.
+ALWAYS_MERGED_SOURCES = frozenset({"filesystem", "music_assistant"})
+
+_MIRROR_FLAGS = ("mirror_enabled", "subsonic_mirror_enabled",
+                 "jellyfin_mirror_enabled", "emby_mirror_enabled", "music_assistant_mirror_enabled",
+                 "plex_mirror_enabled")
+
+
+def _switch_removal_ids(conn, old_provider: str) -> list[int]:
+    """The playlists a switch away from `old_provider` removes: that
+    provider's own rows, and nothing from the extra sources (linked
+    streaming accounts, subscriptions, the .m3u folder, Music Assistant),
+    whose own syncs keep owning their rows across the switch."""
+    if old_provider in ALWAYS_MERGED_SOURCES:
+        return []
+    return [r["id"] for r in conn.execute(
+        "SELECT id FROM playlists WHERE source_provider = ? ORDER BY title COLLATE NOCASE",
+        (old_provider,))]
+
+
+# Users-table column holding each Trobar user's account on a provider whose
+# first sync also lists per-user playlists (see sync_playlists).
+PER_USER_COLUMNS = {"jellyfin": "jellyfin_user_id", "emby": "emby_user_id"}
+
+
+def _norm_title(title: str | None) -> str:
+    return " ".join((title or "").casefold().split())
+
+
+def _overlap_confirms(a: set[int], b: set[int]) -> bool:
+    """The origin-inference overlap rule: at least _ORIGIN_MIN_OVERLAP_TRACKS
+    shared tracks, and at least _ORIGIN_MIN_OVERLAP_RATIO of the smaller
+    playlist."""
+    shared = len(a & b)
+    return (shared >= _ORIGIN_MIN_OVERLAP_TRACKS
+            and shared >= _ORIGIN_MIN_OVERLAP_RATIO * min(len(a), len(b)))
+
+
+def _target_listing(conn, target_id: str, client) -> list[dict] | None:
+    """The target provider's playlists, each owned as its first sync would
+    own it: the server-wide listing first (no owner), then each mapped
+    user's own listing for what it hasn't seen (owned by that user). None
+    when the server-wide listing fails."""
+    listing = client.list_playlists()
+    if listing["status"] != "ok":
+        return None
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+
+    def add(pl: dict, owner: int | None, kwargs: dict) -> None:
+        key = _playlist_key(target_id, pl["id"], pl["title"])
+        if key not in seen:
+            seen.add(key)
+            out.append({"src_id": pl["id"], "title": pl["title"], "owner": owner, "kwargs": kwargs})
+
+    for pl in listing["playlists"]:
+        add(pl, None, {})
+    column = PER_USER_COLUMNS.get(target_id)
+    if column:
+        for user in conn.execute(
+                f"SELECT id, {column} AS mapped FROM users WHERE {column} IS NOT NULL").fetchall():
+            user_listing = client.list_playlists(user_id=user["mapped"])
+            if user_listing["status"] == "ok":
+                for pl in user_listing["playlists"]:
+                    add(pl, user["id"], {"user_id": user["mapped"]})
+    return out
+
+
+def plan_carry_over(conn, old_provider: str, target_id: str, client) -> dict:
+    """Which of the old provider's playlists a switch to `target_id` carries
+    over to their namesake there, instead of removing them. Reads the
+    target through `client` (its stored connection, or an unsaved one set
+    with provider_config.using) and writes nothing.
+
+    A pair is one old playlist and one target playlist with the same title
+    (case and spacing aside) and the same owner, whose tracks overlap by
+    the origin-inference rule (_overlap_confirms). Two old or two target
+    playlists sharing a title and owner are left unmatched rather than
+    guessed, and so is a target playlist Trobar already has a row for.
+
+    Returns {"status", "pairs"}: pairs of (old playlist id, target
+    playlist id, target title). status is "ok"; "already_listed" for a
+    target whose playlists Trobar lists under every provider (they already
+    have rows of their own); "not_listable" for Roon, which can't be read
+    before Trobar is approved in Roon; or "listing_failed"."""
+    if target_id in ALWAYS_MERGED_SOURCES:
+        return {"status": "already_listed", "pairs": []}
+    if target_id == "roon":
+        return {"status": "not_listable", "pairs": []}
+    old_ids = _switch_removal_ids(conn, old_provider)
+    if not old_ids:
+        return {"status": "ok", "pairs": []}
+    listing = _target_listing(conn, target_id, client)
+    if listing is None:
+        return {"status": "listing_failed", "pairs": []}
+
+    ph = ",".join("?" for _ in old_ids)
+    old_groups: dict[tuple[str, int | None], list[int]] = {}
+    for r in conn.execute(f"SELECT id, title, owner_user_id FROM playlists WHERE id IN ({ph})", old_ids):
+        old_groups.setdefault((_norm_title(r["title"]), r["owner_user_id"]), []).append(r["id"])
+    new_groups: dict[tuple[str, int | None], list[dict]] = {}
+    for pl in listing:
+        new_groups.setdefault((_norm_title(pl["title"]), pl["owner"]), []).append(pl)
+
+    pairs: list[tuple[int, str, str]] = []
+    for key, olds in old_groups.items():
+        news = new_groups.get(key, [])
+        if len(olds) != 1 or len(news) != 1:
+            continue
+        old_id, new = olds[0], news[0]
+        if conn.execute("SELECT 1 FROM playlists WHERE source_provider = ? AND source_playlist_id = ?",
+                        (target_id, new["src_id"])).fetchone():
+            continue
+        old_tracks = {r["matched_track_id"] for r in conn.execute(
+            "SELECT matched_track_id FROM playlist_tracks "
+            "WHERE playlist_id = ? AND matched_track_id IS NOT NULL", (old_id,))}
+        result = client.get_playlist_tracks(new["title"], source_playlist_id=new["src_id"], **new["kwargs"])
+        if result.get("status") != "ok":
+            continue
+        new_tracks = set()
+        for t in result["tracks"]:
+            track_id = identity.resolve_playlist_track(
+                conn, artist=t["artist"], title=t["title"], path=t.get("path"), isrc=t.get("isrc"))
+            if track_id is not None:
+                new_tracks.add(track_id)
+        if _overlap_confirms(old_tracks, new_tracks):
+            pairs.append((old_id, new["src_id"], new["title"]))
+    return {"status": "ok", "pairs": pairs}
+
+
+def switch_preview(conn, old_provider: str, carry: dict | None = None) -> dict:
+    """What a library-source switch away from `old_provider` would do,
+    counted now and changing nothing: the admin's review step, and the
+    switch's own report of what it did. `carry` is plan_carry_over()'s
+    result: its playlists are carried over, not removed.
+
+    `devices` lists each device with playlist selections on a removed
+    playlist. Those selections are deleted with the playlist, so the
+    device's next sync removes the playlist file and any tracks no other
+    selection keeps on it."""
+    carry = carry or {"status": "ok", "pairs": []}
+    carried_ids = {old_id for old_id, _src, _title in carry["pairs"]}
+    ids = [i for i in _switch_removal_ids(conn, old_provider) if i not in carried_ids]
+    titles: list[str] = []
+    mirrored = 0
+    if ids:
+        ph = ",".join("?" for _ in ids)
+        flags = " OR ".join(f"{f} = 1" for f in _MIRROR_FLAGS)
+        titles = [r["title"] for r in conn.execute(
+            f"SELECT title FROM playlists WHERE id IN ({ph}) ORDER BY title COLLATE NOCASE", ids)]
+        mirrored = conn.execute(
+            f"SELECT COUNT(*) FROM playlists WHERE id IN ({ph}) AND ({flags})", ids).fetchone()[0]
+    devices = []
+    if ids:
+        ph = ",".join("?" for _ in ids)
+        devices = [{"name": r["name"], "playlists": r["n"]} for r in conn.execute(
+            "SELECT d.name AS name, COUNT(DISTINCT s.id) AS n FROM selections s "
+            "JOIN selection_devices sd ON sd.selection_id = s.id "
+            "JOIN devices d ON d.id = sd.device_id "
+            f"WHERE s.type = 'playlist' AND s.target IN ({ph}) "
+            "GROUP BY d.id ORDER BY d.name COLLATE NOCASE",
+            [str(i) for i in ids])]
+    removing = set(ids) | carried_ids
+    kept: dict[str, int] = {}
+    for r in conn.execute("SELECT id, source_provider FROM playlists"):
+        if r["id"] not in removing:
+            key = r["source_provider"] or "other"
+            kept[key] = kept.get(key, 0) + 1
+    carried_titles = sorted((title for _old, _src, title in carry["pairs"]), key=str.casefold)
+    return {"from": old_provider,
+            # `ids`: the old playlists carried over, which the switch is
+            # confirmed with (main.api_admin_provider_switch).
+            "carried": {"count": len(carried_titles), "titles": carried_titles,
+                        "ids": sorted(carried_ids), "status": carry["status"]},
+            "removed": {"count": len(ids), "titles": titles, "mirrored": mirrored},
+            "devices": devices, "kept": kept}
+
+
+def carry_over_playlists(conn, target_id: str, pairs) -> int:
+    """Re-keys each paired old playlist to its namesake in the target
+    (plan_carry_over's pairs), keeping its row and id, so its selections,
+    mirror flags, Lidarr requests, shared/private choice and excluded gaps
+    stay. The first sync from the target finds the row by its new key and
+    refreshes its tracks. A Roon-only origin hint is cleared: it is
+    recomputed only under Roon. Returns how many."""
+    for old_id, src_id, title in pairs:
+        conn.execute(
+            "UPDATE playlists SET source_provider = ?, source_playlist_id = ?, title = ?, "
+            "inferred_origin_provider = NULL, golden_source_id = NULL WHERE id = ?",
+            (target_id, src_id, title, old_id))
+    conn.commit()
+    return len(pairs)
+
+
+def remove_provider_playlists(conn, old_provider: str) -> int:
+    """Removes the playlists a switch away from `old_provider` removes (see
+    _switch_removal_ids), each through _remove_playlist_row so devices with
+    one selected are told and its mirrors go with it. Returns how many."""
+    ids = _switch_removal_ids(conn, old_provider)
+    for playlist_id in ids:
+        _remove_playlist_row(conn, playlist_id)
+    conn.commit()
+    return len(ids)
 
 
 def _sync_one_playlist(
     conn, provider, provider_id: str, title: str, source_playlist_id: str | None = None,
     owner_user_id: int | None = None, subsonic_mirror_cache: dict | None = None,
     jellyfin_mirror_cache: dict | None = None, emby_mirror_cache: dict | None = None,
+    music_assistant_mirror_cache: dict | None = None, plex_mirror_cache: dict | None = None,
     prefetched: dict | None = None, **provider_kwargs
 ) -> tuple[int, int] | None:
     """Syncs a single playlist's tracks from `provider` into
@@ -273,9 +546,9 @@ def _sync_one_playlist(
     (user_id=...). `owner_user_id` (#28) is written to the playlists row
     itself, not passed to get_playlist_tracks().
 
-    `subsonic_mirror_cache`/`jellyfin_mirror_cache`/`emby_mirror_cache`:
-    forwarded to mirror_subsonic.write_mirror()/mirror_jellyfin.write_
-    mirror()/mirror_emby.write_mirror() — a dict PER SINK sync_playlists()
+    `subsonic_mirror_cache`/`jellyfin_mirror_cache`/`emby_mirror_cache`/
+    `music_assistant_mirror_cache`: forwarded to each server sink's
+    write_mirror() — a dict PER SINK sync_playlists()
     creates ONCE per run and passes to every one of its
     _sync_one_playlist() calls, so N mirrored playlists share one target
     tag-index build per sink instead of each triggering their own full
@@ -422,6 +695,8 @@ def _sync_one_playlist(
     mirror_subsonic.write_mirror(conn, playlist_id, tag_index_cache=subsonic_mirror_cache)
     mirror_jellyfin.write_mirror(conn, playlist_id, tag_index_cache=jellyfin_mirror_cache)
     mirror_emby.write_mirror(conn, playlist_id, tag_index_cache=emby_mirror_cache)
+    mirror_music_assistant.write_mirror(conn, playlist_id, index_cache=music_assistant_mirror_cache)
+    mirror_plex.write_mirror(conn, playlist_id, index_cache=plex_mirror_cache)
     # #494: same "resolve, then act" placement as the four mirror sinks
     # above, and the same never-raises contract -- but a different verb
     # (requests missing ALBUMS from Lidarr, doesn't copy the playlist
@@ -440,7 +715,100 @@ def _sync_one_playlist(
     # which is fine — a sync is re-runnable and the stale-cleanup at the end
     # only runs if the whole pass completes.
     conn.commit()
+    # Gaps without an album get one looked up in the background (after the
+    # commit: queueing a job commits the connection).
+    album_lookup.enqueue_if_pending(conn, playlist_id)
     return track_count, matched_count
+
+
+
+# Playlists made on a device (an SD-card player, a phone) and read off its
+# storage by the client that syncs it. Not a provider: the client uploads
+# them, and their rows key on the device.
+DEVICE_SOURCE = "device"
+
+
+def device_playlist_id(device_id: int, path: str) -> str:
+    return f"{device_id}:{path}"
+
+
+def sync_device_playlists(conn, device_id: int, playlists: list[dict]) -> dict:
+    """Records the playlists a person made on `device_id`, as uploaded by its
+    client: [{"path": <file path from the sync root>, "entries": [<line>, ...]}],
+    the whole set found on the device this sync. Each becomes a playlist
+    owned by the device's owner (private to start with, like any owned
+    playlist), keyed on device id + path, and goes through _sync_one_playlist
+    like a provider's, so its mirrors are written the same way. A playlist
+    from an earlier upload that isn't in this one has left the device and
+    is removed through _remove_playlist_row, so devices it was sent to are
+    told and its mirrors go with it.
+
+    Loop guard, device side: a path Trobar itself writes to this device
+    (sync_state.device_playlist_filenames) is ignored, whatever the client
+    sent, so a Trobar playlist that went out to the card never comes back
+    as one of the device's own. The clients also skip any file carrying
+    sync_state.M3U_MARKER.
+
+    Entries resolve through sync_state.resolve_card_entry(); one that names
+    no library track is added to the device's unknown tracks. Returns counts."""
+    owner = conn.execute("SELECT owner_user_id FROM devices WHERE id = ?", (device_id,)).fetchone()
+    if owner is None:
+        raise ValueError(f"no device {device_id}")
+    ours = sync_state.device_playlist_filenames(conn, device_id)
+    index = sync_state.device_path_index(conn, device_id)
+    listed: set[str] = set()
+    counts = {"playlists": 0, "tracks": 0, "matched": 0, "unknown": 0}
+    unknown: list[str] = []
+    for pl in playlists:
+        path = pl["path"]
+        if path in ours or device_playlist_id(device_id, path) in listed:
+            continue
+        tracks = []
+        for position, entry in enumerate(pl["entries"]):
+            found = sync_state.resolve_card_entry(entry, path, index)
+            row = index.get(found) if found else None
+            if row is not None:
+                tracks.append({"position": position, "artist": row["artist"], "title": row["title"],
+                               "album": row["album"], "path": row["relative_path"]})
+            else:
+                card_path = entry.strip().replace("\\", "/")
+                artist, album, title = sync_state._parse_device_path(card_path)
+                tracks.append({"position": position, "artist": artist or "", "title": title or card_path,
+                               "album": album, "path": None})
+                unknown.append(card_path)
+        source_id = device_playlist_id(device_id, path)
+        title = posixpath.splitext(posixpath.basename(path))[0] or path
+        result = _sync_one_playlist(conn, None, DEVICE_SOURCE, title, source_playlist_id=source_id,
+                                    owner_user_id=owner["owner_user_id"],
+                                    prefetched={"status": "ok", "tracks": tracks})
+        listed.add(source_id)
+        if result is not None:
+            counts["playlists"] += 1
+            counts["tracks"] += result[0]
+            counts["matched"] += result[1]
+    sync_state.add_device_unknown_tracks(conn, device_id, unknown)
+    counts["unknown"] = len(set(unknown))
+    prefix = device_playlist_id(device_id, "")
+    for row in conn.execute(
+        "SELECT id, source_playlist_id FROM playlists WHERE source_provider = ? "
+        "AND substr(source_playlist_id, 1, ?) = ?", (DEVICE_SOURCE, len(prefix), prefix)
+    ).fetchall():
+        if row["source_playlist_id"] not in listed:
+            _remove_playlist_row(conn, row["id"])
+    conn.commit()
+    return counts
+
+
+def remove_device_playlists(conn, device_id: int) -> int:
+    """Removes the playlists made on `device_id`, through _remove_playlist_row,
+    when the device itself is deleted. Does not commit. Returns how many."""
+    prefix = device_playlist_id(device_id, "")
+    ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM playlists WHERE source_provider = ? AND substr(source_playlist_id, 1, ?) = ?",
+        (DEVICE_SOURCE, len(prefix), prefix))]
+    for playlist_id in ids:
+        _remove_playlist_row(conn, playlist_id)
+    return len(ids)
 
 
 # #26: both counts are judgment calls, not derived from anything in the
@@ -655,7 +1023,7 @@ def sync_playlists(provider, provider_id: str) -> dict:
     # Same protection for URL subscriptions, keyed on the subscription
     # rather than on a user: one subscription failing must not remove the
     # playlist it produced, and a user may hold several.
-    ytmusic_failed_ids: set[str] = set()
+    subscription_failed_ids: set[str] = set()
     # #128: only providers we authoritatively listed this run are eligible for
     # stale-cleanup. The primary joins only when its listing succeeded;
     # filesystem/tidal add themselves below on their own success.
@@ -666,6 +1034,8 @@ def sync_playlists(provider, provider_id: str) -> dict:
     subsonic_mirror_cache: dict = {}
     jellyfin_mirror_cache: dict = {}
     emby_mirror_cache: dict = {}
+    music_assistant_mirror_cache: dict = {}
+    plex_mirror_cache: dict = {}
     try:
         if primary_ok:
             provider_ids.add(provider_id)
@@ -676,7 +1046,8 @@ def sync_playlists(provider, provider_id: str) -> dict:
                 outcome = _sync_one_playlist(
                     conn, provider, provider_id, title, source_playlist_id=src_id,
                     subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                    emby_mirror_cache=emby_mirror_cache)
+                    emby_mirror_cache=emby_mirror_cache,
+                    music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache)
                 if outcome is None:
                     continue
                 seen_keys.add(key)
@@ -697,13 +1068,44 @@ def sync_playlists(provider, provider_id: str) -> dict:
                     outcome = _sync_one_playlist(
                         conn, filesystem_client, "filesystem", title, source_playlist_id=src_id,
                         subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                        emby_mirror_cache=emby_mirror_cache)
+                        emby_mirror_cache=emby_mirror_cache,
+                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache)
                     if outcome is None:
                         continue
                     seen_keys.add(key)
                     playlist_count += 1
                     track_count += outcome[0]
                     matched_count += outcome[1]
+
+        # Music Assistant: an extra source, merged whichever provider is
+        # active -- except when it IS the active provider, whose pass above
+        # already listed it. Skipped explicitly rather than left to
+        # seen_keys, which would also hide it but only because both passes
+        # happen to build the same key. Unconfigured or unreachable lists as
+        # an error and joins nothing, so its earlier rows are left alone
+        # rather than cleaned up as deleted -- the same posture as a failed
+        # filesystem listing.
+        ma_listing: dict = (music_assistant_client.list_playlists()
+                      if provider is not music_assistant_client else {"status": "skipped"})
+        if ma_listing["status"] == "ok":
+            provider_ids.add("music_assistant")
+            for pl in ma_listing["playlists"]:
+                src_id, title = pl["id"], pl["title"]
+                key = _playlist_key("music_assistant", src_id, title)
+                listed_keys.add(key)
+                if key in seen_keys:
+                    continue
+                outcome = _sync_one_playlist(
+                    conn, music_assistant_client, "music_assistant", title, source_playlist_id=src_id,
+                    subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
+                    emby_mirror_cache=emby_mirror_cache,
+                    music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache)
+                if outcome is None:
+                    continue
+                seen_keys.add(key)
+                playlist_count += 1
+                track_count += outcome[0]
+                matched_count += outcome[1]
 
         # Locally-created Roon playlists are profile-specific (#23) — the
         # pass above only ever sees whichever profile the connection
@@ -736,6 +1138,7 @@ def sync_playlists(provider, provider_id: str) -> dict:
                         owner_user_id=user_row["id"], roon_profile=profile,
                         subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
                         emby_mirror_cache=emby_mirror_cache,
+                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
                     )
                     if outcome is None:
                         continue
@@ -781,6 +1184,7 @@ def sync_playlists(provider, provider_id: str) -> dict:
                         owner_user_id=user_row["id"], user_id=mapped_user_id,
                         subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
                         emby_mirror_cache=emby_mirror_cache,
+                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
                     )
                     if outcome is None:
                         continue
@@ -811,6 +1215,7 @@ def sync_playlists(provider, provider_id: str) -> dict:
                         owner_user_id=user_row["id"], user_id=mapped_user_id,
                         subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
                         emby_mirror_cache=emby_mirror_cache,
+                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
                     )
                     if outcome is None:
                         continue
@@ -905,6 +1310,7 @@ def sync_playlists(provider, provider_id: str) -> dict:
                         owner_user_id=user_row["id"], access_token=access_token, tidal_user_id=tidal_user_id,
                         subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
                         emby_mirror_cache=emby_mirror_cache,
+                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
                     )
                     if outcome is None:
                         continue
@@ -976,6 +1382,7 @@ def sync_playlists(provider, provider_id: str) -> dict:
                         owner_user_id=user_row["id"], access_token=access_token,
                         subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
                         emby_mirror_cache=emby_mirror_cache,
+                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
                     )
                     if outcome is None:
                         continue
@@ -991,8 +1398,8 @@ def sync_playlists(provider, provider_id: str) -> dict:
         # admin configuration to gate on -- a subscription row IS the whole
         # configuration -- so this runs whenever one exists, under whatever
         # provider is active. With none, not a single external call is
-        # made: the query returns nothing and the client module is never
-        # even imported (its own import of ytmusicapi is function-local).
+        # made: the query returns nothing, so no client is called (and
+        # ytmusicapi is not even imported: its import is function-local).
         #
         # Each subscription is ONE playlist, so there is no listing step
         # and no listing failure to distinguish from an empty listing --
@@ -1013,14 +1420,15 @@ def sync_playlists(provider, provider_id: str) -> dict:
             sub_outcome = sync_one_subscription(
                 conn, sub, subsonic_mirror_cache=subsonic_mirror_cache,
                 jellyfin_mirror_cache=jellyfin_mirror_cache,
-                emby_mirror_cache=emby_mirror_cache)
+                emby_mirror_cache=emby_mirror_cache,
+                music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache)
             if sub_outcome["status"] != "ok":
                 # #71's lesson, and the one this source is most exposed to:
                 # an unofficial endpoint refusing us today must not read as
                 # "the user deleted this playlist". Not listing its key
                 # leaves the row unprotected by the pass below, so protect
                 # it explicitly instead.
-                ytmusic_failed_ids.add(src_id)
+                subscription_failed_ids.add(src_id)
                 continue
             listed_keys.add(_playlist_key(sub["provider"], src_id, sub_outcome["title"]))
             playlist_count += 1
@@ -1064,8 +1472,9 @@ def sync_playlists(provider, provider_id: str) -> dict:
                 continue
             # Same for a subscription whose fetch failed this run.
             if row["source_provider"] in _SUBSCRIPTION_CLIENTS \
-                    and row["source_playlist_id"] in ytmusic_failed_ids:
+                    and row["source_playlist_id"] in subscription_failed_ids:
                 continue
+            _carry_selections_from_mirror_copy(conn, row)
             _remove_playlist_row(conn, row["id"])
             removed_count += 1
         # #93: reclaim orphaned NULL-source_provider ghosts the scan above

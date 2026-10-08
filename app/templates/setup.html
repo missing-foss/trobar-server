@@ -9,15 +9,8 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<script>
-  (function () {
-    var pref = localStorage.getItem('trobar-theme') || 'auto';
-    var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    document.documentElement.setAttribute('data-theme', pref === 'auto' ? (systemDark ? 'dark' : 'light') : pref);
-  })();
-</script>
+{% include "_theme_head.html" %}
 <title>{{ _("Trobar — Setup") }}</title>
-<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/favicon.svg') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/fonts.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/logo.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
@@ -33,10 +26,10 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 </script>
 </head>
 <body class="h-full ss-app-bg font-sans text-gray-900 flex items-center justify-center p-4">
-  <div class="w-full max-w-lg" x-data="setupWizard()" x-init="init()">
+  <div class="w-full max-w-lg" x-data="setupWizard()">
     <div class="flex flex-col items-center gap-3 mb-6">
       <div class="ss-mark" style="width:64px;height:64px;">
-        <img class="ss-bard" src="{{ url_for('static', filename='img/bard-mark.svg') }}" alt="">
+        {% include "_trobar_mark.html" %}
       </div>
       <span class="font-display font-semibold text-xl">Trob<span class="text-accent">ar</span></span>
     </div>
@@ -80,7 +73,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
             <span>{{ _("This folder is on a writable mount. Trobar only ever reads your music — mount it read-only (add ':ro' to the volume in docker-compose) so a bug or compromise can't modify or delete your files. You can still continue.") }}</span>
           </div>
           <button @click="saveMusicRoot()" :disabled="saving"
-            class="w-full text-sm px-3 py-2 rounded bg-burgundy text-white hover:bg-burgundy-lo disabled:opacity-50">
+            class="w-full text-sm px-3 py-2 rounded bg-burgundy text-on-primary hover:bg-burgundy-lo disabled:opacity-50">
             <span x-text="saving ? t('savingLabel') : t('continueLabel')"></span>
           </button>
           <button x-show="musicRootWritable" @click="saveMusicRoot(true)" :disabled="saving"
@@ -97,7 +90,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
           <p class="text-xs text-gray-400">{{ _("Playlists and artist photos come from whichever of these you pick — Filesystem needs nothing set up at all, the others need a live server to talk to.") }}</p>
 
           <div class="flex gap-1 flex-wrap">
-            <template x-for="opt in [{id: 'filesystem', label: 'Filesystem'}, {id: 'roon', label: 'Roon'}, {id: 'subsonic', label: 'Subsonic'}, {id: 'jellyfin', label: 'Jellyfin'}, {id: 'emby', label: 'Emby'}, {id: 'plex', label: 'Plex'}, {id: 'lms', label: 'LMS'}]" :key="opt.id">
+            <template x-for="opt in [{id: 'filesystem', label: 'Filesystem'}, {id: 'roon', label: 'Roon'}, {id: 'subsonic', label: 'Subsonic'}, {id: 'jellyfin', label: 'Jellyfin'}, {id: 'emby', label: 'Emby'}, {id: 'plex', label: 'Plex'}, {id: 'lms', label: 'LMS'}, {id: 'music_assistant', label: 'Music Assistant'}]" :key="opt.id">
               <button type="button" @click="adminConfig.provider = opt.id; providerStatus = null"
                 :class="adminConfig.provider===opt.id ? 'bg-indigo-50 text-accent' : 'text-gray-400 hover:bg-gray-100/10'"
                 class="text-xs px-2 py-1 rounded-md border border-gray-300/40">
@@ -185,6 +178,18 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                 class="border border-gray-300 rounded px-2 py-1 text-sm w-40 bg-transparent">
             </div>
           </div>
+          <div x-show="adminConfig.provider === 'music_assistant'" class="flex flex-wrap items-end gap-2">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Music Assistant URL") }}</label>
+              <input x-model="adminConfig.music_assistant_url" placeholder="http://192.168.1.10:8095"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-56 bg-transparent">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">{{ _("Long-lived token") }}</label>
+              <input x-model="adminConfig.music_assistant_token" type="password"
+                class="border border-gray-300 rounded px-2 py-1 text-sm w-56 bg-transparent">
+            </div>
+          </div>
           <div x-show="adminConfig.provider === 'lms'" class="flex flex-wrap items-end gap-2">
             <div>
               <label class="block text-xs text-gray-400 mb-1">{{ _("LMS URL") }}</label>
@@ -220,7 +225,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
           <div class="flex gap-2">
             <button @click="step = 'music'" type="button" class="text-sm px-3 py-2 text-gray-400 hover:underline">{{ _("Back") }}</button>
             <button @click="continueFromProvider()" :disabled="saving"
-              class="flex-1 text-sm px-3 py-2 rounded bg-burgundy text-white hover:bg-burgundy-lo disabled:opacity-50">
+              class="flex-1 text-sm px-3 py-2 rounded bg-burgundy text-on-primary hover:bg-burgundy-lo disabled:opacity-50">
               <span x-text="saving ? t('savingLabel') : t('continueLabel')"></span>
             </button>
           </div>
@@ -240,7 +245,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
           <div class="flex gap-2">
             <button @click="step = 'provider'" type="button" class="text-sm px-3 py-2 text-gray-400 hover:underline">{{ _("Back") }}</button>
             <button @click="finish()" :disabled="saving"
-              class="flex-1 text-sm px-3 py-2 rounded bg-burgundy text-white hover:bg-burgundy-lo disabled:opacity-50">
+              class="flex-1 text-sm px-3 py-2 rounded bg-burgundy text-on-primary hover:bg-burgundy-lo disabled:opacity-50">
               <span x-text="saving ? t('finishingLabel') : t('finishSetupLabel')"></span>
             </button>
           </div>
@@ -272,6 +277,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
           emby_url: '', emby_api_key: '', emby_username: '',
           plex_url: '', plex_token: '',
           lms_url: '', lms_username: '', lms_password: '',
+          music_assistant_url: '', music_assistant_token: '',
           filesystem_root: '', lastfm_api_key_default: '',
         },
 

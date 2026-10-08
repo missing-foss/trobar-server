@@ -50,18 +50,63 @@ if a step doesn't match what you see (device firmware varies).
 
 ## Pair
 
-There's no keyboard on the watch, so pairing happens through **Garmin Connect
-Mobile** instead:
+There's no keyboard on the watch. The app reads two settings, the **server
+URL** and a short **pairing code**, and the watch exchanges the code for its
+own device credentials the next time it syncs over its own Wi-Fi.
 
-1. Create the device in the trobar-server web UI (**Profile → Devices → Add
-   mobile device (QR / code)** — see
-   [Clients overview → device tokens](index.md#device-tokens)). This gives you
-   a server URL and a short enrollment code.
-2. In Garmin Connect Mobile, open this app's **Settings** and enter both — the
-   server URL once, the code for this pairing.
-3. The watch redeems the code and pairs the next time it syncs (whenever it's
-   on its own configured Wi-Fi — no phone needed at sync time, only at pairing
-   time to type the settings).
+**Garmin Connect Mobile can't set them for a sideloaded app.** It shows an
+app's settings only when the app was installed from the Connect IQ Store,
+and Trobar isn't there yet. Until it is, the settings reach the watch as a
+**settings file** copied over USB.
+
+!!! warning "Not yet confirmed on a watch"
+    The settings-file route below follows how the Connect IQ simulator
+    stores an app's settings. It hasn't been confirmed on a fēnix yet; this
+    note goes once it has.
+
+You need the Connect IQ SDK's simulator, running **the same build** you
+sideloaded.
+
+1. **Get everything ready first.** The pairing code is valid for **one
+   hour** and works once. It's used at the watch's next sync, not when you
+   copy the file.
+2. Start the app in the simulator on `fenix5plus`.
+3. In the trobar-server web UI, create the device: **Profile → Devices → Add
+   mobile device (QR / code)** (see
+   [Clients overview → device tokens](index.md#device-tokens)). Note the
+   server URL and the code; the QR code isn't used here.
+4. In the simulator, open **File → Edit Persistent Storage → Edit
+   Application.Properties data**, set `serverUrl` and `enrollCode`, and send
+   them to the simulator.
+5. Find the `.SET` file the simulator wrote: it's named after the app's
+   `.PRG`, in a `GARMIN/APPS/SETTINGS` folder under the simulator's
+   temporary directory.
+6. Connect the watch over USB and copy that file into `GARMIN/APPS/SETTINGS/`,
+   **under the same base name as the Trobar `.prg` on the watch**. Check
+   whether the `.prg` is in `GARMIN/APPS/` or `GARMIN/APPS/MEDIA/`; the
+   simulator keeps an audio app in `MEDIA/`. Disconnect.
+7. Let the watch sync on its own Wi-Fi within the hour (see
+   [Wi-Fi requirements](#wi-fi-requirements)).
+
+Open Trobar in the watch's Music app to see the outcome. **"Paired: *device
+name*"** means it worked. **"Pairing failed: Invalid or expired code"** means
+the settings arrived but the code had expired or was already used: repeat
+with a fresh code. **"Pairing failed: Network error"** means the watch
+couldn't reach the server during its sync: check the server URL and the
+watch's Wi-Fi. If it still says **"Enter server + code in the Garmin
+Connect app"**, the watch either didn't pick up the settings file or can't
+use the server URL in it (it must start with `http://` or `https://`):
+check the file's name and folder, and the URL.
+
+### Pairing again
+
+A paired watch ignores a new code. To pair it again (to another server, or
+after its device was deleted in the web UI), open Trobar in the Music app,
+press **Menu** (hold **Up**), choose **Forget pairing**, then follow the
+steps above with a new code.
+
+Once the app is on the Connect IQ Store, steps 2 and 4–6 become one: enter
+the server URL and code in the app's **Settings** in Garmin Connect Mobile.
 
 ## Wi-Fi requirements
 

@@ -49,7 +49,7 @@ A few things worth knowing:
 
 - **It is read-only.** Trobar never writes there, and never touches the
   files it finds. That's the difference between this and the mirror output
-  folder ([Mirroring](../using/playlists.md#mirroring-to-a-local-folder-a-subsonicnavidrome-server-a-jellyfin-server-or-an-emby-server)),
+  folder ([Mirroring](../using/playlists.md#mirroring)),
   which is the write side.
 - **It must not overlap your music folder or the mirror folder** — Trobar
   refuses the setting if it does, in either direction. Overlapping either

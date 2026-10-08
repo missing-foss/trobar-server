@@ -24,8 +24,11 @@ or more devices. Batch-select multiple albums and sync them to any combination
 of devices at once — the server then computes each device's missing tracks and
 the [clients](../clients/index.md) download the diff.
 
-Selections are **per user**: every household member has their own, and they
-survive a provider switch, a rescan, and device token regeneration.
+Selections are **per user**: every household member has their own. Artist,
+album and track selections survive a provider switch, a rescan, and device
+token regeneration. A selected playlist from the old provider stays selected
+if the switch carries it over to the new provider, and is removed with it
+otherwise.
 
 ## Scanning
 

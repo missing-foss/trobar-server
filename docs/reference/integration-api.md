@@ -267,9 +267,10 @@ curl -H "Authorization: Bearer <YOUR_TOKEN>" \
 Same errors and rate limiting as [Devices](#devices) above.
 
 Filled a gap the other three routes didn't cover: playlist mirroring
-(filesystem, Subsonic, Jellyfin, Emby) is unattended background
-work with a documented, per-sink failure state
-(`unset_target`/`unreachable`/`no_target_matches`/`write_failed`, or
+(filesystem, Subsonic, Jellyfin, Emby, Music Assistant, Plex) is unattended
+background work with a documented, per-sink failure state
+(`unset_target`/`unreachable`/`no_target_matches`/`write_failed`, Music
+Assistant's and Plex's `readback_mismatch` as well, or
 filesystem's own `unset_folder`/`not_writable`/`bad_filename`/
 `marker_unsafe`), but that state was previously only visible in the
 session-authenticated web UI (`GET /api/provider/playlists`, and
@@ -282,7 +283,7 @@ above, not scoped to the calling token's owner:
 | Field | Type | Notes |
 |---|---|---|
 | `mirrors_failing` | integer | Total currently-failing playlist × sink pairs, across every sink. Exact — never affected by `failing`'s cap below. The simplest possible alert: `> 0`. |
-| `by_sink` | object | One entry per sink — `filesystem`, `subsonic`, `jellyfin`, `emby` — each `{"enabled": integer, "failing": integer}`. Counts playlist × sink **pairs**, not playlists: a playlist mirrored to both Subsonic and Jellyfin counts once in each. `by_sink.*.failing` summed across all four sinks always equals `mirrors_failing`. |
+| `by_sink` | object | One entry per sink — `filesystem`, `subsonic`, `jellyfin`, `emby`, `music_assistant`, `plex` — each `{"enabled": integer, "failing": integer}`. Counts playlist × sink **pairs**, not playlists: a playlist mirrored to both Subsonic and Jellyfin counts once in each. `by_sink.*.failing` summed across all sinks always equals `mirrors_failing`. |
 | `failing` | array | One entry per currently-failing pair — a worklist, not an inventory, capped at 50 entries (see `failing_truncated`). Each entry: `{"playlist_id": integer, "title": string, "sink": string, "error_code": string, "last_written_at": string or null}`. |
 | `failing_truncated` | boolean | `true` if more pairs are failing than `failing` has room for — `mirrors_failing`/`by_sink` are still exact in that case, only the array is short. A single dead mirror target can fail every playlist pointed at it, so this can happen on a real install, not just synthetically. |
 

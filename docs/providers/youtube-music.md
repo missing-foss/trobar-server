@@ -102,21 +102,20 @@ failure. In both cases:
   you asking for it. Devices are told to remove the files, the same as
   deleting any other playlist.
 
-## Why only YouTube Music
+## Other services
 
 The obvious question is why this is not "paste any playlist link". The
-answer inverts what you would expect, and it is worth stating so nobody
-spends an afternoon proposing it:
+answer inverts what you would expect:
 
 | Service | Public playlist by link, no account? |
 |---|---|
 | YouTube Music | **Works** — via the unofficial endpoints above. |
-| Spotify | **Not possible.** Its Get Playlist endpoint returns the track list only for playlists the authenticated user owns or collaborates on. No token of any kind reads a stranger's public playlist. |
+| Spotify | **Works, up to 100 tracks** — not through its API, whose Get Playlist endpoint returns the track list only to a playlist's owner or collaborators, but through its embed player page. See [Spotify links](spotify-links.md). |
 | Tidal | **Not today.** Playlist endpoints need a user token whether or not the playlist is public. TIDAL has said it is considering opening public-playlist endpoints to the client-credentials flow; if that ships, it becomes the first *sanctioned* backend for this feature. |
 
-So the one service where this works has no sanctioned API, and the two with
-sanctioned APIs specifically forbid it. That is why this page is named for
-YouTube Music rather than dressed up as a general link importer.
+So neither service where this works does it through a sanctioned API, and
+the two sanctioned APIs specifically forbid it. That is why each source has
+its own page rather than a general "link importer" one.
 
 ## For the person running the server
 

@@ -30,6 +30,8 @@ from pathlib import Path
 _TMP = tempfile.mkdtemp(prefix="trobar-test-jellyfin-client-")
 os.environ["DATA_DIR"] = _TMP
 
+import requests
+
 import db  # noqa: E402
 db.DATA_DIR = Path(_TMP)
 
@@ -494,6 +496,18 @@ class MirrorCreateOrReplacePlaylistTests(_JellyfinClientTestBase):
         self.assertEqual(body["Name"], "Chill")
         self.assertEqual(body["Ids"], ["1", "2"])
 
+    def test_create_is_made_as_the_account_given_else_the_mirror_account(self):
+        self._configure()
+        with mock.patch("requests.request", return_value=_resp(body={"Id": "42"})) as req:
+            jellyfin_client.mirror_create_or_replace_playlist("Chill", ["1"], None, "member-7")
+            self.assertEqual(req.call_args.kwargs["json"]["UserId"], "member-7")
+            # A member's own copy is private to them; Jellyfin's default is
+            # visible to every user.
+            self.assertIs(req.call_args.kwargs["json"]["IsPublic"], False)
+            jellyfin_client.mirror_create_or_replace_playlist("Chill", ["1"], None)
+            self.assertEqual(req.call_args.kwargs["json"]["UserId"], "u1")
+            self.assertNotIn("IsPublic", req.call_args.kwargs["json"])
+
     def test_create_failure_surfaces_the_status_code(self):
         self._configure()
         with mock.patch("requests.request", return_value=_resp(status_code=500)):
@@ -613,6 +627,63 @@ class MirrorDeletePlaylistTests(_JellyfinClientTestBase):
         self._configure()
         with mock.patch("requests.request", return_value=_resp(status_code=500)):
             self.assertFalse(jellyfin_client.mirror_delete_playlist("42"))
+
+
+class MirrorTargetIsLibraryServerTests(_JellyfinClientTestBase):
+    def _ids(self, library, mirror):
+        def get(url, **_kw):
+            sid = library if url.startswith("http://library.local") else mirror
+            if sid is None:
+                raise requests.ConnectionError("down")
+            return _resp_id(sid)
+        return mock.patch("requests.get", side_effect=get)
+
+    def setUp(self):
+        super().setUp()
+        self._configure()
+        conn = db.get_conn()
+        db.set_config(conn, "jellyfin_url", "http://library.local")
+        conn.commit()
+        conn.close()
+
+    def test_the_same_server_id_is_the_same_server(self):
+        with self._ids("srv-1", "srv-1"):
+            self.assertTrue(jellyfin_client.mirror_target_is_library_server())
+
+    def test_another_server_id_is_another_server(self):
+        with self._ids("srv-1", "srv-2"):
+            self.assertFalse(jellyfin_client.mirror_target_is_library_server())
+
+    def test_a_server_that_does_not_answer_means_unknown_not_different(self):
+        # "Different" would move every member's copy on a passing error.
+        for library, mirror in ((None, "srv-1"), ("srv-1", None), (None, None)):
+            with self.subTest(library=library, mirror=mirror), self._ids(library, mirror):
+                self.assertIsNone(jellyfin_client.mirror_target_is_library_server())
+
+    def test_the_id_is_read_in_either_case(self):
+        # Jellyfin answers camelCase for its first seconds after a start.
+        def get(url, **_kw):
+            r = mock.Mock()
+            r.json.return_value = {"id": "srv-1"} if url.startswith("http://library.local") else {"Id": "srv-1"}
+            r.raise_for_status.return_value = None
+            return r
+        with mock.patch("requests.get", side_effect=get):
+            self.assertTrue(jellyfin_client.mirror_target_is_library_server())
+
+    def test_no_library_connection_is_not_the_same_server(self):
+        conn = db.get_conn()
+        db.set_config(conn, "jellyfin_url", None)
+        conn.commit()
+        conn.close()
+        with self._ids("srv-1", "srv-1"):
+            self.assertFalse(jellyfin_client.mirror_target_is_library_server())
+
+
+def _resp_id(server_id):
+    r = mock.Mock()
+    r.json.return_value = {"Id": server_id, "ServerName": "x"}
+    r.raise_for_status.return_value = None
+    return r
 
 
 if __name__ == "__main__":

@@ -747,6 +747,54 @@ test.describe("Dashboard widget dedup (#418)", () => {
     expect(afterReenable).toBe(0);
   });
 
+  test("each widget is cut at its OWN cover count when deduping against it", async ({ page }) => {
+    // Recently released shows 30, Recently added 15. The album at position
+    // 20 in Released is shown there, so it must not also show in Added --
+    // cutting Released at Added's 15 would miss it and show it twice.
+    await gotoHome(page);
+    await page.evaluate(() => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      const released = [];
+      for (let i = 0; i < 19; i++) released.push({ artist: "A", album: `Released ${i}`, year: 2026 });
+      released.push({ artist: "Z", album: "Shown in Released", year: 2026 });
+      app.recentlyReleased = released;
+      app.recentlyAdded = [{ artist: "Z", album: "Shown in Released" }, { artist: "B", album: "Only here" }];
+      app.profile.dashboard_widgets = {
+        disabled: [], order: [],
+        settings: { recently_released: { cover_limit: 30 }, recently_added: { cover_limit: 15 }, suggestions: { cover_limit: 15 } },
+      };
+    });
+    const [releasedShown, addedShown] = await page.evaluate(() => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      return [
+        app.dedupedRecentlyReleased(app.coverLimit("recently_released")).map((a) => `${a.artist}||${a.album}`),
+        app.dedupedRecentlyAdded(app.coverLimit("recently_added")).map((a) => `${a.artist}||${a.album}`),
+      ];
+    });
+    expect(releasedShown).toContain("Z||Shown in Released");
+    expect(addedShown).toEqual(["B||Only here"]);
+  });
+
+  test("a cover widget's own count is set in its header and changes that widget only", async ({ page }) => {
+    await gotoHome(page);
+    // The header's own select, inside the Recently added widget.
+    const select = page.locator(`[x-data="coverGrid('recentlyAdded')"] select`);
+    await expect(select).toHaveCount(1);
+    await select.selectOption("30");
+    await expect.poll(() => page.evaluate(() => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      return [app.coverLimit("recently_added"), app.coverLimit("recently_released"), app.coverLimit("suggestions")];
+    })).toEqual([30, 15, 15]);
+    // Stored, not only shown: a reload reads it back from the server.
+    await page.reload();
+    await expect.poll(() => page.evaluate(() =>
+      window.Alpine.$data(document.querySelector("[x-data]")).coverLimit("recently_added"))).toBe(30);
+    // Put it back: later tests read the stored set with its defaults.
+    await page.locator(`[x-data="coverGrid('recentlyAdded')"] select`).selectOption("15");
+    await expect.poll(() => page.evaluate(() =>
+      window.Alpine.$data(document.querySelector("[x-data]")).coverLimit("recently_added"))).toBe(15);
+  });
+
   test("an album past Recently released's own display cutoff does not suppress a visible copy in Recently added (review fix)", async ({ page }) => {
     // Caught in review on this PR: the exclude set was built from the FULL
     // recentlyReleased array (server default up to 60), not what's actually

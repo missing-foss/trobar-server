@@ -18,9 +18,11 @@ gets its own fresh SQLite file via db.init_db(). Auth is a real session
 cookie (AUTH_MODE defaults to local), set through the test client's
 session_transaction — the same session key get_current_user_id() reads.
 """
+import contextlib
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import tempfile
 import time
@@ -42,6 +44,7 @@ import db          # noqa: E402
 db.DATA_DIR = Path(_TMP)
 db.DB_PATH = Path(_TMP) / "music-sync.db"
 
+import filesystem_client  # noqa: E402
 import jobs             # noqa: E402
 import library_quiz     # noqa: E402
 import main             # noqa: E402
@@ -436,6 +439,43 @@ class PlaylistListLidarrConnectedTests(_RouteTestBase):
         self.assertTrue(row["lidarr_request_configured"])
 
 
+class PlaylistInferredAlbumTests(_RouteTestBase):
+    """A gap's album looked up in MusicBrainz (inferred_album) makes the
+    playlist requestable from Lidarr, and the gaps review gets it apart
+    from the source's own album."""
+
+    def setUp(self):
+        super().setUp()
+        self.playlist = self._make_playlist("Mix", owner_user_id=None, shared=1)
+        cur = self.conn.execute(
+            "INSERT INTO unresolved_playlist_tracks (playlist_id, position, artist, title, album) "
+            "VALUES (?, 0, 'Band', 'Song', '')", (self.playlist,))
+        self.gap = cur.lastrowid
+        self.conn.commit()
+
+    def _row(self):
+        _login(self.client, self.owner)
+        resp = self.client.get("/api/provider/playlists")
+        return next(p for p in resp.get_json() if p["id"] == self.playlist)
+
+    def test_a_gap_without_any_album_makes_nothing_requestable(self):
+        self.assertFalse(self._row()["lidarr_request_has_albums"])
+
+    def test_a_looked_up_album_makes_the_gap_requestable(self):
+        self.conn.execute("UPDATE unresolved_playlist_tracks SET inferred_album = 'Found' WHERE id = ?",
+                          (self.gap,))
+        self.conn.commit()
+        self.assertTrue(self._row()["lidarr_request_has_albums"])
+
+    def test_the_review_lists_the_looked_up_album_apart_from_the_source_one(self):
+        self.conn.execute("UPDATE unresolved_playlist_tracks SET inferred_album = 'Found' WHERE id = ?",
+                          (self.gap,))
+        self.conn.commit()
+        _login(self.client, self.owner)
+        rows = self.client.get(f"/api/provider/playlists/{self.playlist}/unresolved-tracks").get_json()
+        self.assertEqual((rows[0]["album"], rows[0]["inferred_album"]), ("", "Found"))
+
+
 class PlaylistMirrorToggleTests(_RouteTestBase):
     """#285: POST .../mirror — same #28 visibility rule as the
     unresolved-tracks routes (any user who can see the playlist, not
@@ -772,24 +812,135 @@ class AdminMirrorsRouteTests(_RouteTestBase):
         self.assertEqual(row["mirror_last_error_code"], "not_writable")
         self.assertEqual(row["mirror_last_error"], "boom")
 
-    def test_a_playlist_with_only_lidarr_requests_enabled_is_included(self):
-        # #494: not a mirror sink, but included here too — the WHERE
-        # clause's own OR was extended, not just the SELECT list.
-        db.set_config(self.conn, "lidarr_url", "http://lidarr.example.com")
-        db.set_config(self.conn, "lidarr_api_key", "key1")
-        self.conn.commit()
+    def _requesting_playlist(self):
         requesting = self._make_playlist("Requesting", owner_user_id=None, shared=1)
         self.conn.execute(
             "UPDATE playlists SET lidarr_request_enabled = 1, lidarr_request_last_count = 3, "
             "lidarr_request_last_run_at = datetime('now') WHERE id = ?", (requesting,))
         self.conn.commit()
+        return requesting
+
+    def test_a_playlist_with_only_lidarr_requests_enabled_is_included(self):
+        # #494: not a mirror sink, but included here too — the WHERE
+        # clause's own OR was extended, not just the SELECT list.
+        db.set_config(self.conn, "lidarr_url", "http://lidarr.example.com")
+        db.set_config(self.conn, "lidarr_api_key", "key1")
+        db.set_config(self.conn, "lidarr_root_folder_path", "/music")
+        db.set_config(self.conn, "lidarr_quality_profile_id", "1")
+        db.set_config(self.conn, "lidarr_metadata_profile_id", "2")
+        self.conn.commit()
+        requesting = self._requesting_playlist()
 
         _login(self.client, self.admin)
         data = self.client.get("/api/admin/mirrors").get_json()
         self.assertEqual(data["lidarr_url"], "http://lidarr.example.com")
+        self.assertTrue(data["lidarr_request_configured"])
         row = next(p for p in data["playlists"] if p["id"] == requesting)
         self.assertTrue(row["lidarr_request_enabled"])
         self.assertEqual(row["lidarr_request_last_count"], 3)
+
+    def test_a_stale_lidarr_flag_lists_nothing_while_lidarr_is_not_configured(self):
+        # Connected, but the three profile fields unset: requests can't
+        # run, so a playlist whose flag is still on has nothing to report.
+        db.set_config(self.conn, "lidarr_url", "http://lidarr.example.com")
+        db.set_config(self.conn, "lidarr_api_key", "key1")
+        self.conn.commit()
+        self._requesting_playlist()
+
+        _login(self.client, self.admin)
+        data = self.client.get("/api/admin/mirrors").get_json()
+        self.assertFalse(data["lidarr_request_configured"])
+        self.assertEqual(data["playlists"], [])
+
+
+class AdminMirrorTargetsTests(_RouteTestBase):
+    """GET /api/admin/mirrors' `targets`: every sink listed, configured or
+    not, and a state only for the configured ones: ok, warning (reachable
+    but a write failed, or Lidarr without its profiles) or error
+    (unreachable, or a folder that can't be written). Probes are mocked."""
+
+    def setUp(self):
+        super().setUp()
+        db.set_config(self.conn, "music_root", str(Path(_TMP) / "no-such-music"))
+        self.conn.commit()
+        _login(self.client, self.admin)
+
+    def _targets(self):
+        data = self.client.get("/api/admin/mirrors").get_json()
+        return {t["key"]: t for t in data["targets"]}
+
+    def _configure_subsonic(self):
+        for key, value in (("mirror_subsonic_url", "http://navidrome.example"),
+                           ("mirror_subsonic_username", "u"), ("mirror_subsonic_password", "p")):
+            db.set_config(self.conn, key, value)
+        self.conn.commit()
+
+    def _configure_lidarr(self, profiles=True):
+        db.set_config(self.conn, "lidarr_url", "http://lidarr.example")
+        db.set_config(self.conn, "lidarr_api_key", "k")
+        if profiles:
+            db.set_config(self.conn, "lidarr_root_folder_path", "/music")
+            db.set_config(self.conn, "lidarr_quality_profile_id", "1")
+            db.set_config(self.conn, "lidarr_metadata_profile_id", "2")
+        self.conn.commit()
+
+    def test_nothing_configured_lists_every_target_without_a_state(self):
+        targets = self._targets()
+        self.assertEqual(list(targets), ["filesystem", "subsonic", "jellyfin", "emby", "music_assistant", "plex", "lidarr"])
+        for t in targets.values():
+            self.assertFalse(t["configured"])
+            self.assertIsNone(t["state"])
+        self.assertEqual(targets["lidarr"]["kind"], "request")
+
+    def test_a_writable_folder_is_ok(self):
+        folder = Path(tempfile.mkdtemp(prefix="trobar-test-mirror-target-", dir=_TMP))
+        db.set_config(self.conn, "mirror_folder", str(folder))
+        self.conn.commit()
+        t = self._targets()["filesystem"]
+        self.assertEqual((t["configured"], t["state"], t["where"]), (True, "ok", str(folder)))
+
+    def test_a_folder_that_does_not_exist_is_an_error(self):
+        db.set_config(self.conn, "mirror_folder", str(Path(_TMP) / "no-such-mirror-folder"))
+        self.conn.commit()
+        t = self._targets()["filesystem"]
+        self.assertEqual((t["state"], t["detail_code"]), ("error", "not_writable"))
+
+    def test_an_unreachable_server_is_an_error(self):
+        self._configure_subsonic()
+        with mock.patch.object(main.subsonic_client, "mirror_status",
+                               return_value={"state": "disconnected", "url": "http://navidrome.example"}):
+            t = self._targets()["subsonic"]
+        self.assertEqual((t["state"], t["detail_code"], t["where"]), ("error", "unreachable", "http://navidrome.example"))
+
+    def test_a_reachable_server_with_a_failed_write_is_a_warning_naming_it(self):
+        self._configure_subsonic()
+        playlist = self._make_playlist("Road Trip", owner_user_id=None, shared=1)
+        self.conn.execute(
+            "UPDATE playlists SET subsonic_mirror_enabled = 1, subsonic_mirror_last_error_code = 'write_failed', "
+            "subsonic_mirror_last_error = 'boom' WHERE id = ?", (playlist,))
+        self.conn.commit()
+        with mock.patch.object(main.subsonic_client, "mirror_status",
+                               return_value={"state": "paired", "url": "http://navidrome.example"}):
+            t = self._targets()["subsonic"]
+        self.assertEqual((t["state"], t["detail_code"], t["count"], t["detail"]), ("warning", "write_failed", 1, "boom"))
+
+    def test_lidarr_connected_without_its_profiles_is_a_warning(self):
+        self._configure_lidarr(profiles=False)
+        with mock.patch.object(main.lidarr_client, "status", return_value={"state": "paired", "url": "x"}):
+            t = self._targets()["lidarr"]
+        self.assertEqual((t["state"], t["detail_code"]), ("warning", "incomplete"))
+
+    def test_lidarr_set_up_and_reachable_is_ok(self):
+        self._configure_lidarr()
+        with mock.patch.object(main.lidarr_client, "status", return_value={"state": "paired", "url": "x"}):
+            t = self._targets()["lidarr"]
+        self.assertEqual(t["state"], "ok")
+
+    def test_lidarr_unreachable_is_an_error(self):
+        self._configure_lidarr()
+        with mock.patch.object(main.lidarr_client, "status", return_value={"state": "disconnected", "url": "x"}):
+            t = self._targets()["lidarr"]
+        self.assertEqual((t["state"], t["detail_code"]), ("error", "unreachable"))
 
 
 class RateLimitTrustedProxyTests(_RouteTestBase):
@@ -1153,11 +1304,80 @@ class AdminHealthRouteTests(_RouteTestBase):
         self.assertEqual(resp.get_json()["last_scan_finished_at"], "2026-06-15 12:00:00")
 
 
+class AdminConfigMirrorShareLocationTests(_RouteTestBase):
+    """Where the mirror folder sits inside the music share. Two mounts of
+    one share are simulated by a link under MUSIC_ROOT to the mirror
+    folder, which is elsewhere, as /music and /mirrors are in compose."""
+
+    def setUp(self):
+        super().setUp()
+        self._music_root = Path(tempfile.mkdtemp(prefix="trobar-test-music-root-", dir=_TMP))
+        self._mirrors = Path(tempfile.mkdtemp(prefix="trobar-test-mirrors-", dir=_TMP))
+        (self._music_root / "Lists").mkdir()
+        (self._music_root / "Lists" / "Trobar").symlink_to(self._mirrors)
+        (self._music_root / "Elsewhere").mkdir()
+        db.set_config(self.conn, "music_root", str(self._music_root))
+        db.set_config(self.conn, "mirror_folder", str(self._mirrors))
+        self.conn.commit()
+        _login(self.client, self.admin)
+
+    def _put(self, **body):
+        return self.client.put("/api/admin/config", json=body)
+
+    def _refused(self, resp):
+        self.assertEqual((resp.status_code, resp.get_json()["field"]), (400, "mirror_share_location"))
+        self.assertIsNone(db.get_mirror_share_location())
+
+    def test_the_mirror_folder_seen_from_the_library_is_accepted(self):
+        self.assertEqual(self._put(mirror_share_location=" /Lists/Trobar/ ").status_code, 200)
+        self.assertEqual(db.get_mirror_share_location(), "Lists/Trobar")
+        self.assertEqual(self.client.get("/api/admin/config").get_json()["mirror_share_location"], "Lists/Trobar")
+        self.assertEqual(list(self._mirrors.iterdir()), [], "the probe file is removed")
+
+    def test_another_folder_of_the_library_is_refused(self):
+        resp = self._put(mirror_share_location="Elsewhere")
+        self._refused(resp)
+        self.assertIn("test file", resp.get_json()["error"])
+        self._refused(self._put(mirror_share_location="Missing"))
+
+    def test_dotdot_and_backslashes_are_refused(self):
+        # Each of these does reach the mirror folder, so only the rule refuses them.
+        (self._music_root / "Lists\\Trobar").symlink_to(self._mirrors)
+        for location in ("Lists/../Lists/Trobar", "Lists\\Trobar"):
+            with self.subTest(location=location):
+                self._refused(self._put(mirror_share_location=location))
+
+    def test_no_mirror_folder_is_refused(self):
+        db.set_config(self.conn, "mirror_folder", None)
+        self.conn.commit()
+        with mock.patch.dict(os.environ, {"MIRROR_ROOT": ""}):
+            resp = self._put(mirror_share_location="Lists/Trobar")
+        self._refused(resp)
+        self.assertIn("mirror output folder first", resp.get_json()["error"])
+
+    def test_empty_clears_it(self):
+        self._put(mirror_share_location="Lists/Trobar")
+        self.assertEqual(self._put(mirror_share_location="").status_code, 200)
+        self.assertIsNone(db.get_mirror_share_location())
+
+    def test_moving_the_mirror_folder_rechecks_a_stored_location(self):
+        self._put(mirror_share_location="Lists/Trobar")
+        other = Path(tempfile.mkdtemp(prefix="trobar-test-other-mirrors-", dir=_TMP))
+        resp = self._put(mirror_folder=str(other))
+        self.assertEqual((resp.status_code, resp.get_json()["field"]), (400, "mirror_share_location"))
+        self.assertEqual(db.get_config(self.conn, "mirror_folder"), str(self._mirrors))
+
+    def test_an_unrelated_save_does_not_probe(self):
+        self._put(mirror_share_location="Lists/Trobar")
+        with mock.patch.object(main.mirror, "seen_in_library") as probe:
+            self.assertEqual(self._put(extra_playlist_folder="").status_code, 200)
+        probe.assert_not_called()
+
 class AdminConfigMirrorFolderValidationTests(_RouteTestBase):
     """#285: PUT /api/admin/config rejects a mirror_folder equal to or
-    nested inside MUSIC_ROOT — the concrete fix for the self-import
-    feedback loop filesystem_client.py's .m3u discovery would otherwise
-    cause (it walks the whole of MUSIC_ROOT with no exclusion mechanism)."""
+    nested inside MUSIC_ROOT: Trobar never writes into the library's own
+    path. (A mirror folder that is also visible under MUSIC_ROOT through a
+    second mount is fine: filesystem_client.py skips Trobar's marked files.)"""
 
     def setUp(self):
         super().setUp()
@@ -1727,6 +1947,243 @@ class PlaylistSubscriptionSyncTests(_RouteTestBase):
         self.assertEqual(sorted(calls), ["PLone", "PLtwo"])
 
 
+class SpotifyLinkSubscriptionTests(_RouteTestBase):
+    """Public Spotify playlists by link, through the same routes and sync
+    as YouTube Music's. Both clients are stubbed: nothing reaches either
+    service."""
+
+    PID = "0aBcDeFgHiJkLmNoPqRsTu"
+    URL = f"https://open.spotify.com/playlist/{PID}?si=abc"
+
+    def _add(self, url=None, response=None):
+        response = response if response is not None else _ok("Mix", [("Bon Jovi", "Livin' On A Prayer")])
+        with mock.patch.object(main.spotify_public_client, "get_playlist_tracks",
+                               return_value=response) as spotify, \
+                mock.patch.object(main.ytmusic_client, "get_playlist_tracks",
+                                  return_value=_ok("YT", [("A", "B")])) as yt:
+            resp = self.client.post("/api/playlist-subscriptions", json={"url": url or self.URL})
+        return resp, spotify, yt
+
+    def _subscriptions(self):
+        return self.conn.execute("SELECT * FROM playlist_subscriptions ORDER BY id").fetchall()
+
+    def test_a_spotify_link_is_fetched_from_spotify(self):
+        _login(self.client, self.owner)
+        resp, spotify, yt = self._add()
+        self.assertEqual(resp.status_code, 200)
+        sub = resp.get_json()["subscription"]
+        self.assertEqual((sub["provider"], sub["title"], sub["track_count"]),
+                         ("spotify_public", "Mix", 1))
+        self.assertEqual(sub["track_limit"], 100)
+        self.assertEqual(spotify.call_args.args[1], self.PID)
+        yt.assert_not_called()
+        row = self.conn.execute(
+            "SELECT owner_user_id FROM playlists WHERE source_provider = 'spotify_public'").fetchall()
+        self.assertEqual([r["owner_user_id"] for r in row], [self.owner])
+
+    def test_a_youtube_subscription_has_no_track_limit(self):
+        _login(self.client, self.owner)
+        resp, spotify, yt = self._add(url="https://music.youtube.com/playlist?list=PLabc123")
+        sub = resp.get_json()["subscription"]
+        self.assertEqual((sub["provider"], sub["track_limit"]), ("ytmusic", None))
+        spotify.assert_not_called()
+
+    def test_a_bare_id_still_goes_to_youtube_music(self):
+        _login(self.client, self.owner)
+        resp, spotify, yt = self._add(url=self.PID)
+        self.assertEqual(resp.get_json()["subscription"]["provider"], "ytmusic")
+        spotify.assert_not_called()
+        self.assertEqual(yt.call_args.args[1], self.PID)
+
+    def test_a_short_link_is_rejected_before_any_fetch(self):
+        _login(self.client, self.owner)
+        resp, spotify, yt = self._add(url="https://spotify.link/AbCdEf")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Spotify", resp.get_json()["error"])
+        spotify.assert_not_called()
+        yt.assert_not_called()
+        self.assertEqual(self._subscriptions(), [])
+
+    def test_two_spellings_of_one_playlist_are_one_subscription(self):
+        _login(self.client, self.owner)
+        self._add()
+        self._add(url=f"spotify:playlist:{self.PID}")
+        self.assertEqual(len(self._subscriptions()), 1)
+
+    def test_an_unavailable_playlist_is_recorded(self):
+        _login(self.client, self.owner)
+        resp, _, _ = self._add(response={"status": "unavailable"})
+        self.assertEqual(resp.get_json()["status"], "unavailable")
+        self.assertEqual(self._subscriptions()[0]["last_error"], "unavailable")
+
+    def _subscribe(self):
+        self.conn.execute(
+            "INSERT INTO playlist_subscriptions (owner_user_id, provider, external_id, url) "
+            "VALUES (?, 'spotify_public', ?, ?)", (self.owner, self.PID, self.URL))
+        self.conn.commit()
+
+    def _sync(self, response):
+        provider = mock.Mock()
+        provider.list_playlists.return_value = {"status": "ok", "playlists": []}
+        with mock.patch.object(playlist_sync.spotify_public_client, "get_playlist_tracks",
+                               return_value=response):
+            return playlist_sync.sync_playlists(provider, "subsonic")
+
+    def test_a_failed_fetch_keeps_the_playlist(self):
+        self._subscribe()
+        self._sync(_ok("Mix", [("A", "B")]))
+        result = self._sync({"status": "error", "reason": "unexpected_response"})
+        rows = self.conn.execute(
+            "SELECT title FROM playlists WHERE source_provider = 'spotify_public'").fetchall()
+        self.assertEqual([r["title"] for r in rows], ["Mix"])
+        self.assertEqual(result["removed"], 0)
+
+    def test_a_linked_spotify_accounts_playlist_is_not_pruned_by_a_link(self):
+        """Why the link source has its own id. Were it "spotify", a sync
+        with a Spotify link and no account linked this run would count
+        itself authoritative for every "spotify" row, and prune them."""
+        self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, source_playlist_id, owner_user_id, "
+            "shared, last_synced_at) VALUES ('From my account', 'spotify', 'acct1', ?, 0, "
+            "datetime('now'))", (self.other,))
+        self.conn.commit()
+        self._subscribe()
+        self._sync(_ok("Mix", [("A", "B")]))
+        rows = self.conn.execute(
+            "SELECT title FROM playlists WHERE source_provider = 'spotify'").fetchall()
+        self.assertEqual([r["title"] for r in rows], ["From my account"])
+
+
+class MirrorCopySelectionCarryTests(_RouteTestBase):
+    """A Jellyfin copy that older versions read back as a source left a
+    duplicate row. The listing now skips copies, so the next sync prunes
+    that row once, moving its device selections to the original first."""
+
+    COPY = "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b"
+    PROVIDER = "jellyfin"
+
+    def setUp(self):
+        super().setUp()
+        cur = self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, track_no, size, mtime) "
+            "VALUES ('a/b/1.flac', 'Artist A', 'Album', 'Song A', 1, 1, 0.0)")
+        self.track = sync_state._new_id(cur)
+        self.original = self._row("Road Trip", "filesystem", None, remote_id=self.COPY)
+        # The copy's id spelled differently from the stored one: no dashes,
+        # upper case.
+        self.duplicate = self._row("Road Trip", self.PROVIDER, self.COPY.replace("-", "").upper())
+        cur = self.conn.execute(
+            "INSERT INTO devices (owner_user_id, name, api_token_hash) VALUES (?, 'd', 'h')", (self.owner,))
+        self.device = sync_state._new_id(cur)
+        self.conn.commit()
+
+    def _row(self, title, source, source_id, remote_id=None):
+        cur = self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, source_playlist_id, owner_user_id, shared, "
+            f"last_synced_at, {self.PROVIDER}_mirror_remote_id) VALUES (?, ?, ?, ?, 0, datetime('now'), ?)",
+            (title, source, source_id, self.owner, remote_id))
+        pid = sync_state._new_id(cur)
+        self.conn.execute(
+            "INSERT INTO playlist_tracks (playlist_id, position, artist, title, matched_track_id) "
+            "VALUES (?, 0, 'Artist A', 'Song A', ?)", (pid, self.track))
+        return pid
+
+    def _select(self, playlist_id):
+        sync_state.create_selection(self.conn, "playlist", str(playlist_id), self.owner, [self.device])
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded' WHERE device_id = ?",
+                          (self.device,))
+        self.conn.commit()
+
+    def _sync(self):
+        provider = mock.Mock()
+        provider.list_playlists.return_value = {"status": "ok", "playlists": []}
+        return playlist_sync.sync_playlists(provider, self.PROVIDER)
+
+    def _selections(self):
+        return [(r["target"], r["device_id"]) for r in self.conn.execute(
+            "SELECT s.target, sd.device_id FROM selections s "
+            "JOIN selection_devices sd ON sd.selection_id = s.id WHERE s.type = 'playlist'")]
+
+    def _state(self):
+        return self.conn.execute("SELECT status FROM device_track_state WHERE device_id = ? AND track_id = ?",
+                                 (self.device, self.track)).fetchone()["status"]
+
+    def test_the_duplicates_selection_moves_to_the_original(self):
+        self._select(self.duplicate)
+        result = self._sync()
+        self.assertEqual(result["removed"], 1)
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM playlists WHERE id = ?", (self.duplicate,)).fetchone())
+        self.assertEqual(self._selections(), [(str(self.original), self.device)])
+        self.assertEqual(self._state(), "downloaded")  # nothing for the device to delete
+
+    def test_a_device_already_given_the_original_is_not_given_it_twice(self):
+        self._select(self.original)
+        self._select(self.duplicate)
+        self._sync()
+        self.assertEqual(self._selections(), [(str(self.original), self.device)])
+        self.assertEqual(self._state(), "downloaded")
+
+    def test_a_pruned_playlist_that_is_not_a_copy_still_takes_its_selection(self):
+        other = self._row("Gone", self.PROVIDER, "ffffffffffffffffffffffffffffffff")
+        self.conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (self.original,))
+        self.conn.commit()
+        self._select(other)
+        self._sync()
+        self.assertNotIn(str(other), [t for t, _ in self._selections()])
+        self.assertEqual(self._state(), "removed")
+
+
+    def _select_as(self, user_id, playlist_id):
+        cur = self.conn.execute(
+            "INSERT INTO devices (owner_user_id, name, api_token_hash) VALUES (?, 'theirs', 'h2')", (user_id,))
+        device = sync_state._new_id(cur)
+        sync_state.create_selection(self.conn, "playlist", str(playlist_id), user_id, [device])
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded' WHERE device_id = ?", (device,))
+        self.conn.commit()
+        return device
+
+    def _theirs(self, user_id):
+        return [r["target"] for r in self.conn.execute(
+            "SELECT target FROM selections WHERE type = 'playlist' AND created_by_user_id = ?", (user_id,))]
+
+    def test_a_selection_is_not_carried_onto_a_private_playlist_its_creator_cant_see(self):
+        """The duplicate came back through the default pass, so it's
+        unowned and anyone could select it; the original is the owner's
+        private playlist."""
+        self.conn.execute("UPDATE playlists SET owner_user_id = NULL WHERE id = ?", (self.duplicate,))
+        self.conn.commit()
+        device = self._select_as(self.other, self.duplicate)
+        self._sync()
+        self.assertEqual(self._theirs(self.other), [])
+        self.assertEqual(self.conn.execute(
+            "SELECT status FROM device_track_state WHERE device_id = ?", (device,)).fetchone()["status"],
+            "removed")
+
+    def test_a_selection_is_carried_when_its_creator_can_see_the_original(self):
+        for label, setup, creator in (
+                ("shared", "UPDATE playlists SET shared = 1 WHERE id = ?", self.other),
+                ("unowned", "UPDATE playlists SET owner_user_id = NULL WHERE id = ?", self.other),
+                ("admin", None, self.admin)):
+            with self.subTest(label):
+                if setup:
+                    self.conn.execute(setup, (self.original,))
+                self.conn.commit()
+                duplicate = self._row("Road Trip", self.PROVIDER, self.COPY.replace("-", ""))
+                self.conn.commit()
+                self._select_as(creator, duplicate)
+                self._sync()
+                self.assertEqual(self._theirs(creator), [str(self.original)])
+                self.conn.execute("DELETE FROM selections WHERE created_by_user_id = ?", (creator,))
+                self.conn.execute("UPDATE playlists SET owner_user_id = ?, shared = 0 WHERE id = ?",
+                                  (self.owner, self.original))
+                self.conn.commit()
+
+
+class EmbyMirrorCopySelectionCarryTests(MirrorCopySelectionCarryTests):
+    PROVIDER = "emby"
+
+
 class AdminConfigUrlValidationTests(_RouteTestBase):
     """#509: PUT /api/admin/config used to save a malformed URL (missing
     colon, no scheme, no host) happily in any of eleven provider fields —
@@ -1765,6 +2222,7 @@ class AdminConfigUrlValidationTests(_RouteTestBase):
           "mirror_jellyfin_username": "u"}, "Jellyfin mirror-target URL"),
         ({"mirror_emby_url": "http//bad", "mirror_emby_api_key": "k",
           "mirror_emby_username": "u"}, "Emby mirror-target URL"),
+        ({"mirror_plex_url": "http//bad", "mirror_plex_token": "t"}, "Plex mirror-target URL"),
         ({"lidarr_url": "http//bad", "lidarr_api_key": "k"}, "Lidarr URL"),
         ({"lastfm_api_base": "http//bad"}, "Last.fm API base URL"),
         ({"listenbrainz_api_base": "http//bad"}, "ListenBrainz API base URL"),
@@ -1779,6 +2237,26 @@ class AdminConfigUrlValidationTests(_RouteTestBase):
                 error = resp.get_json()["error"]
                 self.assertIn("valid", error.lower())
                 self.assertIn(field_label, error, payload)
+
+    def test_a_rejected_setting_is_named_by_the_field_the_page_binds(self):
+        # The configuration page opens the section holding `field` and
+        # focuses its input, found by its x-model binding: a field the
+        # template doesn't bind would leave the admin with no pointer.
+        template = (Path(__file__).parent / "templates" / "index.html").read_text()
+        bad_numbers = [
+            ({"transcode_concurrency": "many"}, "transcode_concurrency"),
+            ({"transcode_nice_level": 99}, "transcode_nice_level"),
+            ({"job_retention_days": 0}, "job_retention_days"),
+            ({"scan_interval_hours": -1}, "scan_interval_hours"),
+        ]
+        cases = [(payload, next(iter(payload))) for payload, _label in self._MALFORMED_URL_PAYLOADS]
+        _login(self.client, self.admin)
+        for payload, field in cases + bad_numbers:
+            with self.subTest(payload=payload):
+                resp = self.client.put("/api/admin/config", json=payload)
+                self.assertEqual(resp.status_code, 400, payload)
+                self.assertEqual(resp.get_json()["field"], field)
+                self.assertRegex(template, rf'x-model(\.number)?="adminConfig\.{field}"')
 
     def test_a_url_with_no_scheme_at_all_is_rejected(self):
         _login(self.client, self.admin)
@@ -1823,6 +2301,84 @@ class AdminConfigUrlValidationTests(_RouteTestBase):
         self.assertEqual(resp.status_code, 200)
         req.assert_called()
         self.assertEqual(db.get_config(self.conn, "lidarr_url"), "http://lidarr.example.com:8686")
+
+
+class AdminConfigMusicAssistantTests(_RouteTestBase):
+    """PUT /api/admin/config's Music Assistant connection: URL and token
+    saved together, both blank disconnects, and its state in the GET."""
+
+    def _count(self, n=9):
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.json.return_value = n
+        resp.raise_for_status.return_value = None
+        return resp
+
+    def test_saving_url_and_token_persists_and_reports_paired(self):
+        _login(self.client, self.admin)
+        with mock.patch("requests.post", return_value=self._count()) as post:
+            resp = self.client.put("/api/admin/config", json={
+                "music_assistant_url": "http://ma.example.invalid:8095", "music_assistant_token": " tok ",
+            })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(self.conn, "music_assistant_url"), "http://ma.example.invalid:8095")
+        self.assertEqual(db.get_config(self.conn, "music_assistant_token"), "tok")
+        self.assertEqual(post.call_args.kwargs["headers"], {"Authorization": "Bearer tok"})
+        body = resp.get_json()
+        self.assertEqual(body["music_assistant_state"], "paired")
+        self.assertEqual(body["music_assistant_url"], "http://ma.example.invalid:8095")
+
+    def test_a_malformed_url_is_refused_and_nothing_saved(self):
+        _login(self.client, self.admin)
+        with mock.patch("requests.post") as post:
+            resp = self.client.put("/api/admin/config", json={
+                "music_assistant_url": "http//ma.example.invalid", "music_assistant_token": "tok",
+            })
+        self.assertEqual(resp.status_code, 400)
+        post.assert_not_called()
+        self.assertIsNone(db.get_config(self.conn, "music_assistant_url"))
+
+    def test_blanking_both_disconnects(self):
+        db.set_config(self.conn, "music_assistant_url", "http://ma.example.invalid:8095")
+        db.set_config(self.conn, "music_assistant_token", "tok")
+        self.conn.commit()
+        _login(self.client, self.admin)
+        with mock.patch("requests.post") as post:
+            resp = self.client.put("/api/admin/config", json={"music_assistant_url": "", "music_assistant_token": ""})
+        self.assertEqual(resp.status_code, 200)
+        post.assert_not_called()
+        self.assertIsNone(db.get_config(self.conn, "music_assistant_url"))
+        self.assertIsNone(db.get_config(self.conn, "music_assistant_token"))
+        self.assertEqual(resp.get_json()["music_assistant_state"], "disconnected")
+
+    def test_a_payload_that_never_mentions_it_leaves_it_untouched(self):
+        db.set_config(self.conn, "music_assistant_url", "http://ma.example.invalid:8095")
+        db.set_config(self.conn, "music_assistant_token", "tok")
+        self.conn.commit()
+        _login(self.client, self.admin)
+        with mock.patch("requests.post", return_value=self._count()):
+            resp = self.client.put("/api/admin/config", json={"job_retention_days": 14})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(self.conn, "music_assistant_token"), "tok")
+
+    def test_test_connection_dispatches_url_and_token(self):
+        _login(self.client, self.admin)
+        with mock.patch("music_assistant_client.test_connection",
+                        return_value={"state": "paired", "url": "http://ma.example.invalid:8095",
+                                      "provider": "music_assistant"}) as tc:
+            resp = self.client.post("/api/admin/config/test-connection", json={
+                "provider": "music_assistant", "url": "http://ma.example.invalid:8095", "token": "tok",
+            })
+        self.assertEqual(resp.get_json()["state"], "paired")
+        tc.assert_called_once_with("http://ma.example.invalid:8095", "tok")
+        self.assertIsNone(db.get_config(self.conn, "music_assistant_url"))
+
+    def test_test_connection_requires_the_token(self):
+        _login(self.client, self.admin)
+        resp = self.client.post("/api/admin/config/test-connection", json={
+            "provider": "music_assistant", "url": "http://ma.example.invalid:8095",
+        })
+        self.assertEqual(resp.status_code, 400)
 
 
 class AdminConfigTestConnectionRouteTests(_RouteTestBase):
@@ -1913,6 +2469,489 @@ class AdminConfigTestConnectionRouteTests(_RouteTestBase):
         _login(self.client, self.admin)
         resp = self.client.post("/api/admin/config/test-connection", json={"provider": "lms"})
         self.assertEqual(resp.status_code, 400)
+
+
+class ProviderSwitchTests(_RouteTestBase):
+    """Changing the library source: the general config PUT no longer does
+    it once setup is complete; POST /api/admin/provider/switch does, after
+    re-testing the connection, and removes only the old provider's
+    playlists, through the path that tells devices."""
+
+    def setUp(self):
+        super().setUp()
+        db.set_config(self.conn, "provider", "jellyfin")
+        db.set_config(self.conn, "setup_completed", "1")
+        self.conn.commit()
+        self.tracks = [self._track(i) for i in range(3)]
+        self.kids = self._playlist("Kids", "jellyfin", self.tracks[:2])
+        self.focus = self._playlist("Focus", "jellyfin", self.tracks[2:], mirror=True)
+        self.tidal = self._playlist("Discover", "tidal", self.tracks[2:])
+        self.m3u = self._playlist("Road", "filesystem", self.tracks[2:])
+        self.device, _ = sync_state.create_device(self.conn, self.owner, "Garmin")
+        sync_state.create_selection(self.conn, "playlist", str(self.kids), self.owner, [self.device])
+        # The second Kids track is also selected on its own: it must stay.
+        sync_state.create_selection(self.conn, "track", str(self.tracks[1]), self.owner, [self.device])
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded' WHERE device_id = ?",
+                          (self.device,))
+        self.conn.commit()
+        _login(self.client, self.admin)
+
+    def _track(self, i: int) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, track_no, size, mtime) "
+            "VALUES (?, 'A', 'B', ?, ?, 1000, 0)", (f"A/B/{i}.flac", f"T{i}", i + 1))
+        self.conn.commit()
+        return sync_state._new_id(cur)
+
+    def _playlist(self, title: str, source: str, track_ids, mirror: bool = False) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, source_playlist_id, mirror_enabled, "
+            "last_synced_at) VALUES (?, ?, ?, ?, datetime('now'))",
+            (title, source, f"{source}-{title}", 1 if mirror else 0))
+        pid = sync_state._new_id(cur)
+        for pos, tid in enumerate(track_ids):
+            self.conn.execute(
+                "INSERT INTO playlist_tracks (playlist_id, position, artist, title, matched_track_id) "
+                "VALUES (?, ?, 'A', 'x', ?)", (pid, pos, tid))
+        self.conn.commit()
+        return pid
+
+    def _titles(self) -> set:
+        conn = db.get_conn()
+        try:
+            return {r["title"] for r in conn.execute("SELECT title FROM playlists")}
+        finally:
+            conn.close()
+
+    def _provider(self) -> str | None:
+        conn = db.get_conn()
+        try:
+            return db.get_config(conn, "provider")
+        finally:
+            conn.close()
+
+    _SUBSONIC = {"provider": "subsonic", "url": "http://nav.local", "username": "u", "password": "p"}
+
+    # The target's playlists as its client lists them: {id: (title, [(artist, title), ...])}.
+    def _target(self, client, playlists=None, listing_ok=True, per_user=None):
+        playlists = playlists or {}
+        per_user = per_user or {}
+
+        def list_playlists(user_id=None):
+            if not listing_ok:
+                return {"status": "error", "reason": "unreachable"}
+            ids = per_user.get(user_id, []) if user_id else [i for i in playlists if i not in
+                                                            {x for v in per_user.values() for x in v}]
+            return {"status": "ok", "playlists": [{"id": i, "title": playlists[i][0]} for i in ids]}
+
+        def get_playlist_tracks(title, source_playlist_id=None, **_kwargs):
+            entries = playlists[source_playlist_id][1]
+            return {"status": "ok", "tracks": [
+                {"position": n, "artist": a, "title": t, "path": None} for n, (a, t) in enumerate(entries)]}
+
+        return _Patches(client, list_playlists, get_playlist_tracks)
+
+    def _switch(self, body=None, state="paired", target=None, carry=None):
+        body = {**(body or self._SUBSONIC), **({"carry": carry} if carry is not None else {})}
+        with mock.patch.object(main.subsonic_client, "test_connection",
+                               return_value={"state": state}) as test, \
+             mock.patch.object(main.subsonic_client, "reconnect") as reconnect, \
+             (target or self._target(main.subsonic_client)), \
+             mock.patch.object(main.playlist_sync, "start_sync",
+                               return_value={"status": "started", "job_id": 7}) as start:
+            resp = self.client.post("/api/admin/provider/switch", json=body)
+        return resp, test, reconnect, start
+
+    def _preview(self, body=None, target=None):
+        with (target or self._target(main.subsonic_client)):
+            return self.client.post("/api/admin/provider/switch/preview", json=body or self._SUBSONIC)
+
+    def test_the_config_put_refuses_a_different_provider_once_setup_is_done(self):
+        resp = self.client.put("/api/admin/config", json={"provider": "subsonic"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["field"], "provider")
+        self.assertEqual(self._provider(), "jellyfin")
+        self.assertEqual(self._titles(), {"Kids", "Focus", "Discover", "Road"})
+
+    def test_the_config_put_accepts_the_current_provider(self):
+        resp = self.client.put("/api/admin/config", json={"provider": "jellyfin"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_first_run_setup_still_picks_the_provider_through_the_put(self):
+        db.set_config(self.conn, "setup_completed", None)
+        self.conn.commit()
+        resp = self.client.put("/api/admin/config", json={"provider": "filesystem"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._provider(), "filesystem")
+
+    def test_the_preview_counts_what_a_switch_removes_and_changes_nothing(self):
+        resp = self._preview()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {
+            "from": "jellyfin",
+            "carried": {"count": 0, "titles": [], "ids": [], "status": "ok"},
+            "removed": {"count": 2, "titles": ["Focus", "Kids"], "mirrored": 1},
+            "devices": [{"name": "Garmin", "playlists": 1}],
+            "kept": {"tidal": 1, "filesystem": 1},
+        })
+        self.assertEqual(self._titles(), {"Kids", "Focus", "Discover", "Road"})
+
+    def test_the_preview_refuses_the_active_provider_and_an_unknown_one(self):
+        self.assertEqual(self._preview({**self._SUBSONIC, "provider": "jellyfin"}).status_code, 409)
+        self.assertEqual(self._preview({**self._SUBSONIC, "provider": "winamp"}).status_code, 400)
+
+    def test_a_switch_removes_only_the_old_providers_playlists(self):
+        resp, _test, reconnect, start = self._switch()
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        body = resp.get_json()
+        self.assertEqual(body["provider"], "subsonic")
+        self.assertEqual(body["removed"]["count"], 2)
+        self.assertEqual(body["sync"], {"status": "started", "job_id": 7})
+        reconnect.assert_called_once_with("http://nav.local", "u", "p")
+        start.assert_called_once_with(main.subsonic_client, "subsonic")
+        self.assertEqual(self._provider(), "subsonic")
+        self.assertEqual(self._titles(), {"Discover", "Road"})
+
+    def test_a_device_with_a_removed_playlist_selected_is_told_at_once(self):
+        # Before this, the switch deleted every playlist row and left the
+        # selection pointing at nothing: the playlist file vanished from the
+        # device's next sync, its tracks stayed until something else
+        # recomputed the device, and the dead selection was never removed.
+        self._switch()
+        conn = db.get_conn()
+        try:
+            sels = [r["type"] for r in conn.execute("SELECT type FROM selections")]
+            changes = sync_state.get_changes(conn, self.device)
+        finally:
+            conn.close()
+        self.assertEqual(sels, ["track"])
+        self.assertEqual(changes["playlists"], [])
+        self.assertEqual([d["track_id"] for d in changes["to_delete"]], [self.tracks[0]])
+        self.assertEqual([d["track_id"] for d in changes["downloaded"]], [self.tracks[1]])
+
+    def test_a_failed_connection_test_changes_nothing(self):
+        resp, _test, reconnect, start = self._switch(state="disconnected")
+        self.assertEqual(resp.status_code, 400)
+        reconnect.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(self._provider(), "jellyfin")
+        self.assertEqual(self._titles(), {"Kids", "Focus", "Discover", "Road"})
+
+    def test_a_switch_is_refused_while_a_playlist_sync_runs(self):
+        with mock.patch.object(main.playlist_sync, "sync_status", return_value={"running": True}):
+            resp, test, _reconnect, _start = self._switch()
+        self.assertEqual(resp.status_code, 409)
+        test.assert_not_called()
+        self.assertEqual(self._provider(), "jellyfin")
+
+    def test_a_sync_queued_during_the_test_or_the_planning_stops_the_switch(self):
+        with mock.patch.object(main.playlist_sync, "sync_status",
+                               side_effect=[{"running": False}, {"running": True}]):
+            resp, test, reconnect, start = self._switch()
+        self.assertEqual(resp.status_code, 409)
+        test.assert_called_once()
+        reconnect.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(self._provider(), "jellyfin")
+        self.assertEqual(self._titles(), {"Kids", "Focus", "Discover", "Road"})
+
+    def test_a_sync_job_runs_against_the_provider_active_when_it_starts(self):
+        # Queued under Jellyfin, run after a switch to Subsonic.
+        db.set_config(self.conn, "provider", "subsonic")
+        self.conn.commit()
+        with mock.patch.object(main.playlist_sync, "sync_playlists", return_value={}) as sync:
+            main._run_playlist_sync({"provider_id": "jellyfin"}, None)
+        sync.assert_called_once_with(main.subsonic_client, "subsonic")
+
+    def test_missing_fields_are_refused_before_any_test(self):
+        resp, test, _reconnect, _start = self._switch({"provider": "subsonic", "url": "http://nav.local"})
+        self.assertEqual(resp.status_code, 400)
+        test.assert_not_called()
+
+    def test_switching_away_from_filesystem_keeps_the_m3u_playlists(self):
+        db.set_config(self.conn, "provider", "filesystem")
+        self.conn.commit()
+        resp, *_ = self._switch()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["removed"]["count"], 0)
+        self.assertEqual(self._titles(), {"Kids", "Focus", "Discover", "Road"})
+
+    def test_music_assistant_can_be_switched_to_like_any_provider(self):
+        self._playlist("Probe mix", "music_assistant", [])
+        body = {"provider": "music_assistant", "url": "http://ma.local:8095", "token": "t"}
+        with mock.patch.object(main.music_assistant_client, "test_connection",
+                               return_value={"state": "paired"}), \
+             mock.patch.object(main.music_assistant_client, "reconnect") as reconnect, \
+             mock.patch.object(main.playlist_sync, "start_sync", return_value={"status": "started"}) as start:
+            resp = self.client.post("/api/admin/provider/switch", json=body)
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        reconnect.assert_called_once_with("http://ma.local:8095", "t")
+        start.assert_called_once_with(main.music_assistant_client, "music_assistant")
+        self.assertEqual(self._provider(), "music_assistant")
+        # Jellyfin's own playlists go; Music Assistant's were already there and stay.
+        self.assertEqual(self._titles(), {"Discover", "Road", "Probe mix"})
+
+    def test_switching_away_from_music_assistant_keeps_its_playlists(self):
+        db.set_config(self.conn, "provider", "music_assistant")
+        self.conn.commit()
+        self._playlist("Probe mix", "music_assistant", [])
+        resp, *_ = self._switch()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["removed"]["count"], 0)
+        self.assertIn("Probe mix", self._titles())
+
+    def test_first_run_setup_can_pick_music_assistant(self):
+        db.set_config(self.conn, "setup_completed", None)
+        self.conn.commit()
+        resp = self.client.put("/api/admin/config", json={"provider": "music_assistant"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._provider(), "music_assistant")
+
+    def test_the_connect_step_test_for_roon_reports_reachable_as_ok(self):
+        with mock.patch.object(main.roon_client, "test_connection",
+                               return_value={"state": "reachable"}) as test:
+            resp = self.client.post("/api/admin/provider/switch/test",
+                                    json={"provider": "roon", "host": "core.local", "port": "9330"})
+        self.assertEqual(resp.get_json()["ok"], True)
+        test.assert_called_once_with("core.local", 9330)
+
+    def test_the_switch_endpoints_are_admin_only(self):
+        _login(self.client, self.other)
+        self.assertEqual(self._preview().status_code, 403)
+        self.assertEqual(self._switch()[0].status_code, 403)
+        self.assertEqual(self._provider(), "jellyfin")
+
+
+    # --- Carrying playlists over to their namesakes ---
+
+    def _songs(self, names):
+        """Library tracks named by `names`, and their (artist, title) as a provider lists them."""
+        ids = []
+        for n in names:
+            cur = self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, track_no, size, mtime) "
+                "VALUES (?, 'Artist', 'Album', ?, 1, 1000, 0)", (f"Artist/Album/{n}.flac", n))
+            ids.append(sync_state._new_id(cur))
+        self.conn.commit()
+        return ids, [("Artist", n) for n in names]
+
+    def _party(self, owner=None):
+        """A Jellyfin playlist with four matched tracks, mirrored, selected on the device."""
+        ids, entries = self._songs(["Song 1", "Song 2", "Song 3", "Song 4"])
+        pid = self._playlist("Party Mix", "jellyfin", ids, mirror=True)
+        self.conn.execute("UPDATE playlists SET inferred_origin_provider = 'tidal', golden_source_id = ? "
+                          "WHERE id = ?", (self.tidal, pid))
+        if owner is not None:
+            self.conn.execute("UPDATE playlists SET owner_user_id = ? WHERE id = ?", (owner, pid))
+            self.conn.commit()
+        sync_state.create_selection(self.conn, "playlist", str(pid), self.owner, [self.device])
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded' WHERE device_id = ?",
+                          (self.device,))
+        self.conn.commit()
+        return pid, ids, entries
+
+    def _row(self, pid):
+        conn = db.get_conn()
+        try:
+            return conn.execute("SELECT * FROM playlists WHERE id = ?", (pid,)).fetchone()
+        finally:
+            conn.close()
+
+    def test_a_namesake_with_the_same_tracks_is_carried_over_with_its_id_and_settings(self):
+        pid, ids, entries = self._party()
+        target = lambda: self._target(main.subsonic_client, {"s-party": (" party  mix", entries)})
+        preview = self._preview(target=target()).get_json()
+        self.assertEqual(preview["carried"], {"count": 1, "titles": [" party  mix"], "ids": [pid], "status": "ok"})
+        self.assertEqual(preview["removed"]["titles"], ["Focus", "Kids"])
+
+        resp, *_ = self._switch(target=target(), carry=preview["carried"]["ids"])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["carried"]["count"], 1)
+        row = self._row(pid)
+        self.assertEqual((row["source_provider"], row["source_playlist_id"], row["mirror_enabled"]),
+                         ("subsonic", "s-party", 1))
+        # A Roon-only origin hint doesn't survive the move.
+        self.assertEqual((row["inferred_origin_provider"], row["golden_source_id"]), (None, None))
+        conn = db.get_conn()
+        try:
+            sel = conn.execute("SELECT 1 FROM selections WHERE type = 'playlist' AND target = ?",
+                               (str(pid),)).fetchone()
+            changes = sync_state.get_changes(conn, self.device)
+        finally:
+            conn.close()
+        self.assertIsNotNone(sel)
+        # The device keeps the playlist: nothing of it is queued for deletion.
+        self.assertFalse({d["track_id"] for d in changes["to_delete"]} & set(ids))
+
+    def test_the_preview_matches_what_the_switch_does(self):
+        _pid, _ids, entries = self._party()
+        # Three of the four tracks: carried over (3 shared, 100% of the smaller).
+        target = lambda: self._target(main.subsonic_client, {"s-party": ("Party Mix", entries[:3])})
+        preview = self._preview(target=target()).get_json()
+        done = self._switch(target=target(), carry=preview["carried"]["ids"])[0].get_json()
+        for key in ("carried", "removed", "devices", "kept"):
+            self.assertEqual(done[key], preview[key], key)
+
+    def test_a_target_that_answers_differently_at_the_switch_changes_nothing(self):
+        # The review showed Party Mix carried over; at the switch the target's
+        # listing fails, so the plan would remove it instead.
+        pid, _ids, entries = self._party()
+        preview = self._preview(target=self._target(
+            main.subsonic_client, {"s-party": ("Party Mix", entries)})).get_json()
+        self.assertEqual(preview["carried"]["ids"], [pid])
+        resp, _test, reconnect, start = self._switch(
+            target=self._target(main.subsonic_client, listing_ok=False), carry=preview["carried"]["ids"])
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json()["code"], "plan_changed")
+        reconnect.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(self._provider(), "jellyfin")
+        self.assertIsNotNone(self._row(pid))
+        conn = db.get_conn()
+        try:
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM selections WHERE type = 'playlist' AND target = ?", (str(pid),)).fetchone())
+        finally:
+            conn.close()
+
+    def test_a_carry_over_the_review_did_not_show_changes_nothing(self):
+        # Confirmed with nothing carried over; the target now has the namesake.
+        pid, _ids, entries = self._party()
+        resp, *_ = self._switch(target=self._target(
+            main.subsonic_client, {"s-party": ("Party Mix", entries)}), carry=[])
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(self._row(pid)["source_provider"], "jellyfin")
+
+    def test_a_namesake_with_too_little_overlap_is_not_carried_over(self):
+        pid, _ids, entries = self._party()
+        _other, others = self._songs(["Other 1", "Other 2", "Other 3"])
+        # Two shared tracks out of five: under the three-track minimum.
+        target = self._target(main.subsonic_client, {"s-party": ("Party Mix", entries[:2] + others)})
+        resp, *_ = self._switch(target=target)
+        self.assertEqual(resp.get_json()["carried"]["count"], 0)
+        self.assertIsNone(self._row(pid))
+
+    def test_three_shared_tracks_are_not_enough_under_sixty_percent(self):
+        ids, entries = self._songs([f"Long {n}" for n in range(8)])
+        pid = self._playlist("Long Drive", "jellyfin", ids)
+        _other, others = self._songs([f"Else {n}" for n in range(5)])
+        # Three shared of eight on the smaller side: 37.5%.
+        target = self._target(main.subsonic_client, {"s-long": ("Long Drive", entries[:3] + others)})
+        resp, *_ = self._switch(target=target)
+        self.assertEqual(resp.get_json()["carried"]["count"], 0)
+        self.assertIsNone(self._row(pid))
+
+    def test_two_small_playlists_sharing_everything_still_need_three_tracks(self):
+        # 2 of 2 shared passes the 60% rule; only the 3-track minimum stops a
+        # different two-song "Favourites" being adopted.
+        ids, entries = self._songs(["Fav 1", "Fav 2"])
+        pid = self._playlist("Favourites", "jellyfin", ids)
+        target = lambda: self._target(main.subsonic_client, {"s-fav": ("Favourites", entries)})
+        preview = self._preview(target=target()).get_json()
+        self.assertEqual(preview["carried"]["count"], 0)
+        resp, *_ = self._switch(target=target(), carry=preview["carried"]["ids"])
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(self._row(pid))
+
+    def test_a_target_playlist_that_already_has_a_row_is_not_paired(self):
+        # Re-keying onto it would collide with the unique (provider, id) index.
+        pid, _ids, entries = self._party()
+        stale = self._playlist("Other", "subsonic", [])
+        self.conn.execute("UPDATE playlists SET source_playlist_id = 's-party' WHERE id = ?", (stale,))
+        self.conn.commit()
+        target = self._target(main.subsonic_client, {"s-party": ("Party Mix", entries)})
+        preview = self._preview(target=target).get_json()
+        self.assertEqual(preview["carried"]["count"], 0)
+        resp, *_ = self._switch(target=self._target(main.subsonic_client, {"s-party": ("Party Mix", entries)}),
+                                carry=preview["carried"]["ids"])
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertIsNone(self._row(pid))
+
+    def test_duplicate_namesakes_are_left_unmatched(self):
+        pid, _ids, entries = self._party()
+        target = self._target(main.subsonic_client, {
+            "s-a": ("Party Mix", entries), "s-b": ("party mix", entries)})
+        resp, *_ = self._switch(target=target)
+        self.assertEqual(resp.get_json()["carried"]["count"], 0)
+        self.assertIsNone(self._row(pid))
+
+    def test_a_namesake_of_another_owner_is_not_carried_over(self):
+        # The old playlist is the owner's own; Subsonic's listing has no owner.
+        pid, _ids, entries = self._party(owner=self.owner)
+        target = self._target(main.subsonic_client, {"s-party": ("Party Mix", entries)})
+        resp, *_ = self._switch(target=target)
+        self.assertEqual(resp.get_json()["carried"]["count"], 0)
+        self.assertIsNone(self._row(pid))
+
+    def test_a_users_own_playlist_is_carried_over_to_that_users_namesake(self):
+        pid, _ids, entries = self._party(owner=self.owner)
+        self.conn.execute("UPDATE users SET emby_user_id = 'emby-owner' WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        body = {"provider": "emby", "url": "http://emby.local", "api_key": "k", "username": "u"}
+        target = lambda: self._target(main.emby_client, {"e-party": ("Party Mix", entries)},
+                                      per_user={"emby-owner": ["e-party"]})
+        with mock.patch.object(main.emby_client, "_resolve_user_id", return_value="emby-admin"):
+            preview = self._preview(body, target=target()).get_json()
+        self.assertEqual(preview["carried"]["count"], 1)
+        with mock.patch.object(main.emby_client, "test_connection", return_value={"state": "paired"}), \
+             mock.patch.object(main.emby_client, "_resolve_user_id", return_value="emby-admin"), \
+             mock.patch.object(main.emby_client, "reconnect"), target(), \
+             mock.patch.object(main.playlist_sync, "start_sync", return_value={"status": "started"}):
+            resp = self.client.post("/api/admin/provider/switch",
+                                    json={**body, "carry": preview["carried"]["ids"]})
+        self.assertEqual(resp.get_json()["carried"]["count"], 1)
+        self.assertEqual(self._row(pid)["source_playlist_id"], "e-party")
+
+    def test_the_preview_reads_the_target_with_the_typed_connection_only(self):
+        seen = []
+
+        def list_playlists(user_id=None):
+            seen.append(main.subsonic_client._current_config())
+            return {"status": "ok", "playlists": []}
+
+        self._party()
+        with mock.patch.object(main.subsonic_client, "list_playlists", side_effect=list_playlists):
+            self.client.post("/api/admin/provider/switch/preview", json=self._SUBSONIC)
+        self.assertEqual(seen, [("http://nav.local", "u", "p")])
+        # Outside the request, the stored (empty) connection again.
+        self.assertEqual(main.subsonic_client._current_config(), ("", "", ""))
+
+    def test_an_unreadable_target_carries_nothing_over_and_says_why(self):
+        pid, _ids, _entries = self._party()
+        preview = self._preview(target=self._target(main.subsonic_client, listing_ok=False)).get_json()
+        self.assertEqual(preview["carried"], {"count": 0, "titles": [], "ids": [], "status": "listing_failed"})
+        self.assertEqual(preview["removed"]["count"], 3)
+        resp, *_ = self._switch(target=self._target(main.subsonic_client, listing_ok=False))
+        self.assertIsNone(self._row(pid))
+
+    def test_roon_and_filesystem_targets_carry_nothing_over(self):
+        self._party()
+        preview = self._preview({"provider": "filesystem"}).get_json()
+        self.assertEqual(preview["carried"]["status"], "already_listed")
+        preview = self._preview({"provider": "roon", "host": "core.local", "port": "9330"}).get_json()
+        self.assertEqual(preview["carried"]["status"], "not_listable")
+        # Music Assistant, a provider now, is listed under every provider too.
+        preview = self._preview({"provider": "music_assistant", "url": "http://ma.local:8095",
+                                 "token": "t"}).get_json()
+        self.assertEqual(preview["carried"]["status"], "already_listed")
+
+
+class _Patches:
+    """Patches a client's list_playlists and get_playlist_tracks together."""
+
+    def __init__(self, client, list_playlists, get_playlist_tracks):
+        self._patches = [mock.patch.object(client, "list_playlists", side_effect=list_playlists),
+                         mock.patch.object(client, "get_playlist_tracks", side_effect=get_playlist_tracks)]
+
+    def __enter__(self):
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in self._patches:
+            p.stop()
+        return False
 
 
 class AdminConfigMirrorSubsonicTests(_RouteTestBase):
@@ -2049,6 +3088,58 @@ class AdminConfigMirrorJellyfinTests(_RouteTestBase):
         resp = self.client.get("/api/admin/config")
         self.assertEqual(resp.get_json()["mirror_jellyfin_state"], "disconnected")
 
+
+class AdminConfigMirrorPlexTests(_RouteTestBase):
+    """The Plex mirror target: its own URL and token, saved together,
+    cleared together, echoed back with its state, and the sink toggle."""
+
+    def _answer(self, status=200):
+        resp = mock.Mock()
+        resp.status_code = status
+        resp.content = b'{"MediaContainer": {}}'
+        resp.headers = {"Content-Type": "application/json"}
+        resp.json.return_value = {"MediaContainer": {}}
+        return resp
+
+    def test_url_and_token_are_saved_and_the_state_reported(self):
+        _login(self.client, self.admin)
+        with mock.patch("requests.request", return_value=self._answer()):
+            resp = self.client.put("/api/admin/config", json={
+                "mirror_plex_url": " http://plex.example.com:32400 ", "mirror_plex_token": "tok"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_mirror_plex_config(), ("http://plex.example.com:32400", "tok"))
+        body = resp.get_json()
+        self.assertEqual((body["mirror_plex_url"], body["mirror_plex_token"], body["mirror_plex_state"]),
+                         ("http://plex.example.com:32400", "tok", "paired"))
+
+    def test_blanking_both_clears_it(self):
+        db.set_config(self.conn, "mirror_plex_url", "http://plex.example.com:32400")
+        db.set_config(self.conn, "mirror_plex_token", "tok")
+        self.conn.commit()
+        _login(self.client, self.admin)
+        with mock.patch("requests.request") as request:
+            resp = self.client.put("/api/admin/config", json={"mirror_plex_url": "", "mirror_plex_token": ""})
+        self.assertEqual(resp.status_code, 200)
+        request.assert_not_called()
+        self.assertIsNone(db.get_mirror_plex_config())
+
+    def test_one_field_alone_changes_nothing(self):
+        _login(self.client, self.admin)
+        self.client.put("/api/admin/config", json={"mirror_plex_url": "http://plex.example.com:32400"})
+        self.assertIsNone(db.get_config(self.conn, "mirror_plex_url"))
+
+    def test_the_sink_toggle_accepts_plex(self):
+        cur = self.conn.execute("INSERT INTO playlists (title) VALUES ('Mix')")
+        pid = cur.lastrowid
+        self.conn.commit()
+        _login(self.client, self.admin)
+        resp = self.client.post(f"/api/provider/playlists/{pid}/mirror", json={"enabled": True, "sink": "plex"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body["plex_mirror_enabled"])
+        self.assertEqual(body["plex_mirror_last_error_code"], "unset_target")
+        listed = [p for p in self.client.get("/api/provider/playlists").get_json() if p["id"] == pid][0]
+        self.assertEqual((listed["plex_mirror_enabled"], listed["plex_mirror_configured"]), (True, False))
 
 class AdminConfigMirrorEmbyTests(_RouteTestBase):
     """#189: PUT /api/admin/config's Emby mirror-TARGET triple — same shape
@@ -3493,6 +4584,56 @@ class FirstRunBootstrapTests(unittest.TestCase):
         self.assertEqual(self._admins(), [])
 
 
+class DeviceIconTests(_RouteTestBase):
+    """A device's icon: an optional picture from a fixed set, apart from its
+    type. Null follows the type; it is served wherever the type is, except
+    the published integration API, whose shape is locked."""
+
+    def setUp(self):
+        super().setUp()
+        self.phone, self.token = sync_state.create_device(self.conn, self.owner, "Phone", "dap")
+        _login(self.client, self.owner)
+
+    def _patch(self, body):
+        return self.client.patch(f"/api/devices/{self.phone}", json=body)
+
+    def _listed(self, path, **kw):
+        return next(d for d in self.client.get(path, **kw).get_json() if d["id"] == self.phone)
+
+    def test_a_new_device_has_no_icon_and_follows_its_type(self):
+        self.assertIsNone(self._listed("/api/devices")["icon"])
+
+    def test_an_icon_from_the_set_is_stored_and_served_beside_the_type(self):
+        self.assertEqual(self._patch({"icon": "clickwheel"}).status_code, 200)
+        listed = self._listed("/api/devices")
+        self.assertEqual((listed["icon"], listed["device_type"]), ("clickwheel", "dap"))  # the type is untouched
+        app_headers = {"Authorization": f"Bearer {self.token}"}
+        self.assertEqual(self._listed("/api/app/devices", headers=app_headers)["icon"], "clickwheel")
+        self.assertEqual(self.client.get("/api/device/info", headers=app_headers).get_json()["icon"], "clickwheel")
+
+    def test_null_clears_it_and_an_icon_outside_the_set_is_refused(self):
+        self._patch({"icon": "cassette"})
+        self.assertEqual(self._patch({"icon": None}).status_code, 200)
+        self.assertIsNone(self._listed("/api/devices")["icon"])
+        for bad in ("player", "", "PHONE", 3, True):
+            with self.subTest(icon=bad):
+                self.assertEqual(self._patch({"icon": bad}).status_code, 400)
+        self.assertIsNone(self._listed("/api/devices")["icon"])
+
+    def test_a_patch_without_an_icon_leaves_it_alone(self):
+        self._patch({"icon": "cassette"})
+        self._patch({"name": "Kitchen"})
+        self.assertEqual(self._listed("/api/devices")["icon"], "cassette")
+
+    def test_the_set_matches_the_glyphs_the_web_ships(self):
+        # Every id the server accepts has a glyph in icons.js, so no stored
+        # icon ever draws as a blank.
+        icons_js = (Path(__file__).parent / "static" / "js" / "icons.js").read_text()
+        for icon in main.DEVICE_ICONS:
+            with self.subTest(icon=icon):
+                self.assertIn(f'"device-{icon}":', icons_js)
+
+
 class DeviceEndpointTests(_RouteTestBase):
     """#97 (honour transcode_format on create), #99 (CSRF Origin check must
     still cover the plural /api/devices web API), #100 (input validation:
@@ -3631,6 +4772,25 @@ class DeviceRepairCodeRouteTests(_RouteTestBase):
         body = self.client.post("/api/enrollment/redeem",
                                 json={"code": code, "name": "Some new phone"}).get_json()
         self.assertEqual(body["name"], "Pixel")
+
+    def test_a_card_devices_code_is_8_characters_and_keeps_the_device(self):
+        """The web UI's pairing action for every device, and its new-device
+        flow for a DAP, card or folder: an 8-character code bound to that
+        device. The desktop app redeems it with its own name and type; the
+        device keeps the ones it has, its limit included."""
+        card_id, _token = sync_state.create_device(
+            self.conn, self.owner, "Kitchen card", "sdcard", 8_000_000_000)
+        self.conn.commit()
+        code = self._mint(card_id).get_json()["code"]
+        self.assertRegex(code, r"^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$")
+
+        body = self.client.post("/api/enrollment/redeem", json={
+            "code": code, "name": "card", "device_type": "sdcard"}).get_json()
+        self.assertEqual((body["id"], body["name"]), (card_id, "Kitchen card"))
+        row = self.conn.execute(
+            "SELECT device_type, max_size_bytes FROM devices WHERE id = ?", (card_id,)).fetchone()
+        self.assertEqual((row["device_type"], row["max_size_bytes"]), ("sdcard", 8_000_000_000))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0], 2)
 
     def test_a_stranger_cannot_mint_a_repair_code(self):
         # 403 rather than 404: the device exists, this user just may not
@@ -4404,7 +5564,7 @@ class IntegrationMirrorsRouteTests(_RouteTestBase):
         self.assertEqual(
             body["by_sink"],
             {sink: {"enabled": 0, "failing": 0}
-             for sink in ("filesystem", "subsonic", "jellyfin", "emby")},
+             for sink in ("filesystem", "subsonic", "jellyfin", "emby", "music_assistant", "plex")},
         )
 
     def test_an_enabled_healthy_mirror_counts_as_enabled_not_failing(self):
@@ -5137,6 +6297,197 @@ class DeviceManifestRouteTests(_RouteTestBase):
             headers={"Authorization": f"Bearer {self.token}"})
         self.assertEqual(resp.status_code, 400)
 
+
+
+class DevicePlaylistsRouteTests(_RouteTestBase):
+    """POST /api/device/playlists: playlists a person made on a device,
+    uploaded by the client that syncs it, become playlists of the device's
+    owner and go out to the mirrors like any other."""
+
+    def setUp(self):
+        super().setUp()
+        self.device, self.token = sync_state.create_device(self.conn, self.owner, "Ana's DAP")
+        for rel, artist, album, title, no in (
+                ("lib/a.flac", "Cinder & Ash", "Emberwake", "Smoulder", 1),
+                ("lib/b.flac", "Glass Meridian", "Latitude", "Two Suns", 2)):
+            self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, track_no, size, mtime) "
+                              "VALUES (?, ?, ?, ?, ?, 1, 0)", (rel, artist, album, title, no))
+        self.conn.commit()
+        index = sync_state.device_path_index(self.conn, self.device)
+        self.on_card = {row["relative_path"]: p for p, row in index.items()}
+
+    def _upload(self, playlists, token=None):
+        return self.client.post("/api/device/playlists", json={"playlists": playlists},
+                                headers={"Authorization": f"Bearer {token or self.token}"})
+
+    def _rows(self):
+        return self.conn.execute(
+            "SELECT id, title, source_provider, source_playlist_id, owner_user_id, shared "
+            "FROM playlists WHERE source_provider = 'device' ORDER BY title").fetchall()
+
+    def _matched(self, playlist_id):
+        return [r["relative_path"] for r in self.conn.execute(
+            "SELECT t.relative_path FROM playlist_tracks pt LEFT JOIN tracks t ON t.id = pt.matched_track_id "
+            "WHERE pt.playlist_id = ? ORDER BY pt.position", (playlist_id,))]
+
+    def test_a_card_playlist_becomes_a_private_playlist_of_the_devices_owner(self):
+        a = self.on_card["lib/a.flac"]
+        resp = self._upload([{"path": "Road Trip.m3u8", "entries": [a]}])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"playlists": 1, "tracks": 1, "matched": 1, "unknown": 0})
+        [row] = self._rows()
+        self.assertEqual((row["title"], row["owner_user_id"], row["shared"], row["source_playlist_id"]),
+                         ("Road Trip", self.owner, 0, f"{self.device}:Road Trip.m3u8"))
+        self.assertEqual(self._matched(row["id"]), ["lib/a.flac"])
+
+    def test_the_three_ways_players_write_entries_resolve(self):
+        a, b = self.on_card["lib/a.flac"], self.on_card["lib/b.flac"]
+        self._upload([{"path": "Playlists/Mix.m3u", "entries": [
+            "../" + a,                         # relative to the playlist's folder
+            b,                                 # relative to the sync root
+            "/mnt/sdcard/Music/" + a,          # absolute, from the player's mount
+            "E:\\Music\\" + b.replace("/", "\\"),  # a Windows-made playlist
+        ]}])
+        [row] = self._rows()
+        self.assertEqual(self._matched(row["id"]), ["lib/a.flac", "lib/b.flac", "lib/a.flac", "lib/b.flac"])
+
+    def test_short_entries_resolve_against_the_playlists_folder(self):
+        # A playlist saved inside an album folder lists bare file names; one
+        # in an artist folder lists Album/file. Neither has three segments.
+        artist, album, name = self.on_card["lib/a.flac"].split("/")
+        self._upload([{"path": f"{artist}/{album}/album.m3u", "entries": [name]},
+                      {"path": f"{artist}/best.m3u", "entries": [f"{album}/{name}", f"./{album}/{name}"]},
+                      {"path": "top.m3u", "entries": [name]}])  # at the root, a bare name is nothing
+        matched = {r["title"]: self._matched(r["id"]) for r in self._rows()}
+        self.assertEqual(matched, {"album": ["lib/a.flac"], "best": ["lib/a.flac", "lib/a.flac"], "top": [None]})
+
+    def test_an_entry_matching_no_track_goes_to_the_devices_unknown_tracks(self):
+        resp = self._upload([{"path": "Mix.m3u", "entries": ["Side Loaded/Bootleg/01 - Live.mp3"]}])
+        self.assertEqual(resp.get_json()["unknown"], 1)
+        unknown = self.conn.execute("SELECT path, artist, title FROM device_unknown_tracks WHERE device_id = ?",
+                                    (self.device,)).fetchall()
+        self.assertEqual([tuple(r) for r in unknown], [("Side Loaded/Bootleg/01 - Live.mp3", "Side Loaded", "Live")])
+        self.assertEqual(self.conn.execute("SELECT unknown_track_count FROM devices WHERE id = ?",
+                                           (self.device,)).fetchone()[0], 1)
+        [row] = self._rows()
+        self.assertEqual(self._matched(row["id"]), [None])
+
+    def test_a_reupload_updates_and_a_file_gone_from_the_card_is_removed(self):
+        a, b = self.on_card["lib/a.flac"], self.on_card["lib/b.flac"]
+        self._upload([{"path": "One.m3u", "entries": [a]}, {"path": "Two.m3u", "entries": [a]}])
+        one = {r["title"]: r["id"] for r in self._rows()}["One"]
+        self._upload([{"path": "One.m3u", "entries": [b, a]}])
+        self.assertEqual([r["title"] for r in self._rows()], ["One"])
+        self.assertEqual(self._rows()[0]["id"], one, "same row, updated in place")
+        self.assertEqual(self._matched(one), ["lib/b.flac", "lib/a.flac"])
+
+    def test_another_devices_playlists_are_left_alone(self):
+        other, other_token = sync_state.create_device(self.conn, self.owner, "Phone")
+        a = self.on_card["lib/a.flac"]
+        self._upload([{"path": "Mine.m3u", "entries": [a]}])
+        self._upload([], token=other_token)
+        self.assertEqual([r["title"] for r in self._rows()], ["Mine"])
+
+    def test_a_playlist_trobar_wrote_to_the_card_is_never_read_back(self):
+        # Trobar -> card -> Trobar: a playlist selected onto this device is
+        # written to its root; uploading that file is ignored.
+        a = self.on_card["lib/a.flac"]
+        self._upload([{"path": "Mine.m3u", "entries": [a]}])
+        [mine] = self._rows()
+        sync_state.create_selection(self.conn, "playlist", str(mine["id"]), self.owner, [self.device])
+        [written] = sync_state.device_playlist_filenames(self.conn, self.device)
+        resp = self._upload([{"path": "Mine.m3u", "entries": [a]}, {"path": written, "entries": [a]}])
+        self.assertEqual(resp.get_json()["playlists"], 1)
+        self.assertEqual([r["title"] for r in self._rows()], ["Mine"])
+
+    def test_its_mirror_is_written_and_never_read_back_as_a_source(self):
+        # card -> Trobar -> mirror folder (a Kodi folder) -> filesystem reader.
+        mirror_dir = Path(tempfile.mkdtemp(prefix="trobar-test-device-mirror-", dir=_TMP))
+        db.set_config(self.conn, "mirror_folder", str(mirror_dir))
+        db.set_config(self.conn, "music_root", str(mirror_dir))  # the mirror seen inside the library
+        self.conn.commit()
+        a = self.on_card["lib/a.flac"]
+        self._upload([{"path": "Road Trip.m3u8", "entries": [a]}])
+        [row] = self._rows()
+        self.conn.execute("UPDATE playlists SET mirror_enabled = 1 WHERE id = ?", (row["id"],))
+        self.conn.commit()
+        self._upload([{"path": "Road Trip.m3u8", "entries": [a]}])
+        written = list(mirror_dir.rglob("*_Trobar_.m3u"))
+        self.assertEqual([p.relative_to(mirror_dir).parts[0] for p in written], ["owner"])
+        self.assertEqual(filesystem_client.list_playlists()["playlists"], [])
+        # Removing the file from the card removes the row and its mirror.
+        self._upload([])
+        self.assertEqual(self._rows(), [])
+        self.assertEqual(list(mirror_dir.rglob("*.m3u")), [])
+
+    def test_the_list_names_the_device_a_playlist_came_from(self):
+        a = self.on_card["lib/a.flac"]
+        self.conn.execute("UPDATE devices SET device_type = 'dap' WHERE id = ?", (self.device,))
+        self.conn.commit()
+        self._upload([{"path": "Road Trip.m3u8", "entries": [a]}])
+        _login(self.client, self.owner)
+        [row] = [p for p in self.client.get("/api/provider/playlists").get_json() if p["source_provider"] == "device"]
+        self.assertEqual((row["source_device_name"], row["source_device_type"]), ("Ana's DAP", "dap"))
+
+    def test_deleting_the_device_removes_its_playlists_and_their_mirrors(self):
+        mirror_dir = Path(tempfile.mkdtemp(prefix="trobar-test-device-delete-", dir=_TMP))
+        db.set_config(self.conn, "mirror_folder", str(mirror_dir))
+        self.conn.commit()
+        self._upload([{"path": "Road Trip.m3u8", "entries": [self.on_card["lib/a.flac"]]}])
+        [row] = self._rows()
+        self.conn.execute("UPDATE playlists SET mirror_enabled = 1 WHERE id = ?", (row["id"],))
+        self.conn.commit()
+        self._upload([{"path": "Road Trip.m3u8", "entries": [self.on_card["lib/a.flac"]]}])
+        self.assertEqual(len(list(mirror_dir.rglob("*_Trobar_.m3u"))), 1)
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.delete(f"/api/devices/{self.device}").status_code, 200)
+        self.assertEqual(self._rows(), [])
+        self.assertEqual(list(mirror_dir.rglob("*.m3u")), [])
+
+    def test_replacing_the_device_moves_its_playlists_to_the_new_one(self):
+        self._upload([{"path": "Road Trip.m3u8", "entries": [self.on_card["lib/a.flac"]]}])
+        [before] = self._rows()
+        new, new_token = sync_state.create_device(self.conn, self.owner, "Ana's new DAP")
+        sync_state.transfer_device(self.conn, self.device, new)
+        self.conn.commit()
+        [after] = self._rows()
+        self.assertEqual((after["id"], after["source_playlist_id"]), (before["id"], f"{new}:Road Trip.m3u8"))
+        # The new device's next upload keeps the same row.
+        self._upload([{"path": "Road Trip.m3u8", "entries": [self.on_card["lib/a.flac"]]}], token=new_token)
+        self.assertEqual([r["id"] for r in self._rows()], [before["id"]])
+
+    def test_bad_uploads_are_refused(self):
+        a = self.on_card["lib/a.flac"]
+        bodies: tuple[dict, ...] = ({"playlists": "x"}, {"nope": []},
+                     {"playlists": [{"path": "../x.m3u", "entries": [a]}]},
+                     {"playlists": [{"path": "/abs.m3u", "entries": [a]}]},
+                     {"playlists": [{"path": ".trobar/x.m3u", "entries": [a]}]},
+                     {"playlists": [{"path": "song.flac", "entries": [a]}]},
+                     {"playlists": [{"path": "x.m3u", "entries": "a"}]},
+                     {"playlists": [{"path": "x.m3u", "entries": [1]}]})
+        for body in bodies:
+            with self.subTest(body=body):
+                resp = self.client.post("/api/device/playlists", json=body,
+                                        headers={"Authorization": f"Bearer {self.token}"})
+                self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self._rows(), [])
+
+    def test_the_caps_bound_one_upload(self):
+        # The only bound on the work one device token can ask for.
+        one = {"path": "x.m3u", "entries": [self.on_card["lib/a.flac"]]}
+        at_cap = [dict(one, path=f"p{i}.m3u") for i in range(main._DEVICE_PLAYLISTS_MAX)]
+        self.assertEqual(self._upload(at_cap).status_code, 200)
+        over = at_cap + [dict(one, path="one-more.m3u")]
+        self.assertEqual(self._upload(over).status_code, 400)
+        entries = ["x/y/z.mp3"] * main._DEVICE_PLAYLIST_ENTRIES_MAX
+        self.assertEqual(self._upload([{"path": "long.m3u", "entries": entries}]).status_code, 200)
+        self.assertEqual(self._upload([{"path": "long.m3u", "entries": entries + ["x/y/z.mp3"]}]).status_code, 400)
+
+    def test_a_device_token_is_required(self):
+        resp = self.client.post("/api/device/playlists", json={"playlists": []})
+        self.assertEqual(resp.status_code, 401)
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.post("/api/device/playlists", json={"playlists": []}).status_code, 401)
 
 class DeviceFingerprintsRouteTests(_RouteTestBase):
     """#239: GET /api/device/fingerprints (device Bearer) serves the
@@ -5893,8 +7244,70 @@ class DashboardWidgetsCoverLimitTests(unittest.TestCase):
         # same dict — validating cover_limit must not drop them.
         result = main._normalize_dashboard_widgets(
             {"settings": {"recently_added": {"months": 6}, "cover_limit": 30}})
-        self.assertEqual(result["settings"]["recently_added"], {"months": 6})
+        self.assertEqual(result["settings"]["recently_added"], {"months": 6, "cover_limit": 30})  # its count from the single value
         self.assertEqual(result["settings"]["cover_limit"], 30)
+
+
+class DashboardWidgetsPerWidgetCoverLimitTests(_RouteTestBase):
+    """Each cover widget has its own cover count. A set stored with the old
+    single value reads as that value for all three; the single value stays
+    in every answer, as Suggestions' count, for an app built before the
+    split; and a PATCH of the single value, which such an app sends, sets
+    all three."""
+
+    def _patch(self, body):
+        _login(self.client, self.owner)
+        return self.client.patch("/api/profile/dashboard-widgets", json=body)
+
+    def test_an_older_set_reads_as_its_single_value_for_each_cover_widget(self):
+        result = main._normalize_dashboard_widgets({"settings": {"cover_limit": 45}})
+        for widget in ("suggestions", "recently_added", "recently_released"):
+            self.assertEqual(result["settings"][widget]["cover_limit"], 45)
+        self.assertEqual(result["settings"]["cover_limit"], 45)
+
+    def test_a_widgets_own_count_changes_that_widget_only(self):
+        body = self._patch({"settings": {"recently_added": {"cover_limit": 60}}}).get_json()
+        self.assertEqual(body["settings"]["recently_added"]["cover_limit"], 60)
+        self.assertEqual(body["settings"]["suggestions"]["cover_limit"], 15)
+        self.assertEqual(body["settings"]["recently_released"]["cover_limit"], 15)
+        # The single value an older app reads is Suggestions' count.
+        self.assertEqual(body["settings"]["cover_limit"], 15)
+        body = self._patch({"settings": {"suggestions": {"cover_limit": 30}}}).get_json()
+        self.assertEqual(body["settings"]["cover_limit"], 30)
+
+    def test_the_single_value_an_older_app_sends_sets_all_three(self):
+        self._patch({"settings": {"recently_added": {"cover_limit": 60}}})
+        body = self._patch({"settings": {"cover_limit": 45}}).get_json()
+        for widget in ("suggestions", "recently_added", "recently_released"):
+            self.assertEqual(body["settings"][widget]["cover_limit"], 45)
+
+    def test_a_months_change_keeps_the_widgets_count_and_the_other_way_round(self):
+        self._patch({"settings": {"recently_added": {"cover_limit": 60}}})
+        body = self._patch({"settings": {"recently_added": {"months": 9}}}).get_json()
+        self.assertEqual(body["settings"]["recently_added"], {"cover_limit": 60, "months": 9})
+        body = self._patch({"settings": {"recently_added": {"cover_limit": 30}}}).get_json()
+        self.assertEqual(body["settings"]["recently_added"], {"cover_limit": 30, "months": 9})
+
+    def test_a_malformed_per_widget_setting_is_refused(self):
+        bad_settings: list[dict] = [
+            {"recently_added": {"cover_limit": 7}},
+            {"recently_added": {"cover_limit": True}},
+            {"suggestions": {"months": 3}},  # Suggestions has no months
+            {"suggestions": {"colour": "red"}},
+            {"suggestions": {}},
+            {"suggestions": 30},
+        ]
+        for bad in bad_settings:
+            with self.subTest(settings=bad):
+                self.assertEqual(self._patch({"settings": bad}).status_code, 400)
+
+    def test_a_device_set_has_the_same_per_widget_counts(self):
+        _phone, token = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        headers = {"Authorization": f"Bearer {token}"}
+        body = self.client.patch("/api/app/dashboard/widgets", headers=headers,
+                                 json={"settings": {"recently_released": {"cover_limit": 30}}}).get_json()
+        self.assertEqual(body["settings"]["recently_released"]["cover_limit"], 30)
+        self.assertEqual(body["settings"]["suggestions"]["cover_limit"], 15)
 
 
 class DashboardWidgetsOrderTests(unittest.TestCase):
@@ -6076,6 +7489,167 @@ class MostPlayedRouteTests(_RouteTestBase):
         lastfm_call, listenbrainz_call = get.call_args_list
         self.assertEqual(lastfm_call.kwargs["params"]["period"], "12month")
         self.assertEqual(listenbrainz_call.kwargs["params"]["range"], "year")
+
+
+class MalojaRouteTests(_RouteTestBase):
+    """Maloja as a third listening-history source: a per-user URL on the
+    Profile, validated like the other URLs, counted by the configured flag
+    and the status badge, and merged with Last.fm/ListenBrainz with one copy
+    per album."""
+
+    _CHART = {"status": "ok", "list": [
+        {"scrobbles": 40, "album": {"artists": ["Ash", "Cinder"], "albumtitle": "Emberwake"}, "rank": 1},
+        {"scrobbles": 7, "album": {"artists": ["Glass Meridian"], "albumtitle": "Latitude"}, "rank": 2},
+    ]}
+
+    def _response(self, body):
+        resp = mock.Mock()
+        resp.json.return_value = body
+        resp.raise_for_status.return_value = None
+        resp.status_code = 200
+        return resp
+
+    @contextlib.contextmanager
+    def _http(self, **kw):
+        """One fake for every source: Last.fm and ListenBrainz call
+        requests.get, Maloja a url_guard session."""
+        fake = mock.Mock(**kw)
+        with mock.patch("requests.get", fake), mock.patch.object(main.url_guard.GuardedSession, "get", fake):
+            yield fake
+
+    def _set_url(self, url):
+        self.conn.execute("UPDATE users SET maloja_url = ? WHERE id = ?", (url, self.owner))
+        self.conn.commit()
+
+    def test_the_profile_stores_a_url_and_refuses_a_malformed_one(self):
+        _login(self.client, self.owner)
+        resp = self.client.put("/api/profile", json={"maloja_url": " http://192.168.1.10:42010 "})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["maloja_url"], "http://192.168.1.10:42010")
+        resp = self.client.put("/api/profile", json={"maloja_url": "maloja.local"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["field"], "maloja_url")
+        self.assertEqual(self.client.get("/api/profile").get_json()["maloja_url"], "http://192.168.1.10:42010")
+        self.assertEqual(self.client.put("/api/profile", json={"maloja_url": ""}).get_json()["maloja_url"], None)
+
+    def test_lan_addresses_are_accepted(self):
+        # A Maloja on the home network is the main use: no DNS involved here.
+        _login(self.client, self.owner)
+        for host in ("10.0.0.5", "172.16.0.5", "192.168.1.10", "[fd00::5]"):
+            with self.subTest(host=host):
+                url = f"http://{host}:42010"
+                resp = self.client.put("/api/profile", json={"maloja_url": url})
+                self.assertEqual((resp.status_code, resp.get_json()["maloja_url"]), (200, url))
+
+    def test_each_blocked_range_is_refused_when_saved(self):
+        _login(self.client, self.owner)
+        self.client.put("/api/profile", json={"maloja_url": "http://192.168.1.10:42010"})
+        cases = {
+            "127.0.0.1": "Loopback", "127.8.9.10": "Loopback", "[::1]": "Loopback",
+            "[::ffff:127.0.0.1]": "Loopback",
+            "169.254.169.254": "Link-local", "[fe80::1]": "Link-local", "[::ffff:169.254.169.254]": "Link-local",
+            "0.0.0.0": "unspecified", "[::]": "unspecified",
+            "224.0.0.1": "Multicast", "[ff02::1]": "Multicast",
+        }
+        for host, word in cases.items():
+            with self.subTest(host=host):
+                resp = self.client.put("/api/profile", json={"maloja_url": f"http://{host}:42010"})
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(resp.get_json()["field"], "maloja_url")
+                self.assertIn(word, resp.get_json()["error"])
+                self.assertTrue(resp.get_json()["error"].endswith("(Maloja URL)"))
+        self.assertEqual(self.client.get("/api/profile").get_json()["maloja_url"], "http://192.168.1.10:42010")
+
+    def test_a_hostname_resolving_to_loopback_is_refused_when_saved(self):
+        _login(self.client, self.owner)
+        answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 42010))]
+        with mock.patch("socket.getaddrinfo", return_value=answer) as resolve:
+            resp = self.client.put("/api/profile", json={"maloja_url": "http://maloja.example.invalid:42010"})
+        self.assertEqual(resolve.call_args.args[:2], ("maloja.example.invalid", 42010))
+        self.assertEqual((resp.status_code, resp.get_json()["field"]), (400, "maloja_url"))
+        self.assertIn("Loopback", resp.get_json()["error"])
+
+    def test_a_hostname_that_does_not_resolve_is_saved(self):
+        # It can't be reached either, and every request checks again.
+        _login(self.client, self.owner)
+        with mock.patch("socket.getaddrinfo", side_effect=socket.gaierror("no such host")):
+            resp = self.client.put("/api/profile", json={"maloja_url": "http://maloja.example.invalid:42010"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_the_status_badge(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.get("/api/maloja/status").get_json(), {"configured": False, "ok": False})
+        self._set_url("http://maloja.local:42010")
+        with self._http(return_value=self._response({"versionstring": "3.2.6"})):
+            self.assertEqual(self.client.get("/api/maloja/status").get_json(), {"configured": True, "ok": True})
+
+    def test_maloja_alone_counts_as_configured_for_the_app(self):
+        # The App API's flag, which the Android app reads: with Maloja as the
+        # only source the feed is configured, not "set up a scrobbler".
+        _device_id, token = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        headers = {"Authorization": f"Bearer {token}"}
+        self.assertFalse(self.client.get("/api/app/suggestions/most-played", headers=headers).get_json()["configured"])
+        self._set_url("http://maloja.local:42010")
+        with self._http(return_value=self._response(self._CHART)):
+            body = self.client.get("/api/app/suggestions/most-played", headers=headers).get_json()
+        self.assertTrue(body["configured"])
+        self.assertEqual([i["album"] for i in body["items"]], ["Emberwake", "Latitude"])
+
+    def test_most_played_merges_with_listenbrainz_keeping_one_copy(self):
+        self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                          "VALUES ('e.flac', 'Cinder & Ash', 'Emberwake', 'T', 1, 0)")
+        self.conn.execute("UPDATE users SET listenbrainz_username = 'alice', maloja_url = ? WHERE id = ?",
+                          ("http://maloja.local:42010", self.owner))
+        self.conn.commit()
+        lb = {"payload": {"release_groups": [
+            {"artist_name": "Cinder & Ash", "release_group_name": "Emberwake", "listen_count": 12}]}}
+
+        def get(url, **_kw):
+            return self._response(self._CHART if "maloja" in url else lb)
+
+        _login(self.client, self.owner)
+        with self._http(side_effect=get):
+            rows = self.client.get("/api/suggestions/most-played?period=overall").get_json()
+        self.assertEqual([(r["artist"], r["album"], r["playcount"]) for r in rows],
+                         [("Cinder & Ash", "Emberwake", 40), ("Glass Meridian", "Latitude", 7)])
+
+    def test_suggestions_come_from_maloja_alone(self):
+        self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                          "VALUES ('e.flac', 'Cinder & Ash', 'Emberwake', 'T', 1, 0)")
+        self._set_url("http://maloja.local:42010")
+
+        def get(url, **_kw):
+            return self._response(self._CHART if "charts" in url else {"status": "ok", "list": []})
+
+        _login(self.client, self.owner)
+        # Recently-added would name every album of a library this small first.
+        with self._http(side_effect=get), \
+             mock.patch.object(main.suggestions, "recently_added", return_value=[]):
+            rows = self.client.get("/api/suggestions?period=overall").get_json()
+        self.assertEqual([(r["artist"], r["album"], r["source"]) for r in rows],
+                         [("Cinder & Ash", "Emberwake", "maloja")])
+
+    def test_suggestions_include_maloja_and_dedup_against_last_fm(self):
+        self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                          "VALUES ('e.flac', 'Cinder & Ash', 'Emberwake', 'T', 1, 0)")
+        self.conn.execute("UPDATE users SET lastfm_username = 'alice', lastfm_api_key = 'k', maloja_url = ? "
+                          "WHERE id = ?", ("http://maloja.local:42010", self.owner))
+        self.conn.commit()
+        lastfm_top = {"topalbums": {"album": [
+            {"artist": {"name": "Cinder & Ash"}, "name": "Emberwake", "playcount": "3", "image": []}]}}
+
+        def get(url, **kw):
+            if "maloja" in url:
+                return self._response(self._CHART if "charts" in url else {"status": "ok", "list": []})
+            return self._response(lastfm_top if kw.get("params", {}).get("method") == "user.gettopalbums"
+                                  else {"recenttracks": {"track": []}})
+
+        _login(self.client, self.owner)
+        with self._http(side_effect=get):
+            rows = self.client.get("/api/suggestions?period=overall").get_json()
+        # Recently added, Last.fm and Maloja all name it: one copy (recently
+        # added comes first in the feed's priority order).
+        self.assertEqual([r["album"] for r in rows].count("Emberwake"), 1)
 
 
 class SuggestionsPeriodMappingRouteTests(_RouteTestBase):
@@ -6296,6 +7870,14 @@ class AppApiAuthTests(_RouteTestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["app_api"], main.APP_API_VERSION)
 
+    def test_the_level_is_two_since_the_playlist_section(self):
+        # Pinned rather than read from the constant: the Android app shows its
+        # Playlists tab only on level 2 or above, so a level that slid back
+        # would hide the tab on a server that has every route it needs.
+        resp = self.client.get(
+            "/api/device/info", headers={"Authorization": f"Bearer {self.token}"})
+        self.assertEqual(resp.get_json()["app_api"], 2)
+
     def test_every_route_under_the_prefix_refuses_an_unauthenticated_request(self):
         # The login gate exempts /api/app/ wholesale, so a route added under
         # it that forgets _authenticated_app_user() is not over-permissioned
@@ -6333,22 +7915,22 @@ class DashboardWidgetsMonthsTests(unittest.TestCase):
     def test_in_range_months_kept(self):
         result = main._normalize_dashboard_widgets(
             {"settings": {"recently_added": {"months": 6}, "recently_released": {"months": 24}}})
-        self.assertEqual(result["settings"]["recently_added"], {"months": 6})
-        self.assertEqual(result["settings"]["recently_released"], {"months": 24})
+        self.assertEqual(result["settings"]["recently_added"]["months"], 6)
+        self.assertEqual(result["settings"]["recently_released"]["months"], 24)
 
     def test_out_of_range_months_dropped(self):
         for bad in (0, 25, -3, 99):
             with self.subTest(months=bad):
                 result = main._normalize_dashboard_widgets(
                     {"settings": {"recently_added": {"months": bad}}})
-                self.assertNotIn("recently_added", result["settings"])
+                self.assertNotIn("months", result["settings"]["recently_added"])
 
     def test_non_integer_months_dropped(self):
         for bad in ("6", 6.5, True, None, [6]):
             with self.subTest(months=bad):
                 result = main._normalize_dashboard_widgets(
                     {"settings": {"recently_added": {"months": bad}}})
-                self.assertNotIn("recently_added", result["settings"])
+                self.assertNotIn("months", result["settings"]["recently_added"])
 
     def test_months_on_a_widget_without_that_setting_dropped(self):
         result = main._normalize_dashboard_widgets({"settings": {"devices": {"months": 3}}})
@@ -6356,7 +7938,7 @@ class DashboardWidgetsMonthsTests(unittest.TestCase):
 
     def test_unknown_settings_keys_dropped(self):
         result = main._normalize_dashboard_widgets({"settings": {"theme": "dark", "cover_limit": 30}})
-        self.assertEqual(result["settings"], {"cover_limit": 30})
+        self.assertEqual(result["settings"], {"suggestions": {"cover_limit": 30}, "recently_added": {"cover_limit": 30}, "recently_released": {"cover_limit": 30}, "cover_limit": 30})
 
 
 class DashboardWidgetsPatchRouteTests(_RouteTestBase):
@@ -6390,13 +7972,13 @@ class DashboardWidgetsPatchRouteTests(_RouteTestBase):
         self.assertEqual(body["order"], ["devices", "library"])
         # a non-admin's list always carries the admin-only widget, sorted
         self.assertEqual(body["disabled"], ["administration", "most_played"])
-        self.assertEqual(body["settings"]["recently_added"], {"months": 6})
+        self.assertEqual(body["settings"]["recently_added"], {"months": 6, "cover_limit": 15})
 
     def test_settings_merge_key_by_key(self):
         self._patch({"settings": {"cover_limit": 30}})
         body = self._patch({"settings": {"recently_added": {"months": 12}}}).get_json()
         self.assertEqual(body["settings"]["cover_limit"], 30)
-        self.assertEqual(body["settings"]["recently_added"], {"months": 12})
+        self.assertEqual(body["settings"]["recently_added"], {"months": 12, "cover_limit": 30})  # its count kept
 
     def test_the_narrow_write_does_not_touch_other_profile_fields(self):
         _login(self.client, self.owner)
@@ -6487,8 +8069,19 @@ class AppApiLibraryTests(_RouteTestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json(), self._session("/api/library/artists").get_json())
         by_name = {a["artist"]: a for a in resp.get_json()}
-        self.assertEqual(by_name["Alpha"], {"artist": "Alpha", "track_count": 3, "album_count": 2})
+        self.assertEqual(by_name["Alpha"],
+                         {"artist": "Alpha", "track_count": 3, "album_count": 2, "albums": ["X", "Y"]})
         self.assertEqual(by_name["Beta"]["album_count"], 1)  # the deleted album is not counted
+        self.assertEqual(by_name["Beta"]["albums"], ["Z"])  # nor listed
+
+    def test_each_artist_lists_its_album_titles_once_and_none_empty(self):
+        # One row per track in the database; one title per album in the answer.
+        self._track("c/1.flac", artist="Gamma", album="")
+        self._track("c/3.flac", artist="Gamma", album="W")
+        self._track("c/4.flac", artist="Gamma", album="W")
+        self.conn.commit()
+        by_name = {a["artist"]: a for a in self._app("/api/app/library/artists").get_json()}
+        self.assertEqual(by_name["Gamma"]["albums"], ["W"])
 
     def test_albums_match_the_session_route(self):
         resp = self._app("/api/app/library/albums?artist=Alpha")
@@ -6754,20 +8347,81 @@ class AppApiDashboardTests(_RouteTestBase):
 
     def test_widget_preferences_read_and_patch_under_the_prefix(self):
         stored = self._app("GET", "/api/app/dashboard/widgets").get_json()
-        self.assertEqual(stored, {"disabled": [], "order": [], "settings": {"cover_limit": 15}})
+        self.assertEqual(stored, {"disabled": [], "order": [], "settings": {"suggestions": {"cover_limit": 15}, "recently_added": {"cover_limit": 15}, "recently_released": {"cover_limit": 15}, "cover_limit": 15}})
         resp = self._app("PATCH", "/api/app/dashboard/widgets",
                          json={"disabled": ["devices"], "settings": {"recently_added": {"months": 6}}})
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         # a non-admin's list always carries the admin-only widget, sorted
         self.assertEqual(body["disabled"], ["administration", "devices"])
-        self.assertEqual(body["settings"], {"cover_limit": 15, "recently_added": {"months": 6}})
+        self.assertEqual(body["settings"]["recently_added"], {"cover_limit": 15, "months": 6})
         self.assertEqual(self._app("GET", "/api/app/dashboard/widgets").get_json(), body)
+        # The device's own set: the browser's is untouched.
         _login(self.client, self.owner)
-        self.assertEqual(self.client.get("/api/profile").get_json()["dashboard_widgets"], body)
+        self.assertEqual(self.client.get("/api/profile").get_json()["dashboard_widgets"],
+                         {"disabled": [], "order": [], "settings": {"suggestions": {"cover_limit": 15}, "recently_added": {"cover_limit": 15}, "recently_released": {"cover_limit": 15}, "cover_limit": 15}})
         self.assertEqual(self._app("PATCH", "/api/app/dashboard/widgets", json={"settings": {"cover_limit": 7}}).status_code, 400)
         self.assertEqual(self._app("PATCH", "/api/app/dashboard/widgets", data="[]",
                                    content_type="application/json").status_code, 400)
+
+
+class AppApiDeviceWidgetSetTests(_RouteTestBase):
+    """Each paired device keeps its own Home widget set, apart from the
+    browser's: a first read copies the browser's, and from then on neither
+    moves the other, nor one device another."""
+
+    BROWSER = {"disabled": ["devices"], "order": ["suggestions", "library"],
+               "settings": {"cover_limit": 30, "recently_added": {"months": 6}}}
+
+    def setUp(self):
+        super().setUp()
+        self.phone, self.token = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        self.tablet, self.tablet_token = sync_state.create_device(self.conn, self.owner, "Tablet", "tablet")
+        _login(self.client, self.owner)
+        resp = self.client.patch("/api/profile/dashboard-widgets", json=self.BROWSER)
+        self.assertEqual(resp.status_code, 200)
+        self.browser = resp.get_json()  # as stored, with the admin-only union
+
+    def _app(self, method, path, token=None, **kw):
+        return self.client.open(path, method=method, headers={"Authorization": f"Bearer {token or self.token}"}, **kw)
+
+    def _browser_set(self):
+        return self.client.get("/api/profile").get_json()["dashboard_widgets"]
+
+    def test_a_first_read_is_a_copy_of_the_browser_set_and_stays_one(self):
+        first = self._app("GET", "/api/app/dashboard/widgets").get_json()
+        self.assertEqual(first, self.browser)  # nobody's Home rearranges itself on upgrade
+        # Copied, not followed: a later browser change leaves the phone as it was.
+        self.client.patch("/api/profile/dashboard-widgets", json={"order": ["library"]})
+        self.assertEqual(self._app("GET", "/api/app/dashboard/widgets").get_json(), first)
+
+    def test_a_patch_through_the_app_leaves_the_browser_set_untouched_and_the_other_way_round(self):
+        phone = self._app("PATCH", "/api/app/dashboard/widgets", json={"order": ["library", "devices"]}).get_json()
+        self.assertEqual(self._browser_set(), self.browser)
+        self.client.patch("/api/profile/dashboard-widgets", json={"settings": {"cover_limit": 45}})
+        self.assertEqual(self._app("GET", "/api/app/dashboard/widgets").get_json(), phone)
+        self.assertEqual(self._browser_set()["settings"]["cover_limit"], 45)
+
+    def test_each_device_has_its_own_set(self):
+        self._app("PATCH", "/api/app/dashboard/widgets", json={"disabled": ["library"]})
+        tablet = self._app("GET", "/api/app/dashboard/widgets", token=self.tablet_token).get_json()
+        self.assertEqual(tablet, self.browser)  # the tablet's first read: the browser's, not the phone's
+        self.assertIn("library", self._app("GET", "/api/app/dashboard/widgets").get_json()["disabled"])
+
+    def test_the_admin_only_union_applies_to_a_device_set_as_to_the_browser_set(self):
+        body = self._app("PATCH", "/api/app/dashboard/widgets", json={"disabled": []}).get_json()
+        self.assertEqual(body["disabled"], ["administration"])
+
+    def test_a_replacement_device_takes_the_old_ones_set_unless_it_has_its_own(self):
+        self._app("PATCH", "/api/app/dashboard/widgets", json={"order": ["most_played"]})
+        sync_state.transfer_device(self.conn, self.phone, self.tablet)
+        self.assertEqual(self._app("GET", "/api/app/dashboard/widgets", token=self.tablet_token).get_json()["order"],
+                         ["most_played"])
+        # A new device that already chose its own keeps it.
+        third, third_token = sync_state.create_device(self.conn, self.owner, "DAP", "dap")
+        self._app("PATCH", "/api/app/dashboard/widgets", token=third_token, json={"order": ["devices"]})
+        sync_state.transfer_device(self.conn, self.tablet, third)
+        self.assertEqual(self._app("GET", "/api/app/dashboard/widgets", token=third_token).get_json()["order"], ["devices"])
 
 
 class AppApiProfileTests(_RouteTestBase):
@@ -6803,3 +8457,173 @@ class AppApiProfileTests(_RouteTestBase):
         self.client.put("/api/profile", json={"cover_view_mode": "grid", "show_reissue_year": False,
                                               "dashboard_widgets": {"disabled": [], "order": [], "settings": {}}})
         self.assertEqual(self._app("GET", "/api/app/profile").get_json()["cover_view_mode"], "list")
+
+
+class AppApiPlaylistTests(_RouteTestBase):
+    """/api/app/playlists* and /api/app/playlist-subscriptions* (#108): the
+    browser's playlist section behind the device token, minus mirroring.
+    #28 privacy and #81 attribution are exercised through these routes
+    themselves, not trusted to the shared function -- a privacy rule that
+    held in the browser and not on the phone would be a security bug."""
+
+    def setUp(self):
+        super().setUp()
+        _, self.owner_token = sync_state.create_device(self.conn, self.owner, "Owner's phone", "phone")
+        _, self.other_token = sync_state.create_device(self.conn, self.other, "Bob's phone", "phone")
+        _, self.admin_token = sync_state.create_device(self.conn, self.admin, "Admin's phone", "phone")
+        self.private = self._make_playlist("Private", owner_user_id=self.owner, shared=0)
+        self.shared = self._make_playlist("Shared", owner_user_id=self.owner, shared=1)
+        self.unowned = self._make_playlist("Unowned", owner_user_id=None, shared=1)
+        # #81: the owner's private Tidal copy, the same playlist through the
+        # household Roon connection (linked golden), and a Tidal-only one.
+        cur = self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, source_playlist_id, owner_user_id, shared, last_synced_at) "
+            "VALUES ('Road Trip', 'tidal', 'tid1', ?, 0, datetime('now'))", (self.owner,))
+        self.tidal = sync_state._new_id(cur)
+        cur = self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, owner_user_id, inferred_origin_provider, "
+            "golden_source_id, last_synced_at) VALUES ('Road Trip', 'roon', NULL, 'tidal', ?, datetime('now'))",
+            (self.tidal,))
+        self.roon = sync_state._new_id(cur)
+        cur = self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, source_playlist_id, owner_user_id, shared, last_synced_at) "
+            "VALUES ('Solo', 'tidal', 'tid2', ?, 0, datetime('now'))", (self.owner,))
+        self.solo = sync_state._new_id(cur)
+        self.conn.commit()
+
+    def _app(self, token, method, path, **kw):
+        return self.client.open(path, method=method, headers={"Authorization": f"Bearer {token}"}, **kw)
+
+    def _list(self, token):
+        resp = self._app(token, "GET", "/api/app/playlists")
+        self.assertEqual(resp.status_code, 200)
+        return {p["id"]: p for p in resp.get_json()}
+
+    # --- #28 and #81, through the App API ---------------------------------
+
+    def test_a_private_playlist_is_seen_by_its_owner_and_the_admin_only(self):
+        self.assertIn(self.private, self._list(self.owner_token))
+        self.assertIn(self.private, self._list(self.admin_token))
+        other = self._list(self.other_token)
+        self.assertNotIn(self.private, other)
+        self.assertIn(self.shared, other)
+        self.assertIn(self.unowned, other)
+
+    def test_golden_attribution_is_per_viewer(self):
+        owner = self._list(self.owner_token)
+        self.assertIn(self.tidal, owner)          # the owner sees their golden Tidal copy
+        self.assertNotIn(self.roon, owner)        # and not the Roon duplicate
+        other = self._list(self.other_token)
+        self.assertIn(self.roon, other)           # a non-owner reaches it through Roon
+        self.assertEqual(other[self.roon]["golden_owner_username"], "owner")
+        self.assertNotIn(self.tidal, other)       # the owner's Tidal copy stays private
+        self.assertNotIn(self.solo, other)        # and so does a Tidal-only one
+        admin = self._list(self.admin_token)
+        self.assertIn(self.tidal, admin)
+        self.assertNotIn(self.roon, admin)
+
+    def test_every_viewer_sees_exactly_what_the_browser_shows_them(self):
+        for user_id, token in ((self.owner, self.owner_token), (self.other, self.other_token),
+                               (self.admin, self.admin_token)):
+            _login(self.client, user_id)
+            browser = {p["id"]: p for p in self.client.get("/api/provider/playlists").get_json()}
+            with self.client.session_transaction() as sess:
+                sess.clear()
+            app = self._list(token)
+            self.assertEqual(set(app), set(browser), f"user {user_id}")
+            for pid, row in app.items():
+                shown = {k: v for k, v in browser[pid].items()
+                         if not k.startswith(main._APP_PLAYLIST_OMITTED_PREFIXES)}
+                self.assertEqual({k: v for k, v in row.items() if k != "can_share"}, shown, f"user {user_id}, playlist {pid}")
+
+    # --- what the phone is and is not given --------------------------------
+
+    def test_the_list_carries_no_mirror_field(self):
+        for row in self._list(self.owner_token).values():
+            self.assertEqual([k for k in row if "mirror" in k], [], row["title"])
+
+    def test_can_share_follows_the_owner_or_admin_rule(self):
+        owner, other, admin = self._list(self.owner_token), self._list(self.other_token), self._list(self.admin_token)
+        self.assertIs(owner[self.private]["can_share"], True)
+        self.assertIs(other[self.shared]["can_share"], False)   # visible, not theirs
+        self.assertIs(admin[self.shared]["can_share"], True)
+        self.assertIs(owner[self.unowned]["can_share"], False)  # no owner to share for
+
+    def test_no_app_route_can_change_a_mirror(self):
+        rules = [r.rule for r in main.app.url_map.iter_rules() if r.rule.startswith("/api/app/")]
+        self.assertTrue(any("playlists" in r for r in rules), "the control: the playlist routes are there")
+        self.assertEqual([r for r in rules if "mirror" in r], [])
+
+    # --- the actions --------------------------------------------------------
+
+    def test_the_shared_toggle_is_the_owners_or_an_admins(self):
+        self.assertEqual(self._app(self.other_token, "PATCH", f"/api/app/playlists/{self.shared}",
+                                   json={"shared": False}).status_code, 403)
+        self.assertEqual(self._app(self.owner_token, "PATCH", f"/api/app/playlists/{self.unowned}",
+                                   json={"shared": False}).status_code, 400)
+        self.assertEqual(self._app(self.owner_token, "PATCH", f"/api/app/playlists/{self.private}",
+                                   json={"shared": True}).status_code, 200)
+        self.assertEqual(self.conn.execute("SELECT shared FROM playlists WHERE id = ?", (self.private,)).fetchone()[0], 1)
+
+    def test_tracks_come_in_playlist_order_with_whether_each_resolved(self):
+        cur = self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) VALUES ('a/b/1.flac', 'A', 'B', 'One', 1, 0.0)")
+        track = sync_state._new_id(cur)
+        # inserted out of order: the route orders by position
+        self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, artist, title, album, matched_track_id) "
+                          "VALUES (?, 2, 'C', 'Three', NULL, NULL)", (self.private,))
+        self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, artist, title, album, matched_track_id) "
+                          "VALUES (?, 1, 'A', 'One', 'B', ?)", (self.private, track))
+        self.conn.commit()
+        resp = self._app(self.owner_token, "GET", f"/api/app/playlists/{self.private}/tracks")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), [
+            {"position": 1, "artist": "A", "title": "One", "album": "B", "matched": True},
+            {"position": 2, "artist": "C", "title": "Three", "album": None, "matched": False},
+        ])
+        self.assertEqual(self._app(self.other_token, "GET", f"/api/app/playlists/{self.private}/tracks").status_code, 403)
+        self.assertEqual(self._app(self.owner_token, "GET", "/api/app/playlists/999999/tracks").status_code, 404)
+
+    def test_unresolved_review_follows_the_playlists_visibility(self):
+        self.conn.execute("INSERT INTO unresolved_playlist_tracks (playlist_id, position, artist, title, album) "
+                          "VALUES (?, 1, 'X', 'Gone', 'Y')", (self.private,))
+        self.conn.commit()
+        path = f"/api/app/playlists/{self.private}/unresolved-tracks"
+        self.assertEqual(self._app(self.other_token, "GET", path).status_code, 403)
+        rows = self._app(self.owner_token, "GET", path).get_json()
+        self.assertEqual([r["title"] for r in rows], ["Gone"])
+        self.assertEqual(self._app(self.other_token, "POST", path + "/exclude", json={"ids": [rows[0]["id"]]}).status_code, 403)
+        resp = self._app(self.owner_token, "POST", path + "/exclude", json={"ids": [rows[0]["id"]]})
+        self.assertEqual(resp.get_json(), {"unresolved_count": 0})
+
+    def test_the_lidarr_toggle_follows_the_playlists_visibility(self):
+        path = f"/api/app/playlists/{self.private}/lidarr-requests"
+        self.assertEqual(self._app(self.other_token, "POST", path, json={"enabled": True}).status_code, 403)
+        with mock.patch("lidarr_requests.lidarr_client"):
+            resp = self._app(self.owner_token, "POST", path, json={"enabled": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIs(resp.get_json()["lidarr_request_enabled"], True)
+
+    def test_subscriptions_are_the_owners_own(self):
+        with mock.patch.object(main.ytmusic_client, "get_playlist_tracks",
+                               return_value=_ok("Road Trip", [("Bon Jovi", "Livin' On A Prayer")])):
+            added = self._app(self.owner_token, "POST", "/api/app/playlist-subscriptions",
+                              json={"url": "https://music.youtube.com/playlist?list=PLabc123"})
+        self.assertEqual(added.status_code, 200)
+        sub = added.get_json()["subscription"]["id"]
+        self.assertEqual([s["id"] for s in self._app(self.owner_token, "GET", "/api/app/playlist-subscriptions")
+                          .get_json()["subscriptions"]], [sub])
+        self.assertEqual(self._app(self.other_token, "GET", "/api/app/playlist-subscriptions").get_json(),
+                         {"subscriptions": []})
+        self.assertEqual(self._app(self.other_token, "POST", f"/api/app/playlist-subscriptions/{sub}/refresh").status_code, 403)
+        self.assertEqual(self._app(self.other_token, "DELETE", f"/api/app/playlist-subscriptions/{sub}").status_code, 403)
+        self.assertEqual(self._app(self.owner_token, "POST", "/api/app/playlist-subscriptions",
+                                   json={"url": "not a link"}).status_code, 400)
+        self.assertEqual(self._app(self.owner_token, "DELETE", f"/api/app/playlist-subscriptions/{sub}").status_code, 200)
+
+    def test_a_sync_can_be_started_and_polled(self):
+        with mock.patch.object(playlist_sync, "start_sync", return_value={"status": "started"}):
+            self.assertEqual(self._app(self.owner_token, "POST", "/api/app/playlists/sync").status_code, 202)
+        with mock.patch.object(playlist_sync, "start_sync", return_value={"already_running": True}):
+            self.assertEqual(self._app(self.owner_token, "POST", "/api/app/playlists/sync").status_code, 409)
+        self.assertEqual(self._app(self.owner_token, "GET", "/api/app/playlists/sync/status").status_code, 200)

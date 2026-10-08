@@ -1,0 +1,26 @@
+{#- SPDX-FileCopyrightText: 2026 missing-foss
+    SPDX-License-Identifier: AGPL-3.0-or-later
+
+    Shared <head> for every page: the theme applied before first paint, so
+    there is no flash, and the icons. data-brand names the brand theme
+    (localStorage 'trobar-brand', default troubadour); data-theme is the
+    effective light/dark ('trobar-theme': auto/light/dark), except that
+    Nuèch and Contraste are dark only. The Alpine app keeps both in step at
+    runtime (applyTheme in index.html). -#}
+<script>
+  (function () {
+    var brands = ['troubadour', 'nuech', 'garriga', 'peira', 'contraste'];
+    var brand = localStorage.getItem('trobar-brand');
+    if (brands.indexOf(brand) < 0) brand = 'troubadour';
+    var pref = localStorage.getItem('trobar-theme') || 'auto';
+    var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var mode = (brand === 'nuech' || brand === 'contraste') ? 'dark'
+      : (pref === 'auto' ? (systemDark ? 'dark' : 'light') : pref);
+    document.documentElement.setAttribute('data-brand', brand);
+    document.documentElement.setAttribute('data-theme', mode);
+  })();
+</script>
+<link rel="icon" href="{{ url_for('static', filename='img/favicon.ico') }}" sizes="any">
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/favicon.svg') }}">
+<link rel="apple-touch-icon" href="{{ url_for('static', filename='img/apple-touch-icon.png') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/brand-themes.css') }}">

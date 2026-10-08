@@ -701,6 +701,15 @@ class EnrollmentGrantTests(unittest.TestCase):
         self.assertIsNone(
             sync_state.redeem_enrollment_grant(self.conn, "BOGUS123", "A", "phone", None))
 
+    def test_a_code_lasts_an_hour(self):
+        """While the Garmin app is sideloaded, a code reaches the watch in a
+        settings file and is redeemed only at its next Wi-Fi sync."""
+        code = sync_state.create_enrollment_grant(self.conn, self.user)
+        left = self.conn.execute(
+            "SELECT (julianday(expires_at) - julianday('now')) * 86400 AS s "
+            "FROM enrollment_grants WHERE code_hash = ?", (sync_state.hash_token(code),)).fetchone()["s"]
+        self.assertAlmostEqual(left, 3600, delta=5)
+
     def test_expired_code_returns_none(self):
         code = sync_state.create_enrollment_grant(self.conn, self.user)
         self.conn.execute(

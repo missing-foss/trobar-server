@@ -23,6 +23,7 @@ from pathlib import Path
 
 import db
 import matching
+import jellyfin_client
 import mirror_jellyfin
 
 
@@ -148,7 +149,7 @@ class WriteContentTests(_MirrorJellyfinTestBase):
                 "status": "ok", "remote_id": "99"}
             mirror_jellyfin.write_mirror(self.conn, pid)
             client.mirror_create_or_replace_playlist.assert_called_once_with(
-                "Road Trip", ["s1"], None)
+                "Road Trip", ["s1"], None, "u1")
             client.mirror_set_playlist_metadata.assert_called_once_with(
                 "99", "Road Trip", mock.ANY)
 
@@ -241,7 +242,7 @@ class CollapsedMatchGuardTests(_MirrorJellyfinTestBase):
                 "status": "ok", "remote_id": "1"}
             mirror_jellyfin.write_mirror(self.conn, pid)
             client.mirror_create_or_replace_playlist.assert_called_once_with(
-                "Empty So Far", [], None)
+                "Empty So Far", [], None, "u1")
         self.assertIsNone(self._row(pid)["jellyfin_mirror_last_error_code"])
 
 
@@ -306,8 +307,8 @@ class StaleRemoteIdTests(_MirrorJellyfinTestBase):
             ]
             mirror_jellyfin.write_mirror(self.conn, pid)
             calls = client.mirror_create_or_replace_playlist.call_args_list
-            self.assertEqual(calls[0].args, ("Chill", ["s1"], "stale-id"))
-            self.assertEqual(calls[1].args, ("Chill", ["s1"], None))
+            self.assertEqual(calls[0].args, ("Chill", ["s1"], "stale-id", "u1"))
+            self.assertEqual(calls[1].args, ("Chill", ["s1"], None, "u1"))
 
         row = self._row(pid)
         self.assertEqual(row["jellyfin_mirror_remote_id"], "new-id")
@@ -501,5 +502,202 @@ class DeleteMirrorTests(_MirrorJellyfinTestBase):
         self.assertIsNone(self._row(pid)["jellyfin_mirror_remote_id"])
 
 
+class AccountMoveTests(_MirrorJellyfinTestBase):
+    """Each copy records the account it was written into; one that belongs
+    in another account is moved (deleted by id, recreated), never written
+    into the wrong one."""
+
+    def _setup(self, client, remote_id="99"):
+        client.mirror_build_tag_index.return_value = {
+            _key("Artist A", "Album", "Song A"): [{"id": "s1", "track_no": None}]}
+        client.mirror_create_or_replace_playlist.return_value = {"status": "ok", "remote_id": remote_id}
+        client.mirror_delete_playlist.return_value = True
+
+    def _playlist(self, remote_id=None, owner=None):
+        pid = self._make_playlist("Road Trip", remote_id=remote_id)
+        self._add_playlist_track(pid, 0, self._make_track("Artist A", "Album", "Song A"))
+        self.conn.execute("UPDATE playlists SET jellyfin_mirror_owner_id = ? WHERE id = ?", (owner, pid))
+        self.conn.commit()
+        return pid
+
+    def _owner(self, pid):
+        return self.conn.execute("SELECT jellyfin_mirror_owner_id FROM playlists WHERE id = ?", (pid,)).fetchone()[0]
+
+    def test_a_write_records_the_account(self):
+        pid = self._playlist()
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client:
+            self._setup(client)
+            mirror_jellyfin.write_mirror(self.conn, pid)
+        self.assertEqual(self._owner(pid), "u1")
+
+    def test_a_copy_in_another_account_is_moved(self):
+        pid = self._playlist(remote_id="old-copy", owner="someone-else")
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client:
+            self._setup(client, remote_id="new-copy")
+            mirror_jellyfin.write_mirror(self.conn, pid)
+            client.mirror_delete_playlist.assert_called_once_with("old-copy")
+            client.mirror_create_or_replace_playlist.assert_called_once_with("Road Trip", ["s1"], None, "u1")
+        self.assertEqual((self._row(pid)["jellyfin_mirror_remote_id"], self._owner(pid)), ("new-copy", "u1"))
+
+    def test_a_copy_from_before_tracking_stays_in_the_mirror_account(self):
+        pid = self._playlist(remote_id="old-copy", owner=None)
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client:
+            self._setup(client, remote_id="old-copy")
+            mirror_jellyfin.write_mirror(self.conn, pid)
+            client.mirror_delete_playlist.assert_not_called()
+            client.mirror_create_or_replace_playlist.assert_called_once_with("Road Trip", ["s1"], "old-copy", "u1")
+        self.assertEqual(self._owner(pid), "u1")
+
+    def test_a_copy_that_cannot_be_removed_is_not_duplicated(self):
+        pid = self._playlist(remote_id="old-copy", owner="someone-else")
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client:
+            self._setup(client)
+            client.mirror_delete_playlist.return_value = False
+            mirror_jellyfin.write_mirror(self.conn, pid)
+            client.mirror_create_or_replace_playlist.assert_not_called()
+        row = self._row(pid)
+        self.assertEqual((row["jellyfin_mirror_remote_id"], row["jellyfin_mirror_last_error_code"]), ("old-copy", "write_failed"))
+        self.assertEqual(self._owner(pid), "someone-else")
+
+    def test_switching_off_forgets_the_account(self):
+        pid = self._playlist(remote_id="old-copy", owner="u1")
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client:
+            client.mirror_delete_playlist.return_value = True
+            mirror_jellyfin.delete_mirror(self.conn, pid)
+        self.assertIsNone(self._owner(pid))
+
+
+class MemberAccountTests(_MirrorJellyfinTestBase):
+    """#6: a member's copy lands in their mapped account when the mirror
+    target is the library server; otherwise in the mirror account."""
+
+    def _member(self, mapped):
+        cur = self.conn.execute("INSERT INTO users (username, jellyfin_user_id) VALUES ('ana', ?)", (mapped,))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def _owned_playlist(self, owner, remote_id=None, copy_owner=None):
+        pid = self._make_playlist("Road Trip", remote_id=remote_id)
+        self._add_playlist_track(pid, 0, self._make_track("Artist A", "Album", "Song A"))
+        self.conn.execute("UPDATE playlists SET owner_user_id = ?, jellyfin_mirror_owner_id = ? WHERE id = ?",
+                          (owner, copy_owner, pid))
+        self.conn.commit()
+        return pid
+
+    def _write(self, pid, same_server, cache=None, remote_id="99"):
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client:
+            client.mirror_build_tag_index.return_value = {
+                _key("Artist A", "Album", "Song A"): [{"id": "s1", "track_no": None}]}
+            client.mirror_create_or_replace_playlist.return_value = {"status": "ok", "remote_id": remote_id}
+            client.mirror_delete_playlist.return_value = True
+            client.mirror_target_is_library_server.return_value = same_server
+            mirror_jellyfin.write_mirror(self.conn, pid, cache)
+            return client
+
+    def test_on_the_library_server_a_members_copy_goes_to_their_account(self):
+        client = self._write(self._owned_playlist(self._member("member-ana")), same_server=True)
+        self.assertEqual(client.mirror_create_or_replace_playlist.call_args.args[3], "member-ana")
+
+    def test_on_another_server_it_goes_to_the_mirror_account(self):
+        client = self._write(self._owned_playlist(self._member("member-ana")), same_server=False)
+        self.assertEqual(client.mirror_create_or_replace_playlist.call_args.args[3], "u1")
+
+    def test_a_member_without_a_mapping_uses_the_mirror_account(self):
+        client = self._write(self._owned_playlist(self._member(None)), same_server=True)
+        self.assertEqual(client.mirror_create_or_replace_playlist.call_args.args[3], "u1")
+
+    def test_an_unowned_playlist_uses_the_mirror_account_without_asking(self):
+        client = self._write(self._owned_playlist(None), same_server=True)
+        self.assertEqual(client.mirror_create_or_replace_playlist.call_args.args[3], "u1")
+        client.mirror_target_is_library_server.assert_not_called()
+
+    def test_the_servers_are_compared_once_per_run(self):
+        member = self._member("member-ana")
+        cache: dict = {}
+        first = self._write(self._owned_playlist(member), same_server=True, cache=cache)
+        second = self._write(self._owned_playlist(member), same_server=False, cache=cache)
+        first.mirror_target_is_library_server.assert_called_once()
+        second.mirror_target_is_library_server.assert_not_called()
+        self.assertEqual(second.mirror_create_or_replace_playlist.call_args.args[3], "member-ana")
+
+    def test_when_it_cannot_be_told_a_copy_stays_where_it_is(self):
+        pid = self._owned_playlist(self._member("member-ana"), remote_id="their-copy", copy_owner="member-ana")
+        client = self._write(pid, same_server=None, remote_id="their-copy")
+        client.mirror_delete_playlist.assert_not_called()
+        self.assertEqual(client.mirror_create_or_replace_playlist.call_args.args[2:], ("their-copy", "member-ana"))
+
+    def test_when_it_cannot_be_told_a_new_copy_goes_to_the_mirror_account(self):
+        client = self._write(self._owned_playlist(self._member("member-ana")), same_server=None)
+        self.assertEqual(client.mirror_create_or_replace_playlist.call_args.args[3], "u1")
+
+    def test_a_remapped_member_has_the_copy_moved(self):
+        member = self._member("member-ana-new")
+        pid = self._owned_playlist(member, remote_id="old-copy", copy_owner="member-ana-old")
+        client = self._write(pid, same_server=True, remote_id="new-copy")
+        client.mirror_delete_playlist.assert_called_once_with("old-copy")
+        self.assertEqual(client.mirror_create_or_replace_playlist.call_args.args[2:], (None, "member-ana-new"))
+        owner = self.conn.execute("SELECT jellyfin_mirror_owner_id FROM playlists WHERE id = ?", (pid,)).fetchone()[0]
+        self.assertEqual(owner, "member-ana-new")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class CopyNotReadBackTests(_MirrorJellyfinTestBase):
+    """A copy written to Jellyfin never comes back as a source playlist when
+    the library provider lists that account: the member's own (the
+    per-user pass) or the mirror account, when it's also the provider's
+    default account."""
+
+    COPY = "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b"
+
+    def setUp(self):
+        super().setUp()
+        db.set_config(self.conn, "jellyfin_url", "http://mirror.example.com")
+        db.set_config(self.conn, "jellyfin_api_key", "key")
+        db.set_config(self.conn, "jellyfin_user_id", "u1")
+        self.conn.execute("INSERT INTO users (username, jellyfin_user_id) VALUES ('ana', 'member-ana')")
+        self.conn.commit()
+
+    def _write(self, owner_id, remote_id):
+        pid = self._make_playlist("Road Trip")
+        self._add_playlist_track(pid, 0, self._make_track("Artist A", "Album", "Song A"))
+        self.conn.execute("UPDATE playlists SET owner_user_id = ? WHERE id = ?", (owner_id, pid))
+        self.conn.commit()
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client:
+            client.mirror_build_tag_index.return_value = {
+                _key("Artist A", "Album", "Song A"): [{"id": "s1", "track_no": None}]}
+            client.mirror_create_or_replace_playlist.return_value = {"status": "ok", "remote_id": remote_id}
+            client.mirror_target_is_library_server.return_value = True
+            mirror_jellyfin.write_mirror(self.conn, pid, None)
+        self.conn.commit()  # the sync run commits before the next listing
+        return client
+
+    def _listed(self, items, user_id=None):
+        with mock.patch.object(jellyfin_client, "_get", return_value={"Items": items}):
+            result = jellyfin_client.list_playlists(user_id=user_id)
+        return [p["id"] for p in result["playlists"]]
+
+    def test_a_members_copy_is_not_listed_by_their_own_pass(self):
+        member = self.conn.execute("SELECT id FROM users WHERE username = 'ana'").fetchone()[0]
+        client = self._write(member, self.COPY)
+        self.assertEqual(client.mirror_create_or_replace_playlist.call_args.args[3], "member-ana")
+        listed = self._listed([{"Name": "Road Trip", "Id": self.COPY},
+                               {"Name": "Her own", "Id": "a1"}], user_id="member-ana")
+        self.assertEqual(listed, ["a1"])
+
+    def test_a_mirror_account_copy_is_not_listed_by_the_default_pass(self):
+        self._write(None, self.COPY)
+        listed = self._listed([{"Name": "Road Trip", "Id": self.COPY}, {"Name": "Other", "Id": "b2"}])
+        self.assertEqual(listed, ["b2"])
+
+    def test_the_id_is_recognised_however_it_is_spelled(self):
+        self._write(None, self.COPY)
+        bare = self.COPY.replace("-", "").upper()
+        listed = self._listed([{"Name": "Road Trip", "Id": bare}])
+        self.assertEqual(listed, [])
+
+    def test_with_no_copies_everything_is_listed(self):
+        listed = self._listed([{"Name": "A", "Id": "a1"}, {"Name": "B", "Id": self.COPY}])
+        self.assertEqual(listed, ["a1", self.COPY])

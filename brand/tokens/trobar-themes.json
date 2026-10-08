@@ -1,0 +1,65 @@
+{
+  "$schema-note": "Trobar theme tokens. Roles: ground (background), disc, star (star + pommels), dot (centre), text ('Trob'), accent ('ar'), watch (watch-face ground).",
+  "default": "troubadour",
+  "fonts": {
+    "wordmark": "Fredoka 700 (outlined in assets)",
+    "ui": "Space Grotesk"
+  },
+  "themes": {
+    "troubadour": {
+      "name": "Troubadour",
+      "sub": "Default · cream",
+      "ground": "#F9EFDF",
+      "disc": "#A83250",
+      "star": "#F9EFDF",
+      "dot": "#D76A83",
+      "text": "#17140E",
+      "accent": "#C2506B",
+      "watch": "#100E08"
+    },
+    "nuech": {
+      "name": "Nuèch",
+      "sub": "Night · OLED",
+      "ground": "#0E1220",
+      "disc": "#40569A",
+      "star": "#E8C872",
+      "dot": "#E8C872",
+      "text": "#F4EEDC",
+      "accent": "#E8C872",
+      "watch": "#0E1220"
+    },
+    "garriga": {
+      "name": "Garriga",
+      "sub": "Sage · olive",
+      "ground": "#EEF0E4",
+      "disc": "#5E6B3A",
+      "star": "#F4F1E2",
+      "dot": "#C9A227",
+      "text": "#23281A",
+      "accent": "#8C6C12",
+      "watch": "#14170E"
+    },
+    "peira": {
+      "name": "Pèira",
+      "sub": "Stone · terracotta",
+      "ground": "#E6E1D8",
+      "disc": "#3A3F47",
+      "star": "#E6E1D8",
+      "dot": "#C0573E",
+      "text": "#22252A",
+      "accent": "#B04A33",
+      "watch": "#16181B"
+    },
+    "contraste": {
+      "name": "Contraste",
+      "sub": "High contrast · MIP",
+      "ground": "#000000",
+      "disc": "#FFFFFF",
+      "star": "#000000",
+      "dot": "#FFD400",
+      "text": "#FFFFFF",
+      "accent": "#FFD400",
+      "watch": "#000000"
+    }
+  }
+}

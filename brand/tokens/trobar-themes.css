@@ -1,0 +1,7 @@
+/* Trobar themes — set data-theme on <html>. trobar-mark-themable.svg (inline) reads these. */
+:root,
+[data-theme="troubadour"]{--tb-ground:#F9EFDF;--tb-disc:#A83250;--tb-star:#F9EFDF;--tb-dot:#D76A83;--tb-text:#17140E;--tb-accent:#C2506B;--tb-watch:#100E08;}
+[data-theme="nuech"]{--tb-ground:#0E1220;--tb-disc:#40569A;--tb-star:#E8C872;--tb-dot:#E8C872;--tb-text:#F4EEDC;--tb-accent:#E8C872;--tb-watch:#0E1220;}
+[data-theme="garriga"]{--tb-ground:#EEF0E4;--tb-disc:#5E6B3A;--tb-star:#F4F1E2;--tb-dot:#C9A227;--tb-text:#23281A;--tb-accent:#8C6C12;--tb-watch:#14170E;}
+[data-theme="peira"]{--tb-ground:#E6E1D8;--tb-disc:#3A3F47;--tb-star:#E6E1D8;--tb-dot:#C0573E;--tb-text:#22252A;--tb-accent:#B04A33;--tb-watch:#16181B;}
+[data-theme="contraste"]{--tb-ground:#000000;--tb-disc:#FFFFFF;--tb-star:#000000;--tb-dot:#FFD400;--tb-text:#FFFFFF;--tb-accent:#FFD400;--tb-watch:#000000;}

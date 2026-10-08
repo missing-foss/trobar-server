@@ -4,43 +4,27 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 /* ============================================================
-   Trobar — "The Bard" logo · drop-in CSS
-   The mark itself is an SVG asset (img/bard-mark.svg) — see brand/
-   for the source set. This file only sizes the wrapper and drives
-   the sync-state animation: musical notes rising from the lute's
-   soundhole. Toggle `.is-syncing` on `.ss-mark`.
-   The mark never theme-inverts (same artwork in light and dark).
+   Trobar — the rosette mark · wrapper and sync animation
+   The mark is inlined from templates/_trobar_mark.html and takes the
+   active theme's colours (--tb-* in brand-themes.css); brand/ holds the
+   sources. Toggle `.is-syncing` on `.ss-mark`: the star alone turns 90°
+   every 2.4 s, eased (brand/BRAND.md §5), and holds still under reduced
+   motion.
    ============================================================ */
 :root{
-  --ss-accent:#d76a83;              /* rose — the notes */
   --ss-font-display:'Fredoka',system-ui,sans-serif;
   --ss-font-ui:'Space Grotesk',system-ui,sans-serif;
   --ss-font-mono:'Space Mono',ui-monospace,monospace;
 }
 
-/* --- wrapper: set width/height (square). Everything scales from it --- */
-.ss-mark{position:relative;flex:none;container-type:size;}
-.ss-mark .ss-bard{width:100%;height:100%;display:block;}
+/* --- wrapper: set width/height (square). The mark fills it --- */
+.ss-mark{position:relative;flex:none;}
+.ss-mark .ss-rosette{width:100%;height:100%;display:block;}
 
-/* --- sync state: notes spawn at the soundhole, rise and fade ---
-   Spawn point ≈ the lute's soundhole (right-of-center, lower half of
-   the artwork). Three staggered copies with different drifts make the
-   ~2.5s loop read as continuous. Hidden entirely unless syncing. */
-.ss-note{
-  position:absolute;left:68%;top:64%;
-  font-family:var(--ss-font-ui);color:var(--ss-accent);
-  font-size:34cqw;line-height:1;opacity:0;pointer-events:none;
-  text-shadow:0 1px 2px rgba(0,0,0,.35);
-}
-.is-syncing .ss-note{animation:ss-note-rise 2.5s ease-in infinite;}
-.is-syncing .ss-note:nth-child(2){animation-delay:.85s;}
-.is-syncing .ss-note:nth-child(3){animation-delay:1.7s;--ss-drift:-14cqw;}
-@keyframes ss-note-rise{
-  0%{transform:translate(0,0) scale(.7);opacity:0;}
-  18%{opacity:1;}
-  72%{opacity:.9;}
-  100%{transform:translate(var(--ss-drift,16cqw),-64cqw) scale(1);opacity:0;}
-}
+/* --- sync state: only the star turns; disc, pommels and hub stay --- */
+.ss-rosette .tb-star{transform-box:view-box;transform-origin:100px 100px;}
+.is-syncing .ss-rosette .tb-star{animation:tb-spin 2.4s cubic-bezier(.45,0,.55,1) infinite;}
+@keyframes tb-spin{to{transform:rotate(90deg);}}
 @media (prefers-reduced-motion:reduce){
-  .is-syncing .ss-note{animation-duration:5s;}
+  .is-syncing .ss-rosette .tb-star{animation:none;}
 }

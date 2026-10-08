@@ -21,10 +21,9 @@ module = ["flask_babel", "authlib.*", "roonapi", "roonapi.*", "waitress", "acous
 ignore_missing_imports = true
 
 [tool.coverage.run]
-# Visibility tool only (#41) — no enforced threshold, deliberately. Coverage
-# is reported on every CI run so gaps stay visible, but gating on a number
-# tends to produce tests written for the number rather than for the risk.
-# Raise the bar by adding tests worth having, not by setting a floor.
+# Reported on every CI run so gaps stay visible. The one gate is the soft
+# floor under [tool.coverage.report]; raise real coverage by adding tests
+# worth having, not by chasing a number.
 #
 # Unlike the unit-test step, this runs from the repo root (PYTHONPATH=app
 # so the test modules' bare `import sync_state`-style imports still
@@ -35,6 +34,12 @@ source = ["app"]
 omit = ["app/test_*.py", "app/translations/*"]
 
 [tool.coverage.report]
+# A floor, not a target: `coverage report` fails when the total drops below
+# it, which catches a silent regression. One fixed number, set just under the
+# total measured from the repository root when the floor was introduced. It
+# moves only by decision, never automatically, and there are no per-file
+# thresholds.
+fail_under = 88
 skip_covered = false
 show_missing = true
 precision = 1

@@ -40,8 +40,9 @@ if command -v coverage >/dev/null 2>&1; then
   # PYTHONPATH=app, not `cd app`: coverage.py only auto-discovers a config
   # file (pyproject.toml's [tool.coverage.*]) in the current directory, it
   # doesn't walk up like mypy/pytest do — cd-ing in would silently pick up
-  # no config. Report only, no enforced threshold: this exists to
-  # make the untested-code gap visible in every run, not to gate on it.
+  # no config. The report makes the untested-code gap visible in every run,
+  # and fails when the total drops below pyproject.toml's soft floor
+  # (fail_under).
   _t=$( (PYTHONPATH=app coverage run -m unittest discover -s app -p 'test_*.py' -v \
     && coverage report) 2>&1 ); _rc=$?
 else
@@ -141,6 +142,15 @@ else
     rm -f /tmp/trobar-fresh.css /tmp/trobar-committed.classes /tmp/trobar-fresh.classes /tmp/trobar-tw.log
   fi
 fi
+
+step "brand palette (generated, WCAG AA)"
+# app/static/css/brand-themes.css is generated from brand/tokens/ by
+# dev/gen_brand_css.py: every theme's colours, and the UI palette derived from
+# them. So are the docs site's colours (docs/stylesheets/brand.css) and its
+# copies of the mark and favicon (docs/assets/brand/). Fails when any of those
+# files is stale, or when any text/background or UI pair in any theme, app or
+# docs, falls under WCAG AA.
+python3 dev/gen_brand_css.py --check || fail=1
 
 step "translations (FR catalog complete, #187)"
 # A new _() string missing from the FR .po silently renders as English in

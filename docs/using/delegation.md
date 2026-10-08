@@ -15,4 +15,7 @@ parent-managing-a-kid's-device case.
 - The delegate additionally **pins** the devices they want visible in their own
   Devices list; the admin always sees every device regardless.
 
-Delegations are created in the [Administration](../administration.md) panel.
+Delegations are created and revoked in **Administration → Users**, in its
+[Delegations](../administration.md#delegations) section, beside the accounts
+they link; each user's row there also says whom they manage and who manages
+them.

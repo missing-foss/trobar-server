@@ -113,11 +113,11 @@ def run_for_playlist(conn, playlist_id: int) -> None:
     Never raises otherwise — every per-album failure is caught and
     recorded via _record_outcome, not propagated.
 
-    Eligible unresolved rows: excluded = 0 AND album IS NOT NULL AND
-    album != '' — this single condition is both the #200 exclusion rule
-    and the no-album-data eligibility rule (#494 item 9): Roon and
-    iTunes/Apple Music unresolved rows always have album IS NULL, so
-    they're naturally never selected here, not specially cased.
+    Eligible unresolved rows: excluded = 0 and an album, the source's or
+    else the one looked up in MusicBrainz (inferred_album) — this single
+    condition is both the exclusion rule and the no-album-data
+    eligibility rule: a Roon or iTunes/Apple Music gap has no album of its
+    own, and is selected only once album_lookup.py has found one.
 
     Does not commit — runs inline in playlist_sync.py's per-playlist
     commit, same convention as every mirror sink's write_mirror().
@@ -142,9 +142,13 @@ def run_for_playlist(conn, playlist_id: int) -> None:
         )
         return
 
+    # The source's album first; for a gap whose source gave none, the one
+    # album_lookup.py found in MusicBrainz.
     eligible = conn.execute(
-        "SELECT artist, album FROM unresolved_playlist_tracks "
-        "WHERE playlist_id = ? AND excluded = 0 AND album IS NOT NULL AND album != ''",
+        "SELECT artist, COALESCE(NULLIF(album, ''), inferred_album) AS album "
+        "FROM unresolved_playlist_tracks "
+        "WHERE playlist_id = ? AND excluded = 0 "
+        "AND COALESCE(NULLIF(album, ''), inferred_album, '') != ''",
         (playlist_id,),
     ).fetchall()
 

@@ -57,6 +57,7 @@ import threading
 import requests
 
 import db
+import provider_config
 import matching
 
 _CLIENT_ID = "trobar"
@@ -68,6 +69,10 @@ _music_library_id_lock = threading.Lock()
 
 
 def _current_config() -> tuple[str, str, str]:
+    # An unsaved connection the switch preview reads through: provider_config.
+    unsaved = provider_config.override("jellyfin")
+    if unsaved is not None:
+        return unsaved
     conn = db.get_conn()
     try:
         url = db.get_config(conn, "jellyfin_url") or ""
@@ -219,10 +224,32 @@ def list_playlists(user_id: str | None = None) -> dict:
     items = _list_playlist_items(user_id)
     if items is None:
         return {"status": "error", "reason": "not_paired"}
+    # Trobar's own mirror copies are never sources. When the mirror target
+    # is this server, a copy sits in a member's account or in the mirror
+    # account, and either may be the account listed here. Known by the ids
+    # the sink stored: Jellyfin ids are server-generated GUIDs, so one held
+    # for another server can't name a playlist here.
+    copies = _mirror_ids()
     return {"status": "ok", "playlists": [
         {"id": i["Id"], "title": i["Name"]}
-        for i in items if i.get("Name") and i.get("Id")
+        for i in items if i.get("Name") and i.get("Id") and _norm_id(i["Id"]) not in copies
     ]}
+
+
+def _norm_id(item_id: str) -> str:
+    """An item id as Jellyfin spells it either way: with or without dashes,
+    in either case."""
+    return str(item_id).replace("-", "").lower()
+
+
+def _mirror_ids() -> set[str]:
+    """The ids of every copy the mirror sink made, normalised."""
+    conn = db.get_conn()
+    try:
+        return {_norm_id(r[0]) for r in conn.execute(
+            "SELECT jellyfin_mirror_remote_id FROM playlists WHERE jellyfin_mirror_remote_id IS NOT NULL")}
+    finally:
+        conn.close()
 
 
 def list_users() -> dict:
@@ -456,8 +483,42 @@ def mirror_build_tag_index() -> dict[tuple[str, str, str], list[dict]] | None:
     return None
 
 
+
+def _server_id(url: str) -> str | None:
+    """A server's own unique id, from /System/Info/Public (no key needed),
+    or None if it doesn't answer."""
+    if not url:
+        return None
+    try:
+        resp = requests.get(f"{url.rstrip('/')}/System/Info/Public", timeout=10)
+        resp.raise_for_status()
+        # Jellyfin answers in camelCase ("id") for its first seconds after
+        # a start, PascalCase ("Id") after that.
+        body = {k.lower(): v for k, v in resp.json().items()}
+        return body.get("id") or None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def mirror_target_is_library_server() -> bool | None:
+    """Whether the mirror target is the same Jellyfin server as the library
+    connection: only then is a member's mapped user id (resolved on the
+    library server) an account on the mirror target. Compared by server
+    id, not URL, since two URLs can reach one server. None when it can't
+    be told (a server didn't answer), which the sink must not read as "a
+    different server": that would move every member's copy."""
+    config = db.get_mirror_jellyfin_config()
+    library_url = _current_config()[0]
+    if config is None or not library_url:
+        return False  # no library connection: nothing was mapped on it
+    library_id, mirror_id = _server_id(library_url), _server_id(config[0])
+    if library_id is None or mirror_id is None:
+        return None
+    return library_id == mirror_id
+
+
 def mirror_create_or_replace_playlist(
-    name: str, song_ids: list[str], remote_id: str | None
+    name: str, song_ids: list[str], remote_id: str | None, user_id: str | None = None
 ) -> dict:
     """Creates (remote_id is None) or FULLY REPLACES (remote_id given) a
     playlist's song list. Returns {"status": "ok", "remote_id": str} or
@@ -524,12 +585,22 @@ def mirror_create_or_replace_playlist(
     config = db.get_mirror_jellyfin_config()
     if config is None:
         return {"status": "error", "reason": "not_configured", "code": None}
-    url, api_key, user_id = config
+    url, api_key, configured_user_id = config
+    # The account the copy is written as: the playlist owner's, when the
+    # sink resolved one, else the configured mirror account.
+    user_id = user_id or configured_user_id
 
     if remote_id is None:
+        body_json: dict = {"Name": name, "Ids": song_ids, "UserId": user_id, "MediaType": "Audio"}
+        if user_id != configured_user_id:
+            # A member's own copy is theirs alone: without IsPublic false,
+            # Jellyfin marks a playlist OpenAccess and every user lists it
+            # (measured on 10.11.11 and 12.2.0). Copies in the mirror
+            # account stay household-visible, as before.
+            body_json["IsPublic"] = False
         status, body = _request_as(
             "POST", "/Playlists", api_key, url,
-            json_body={"Name": name, "Ids": song_ids, "UserId": user_id, "MediaType": "Audio"},
+            json_body=body_json,
         )
         if status is None or status >= 400 or not body or "Id" not in body:
             return {"status": "error", "reason": "create failed", "code": status}

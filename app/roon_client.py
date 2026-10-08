@@ -18,6 +18,7 @@ the caller's job (see matching.py), using the locally-scanned `tracks` table.
 """
 
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -54,6 +55,8 @@ _browse_lock = threading.Lock()
 _roon: "RoonApi | None" = None
 _last_connect_attempt: float = 0.0
 _RECONNECT_COOLDOWN = 30
+# test_connection: a Core on the LAN answers well inside this.
+_TEST_TIMEOUT = 3
 
 
 def _load_token() -> str | None:
@@ -133,6 +136,19 @@ def retry_pairing() -> dict:
             _connect_locked()
     time.sleep(0.5)
     return status()
+
+
+def test_connection(host: str, port: int) -> dict:
+    """Is a Roon Core listening at host:port? Changes nothing: no stored
+    config, no pairing attempt. Roon can't report "paired" before the
+    extension is approved in Roon itself (Settings, Extensions), which
+    needs the connection to exist first, so reachable is all a check
+    before a switch can establish."""
+    try:
+        with socket.create_connection((host, port), timeout=_TEST_TIMEOUT):
+            return {"state": "reachable", "host": host, "port": port, "provider": "roon"}
+    except (OSError, ValueError):
+        return {"state": "disconnected", "host": host, "port": port, "provider": "roon"}
 
 
 def reconnect(host: str, port: int) -> dict:
@@ -399,13 +415,17 @@ def _build_artist_image_key_map(roon: RoonApi) -> dict[str, str]:
         zone_id = _pick_zone_or_output_id(roon)
         if zone_id is None:
             return {}
-        walked = _browse_root(roon, zone_id)
-        if walked is None:
-            return {}
-        opts, load_opts, total_count = walked
 
         for menu_path in _ARTISTS_MENU_PATHS:
-            descended = _descend_path(roon, dict(opts), dict(load_opts), total_count, menu_path)
+            # From the root each time. Browse state lives on the Core, not in
+            # these dicts: a path that descends and then misses (a Library
+            # menu without Artists in it) leaves the Core inside it, and the
+            # next path would search there instead of at the root.
+            walked = _browse_root(roon, zone_id)
+            if walked is None:
+                return {}
+            opts, load_opts, total_count = walked
+            descended = _descend_path(roon, opts, load_opts, total_count, menu_path)
             if descended is not None:
                 _, d_load_opts, d_total_count = descended
                 items = _collect_all_items(roon, d_load_opts, d_total_count)

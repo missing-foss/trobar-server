@@ -28,6 +28,8 @@ import db  # noqa: E402
 db.DATA_DIR = Path(_TMP)
 
 import filesystem_client  # noqa: E402
+import mirror  # noqa: E402
+import sync_state  # noqa: E402
 
 
 def _write_library(xml_path: Path, tracks: dict, playlists: list) -> None:
@@ -188,6 +190,68 @@ class ExtraPlaylistFolderListTests(_FilesystemClientTestBase):
         result = filesystem_client.list_playlists()
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["playlists"], [{"id": "mix", "title": "mix"}])
+
+
+class TrobarManagedFilesTests(_FilesystemClientTestBase):
+    """Trobar's own playlist files, carrying sync_state.M3U_MARKER on their
+    second line, are never sources: a mirror folder can sit inside the
+    music share, seen by Trobar both as the mirror mount and under
+    MUSIC_ROOT."""
+
+    def _mirror_inside_the_library(self, title="Road Trip"):
+        # The real writer, with its folder under MUSIC_ROOT: the second
+        # mount of the same share, as the container sees it.
+        conn = db.get_conn()
+        db.set_config(conn, "mirror_folder", str(self.root / "UserPlaylists"))
+        (self.root / "A").mkdir()
+        (self.root / "A" / "t.flac").write_bytes(b"")
+        track = conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                             "VALUES ('A/t.flac', 'A', 'B', 'T', 1, 0)").lastrowid
+        pid = conn.execute("INSERT INTO playlists (title, mirror_enabled) VALUES (?, 1)", (title,)).lastrowid
+        conn.execute("INSERT INTO playlist_tracks (playlist_id, position, matched_track_id) VALUES (?, 0, ?)",
+                     (pid, track))
+        conn.commit()
+        assert pid is not None
+        mirror.write_mirror(conn, pid)
+        conn.close()
+        written = list((self.root / "UserPlaylists").rglob("*.m3u"))
+        self.assertEqual(len(written), 1)
+        return written[0]
+
+    def test_a_mirror_inside_the_music_root_is_not_a_source(self):
+        mirror_file = self._mirror_inside_the_library()
+        # A playlist saved from Kodi into the same folder is a source.
+        (mirror_file.parent / "Saved in Kodi.m3u").write_text("#EXTM3U\nA/t.flac\n", encoding="utf-8")
+        titles = [p["title"] for p in filesystem_client.list_playlists()["playlists"]]
+        self.assertEqual(titles, ["UserPlaylists/_shared/music/Saved in Kodi"])
+        title = str(mirror_file.relative_to(self.root).with_suffix(""))
+        self.assertEqual(filesystem_client.get_playlist_tracks(title)["status"], "not_found")
+
+    def test_a_mirror_in_the_extra_folder_is_not_a_source_either(self):
+        extra = self._make_extra_folder()
+        (extra / "mine.m3u").write_text(f"#EXTM3U\n{sync_state.M3U_MARKER}\n/music/a.mp3\n", encoding="utf-8")
+        (extra / "theirs.m3u").write_text("#EXTM3U\n/music/a.mp3\n", encoding="utf-8")
+        self.assertEqual(filesystem_client.list_playlists()["playlists"],
+                         [{"id": "extra:theirs", "title": "theirs"}])
+
+    def test_only_the_second_line_counts(self):
+        cases = {
+            "bom.m3u": f"\ufeff#EXTM3U\r\n{sync_state.M3U_MARKER}\r\n/x.mp3\r\n",  # skipped
+            "later.m3u": f"#EXTM3U\n#PLAYLIST:x\n{sync_state.M3U_MARKER}\n/x.mp3\n",  # read
+            "first.m3u": f"{sync_state.M3U_MARKER}\n/x.mp3\n",  # read
+            "plain.m3u8": "#EXTM3U\n/x.mp3\n",  # read
+        }
+        for name, text in cases.items():
+            (self.root / name).write_text(text, encoding="utf-8")
+        titles = sorted(p["title"] for p in filesystem_client.list_playlists()["playlists"])
+        self.assertEqual(titles, ["first", "later", "plain"])
+
+    def test_an_unreadable_file_is_not_taken_for_trobars(self):
+        path = self.root / "locked.m3u"
+        path.write_text(f"#EXTM3U\n{sync_state.M3U_MARKER}\n", encoding="utf-8")
+        from unittest import mock  # noqa: PLC0415
+        with mock.patch.object(Path, "open", side_effect=PermissionError("denied")):
+            self.assertFalse(filesystem_client._is_trobar_managed(path))
 
 
 class M3uEncodingTests(_FilesystemClientTestBase):

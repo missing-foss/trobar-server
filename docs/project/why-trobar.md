@@ -24,9 +24,10 @@ losslessly, on your own terms — to your phone, your player, your SD card,
 even where the signal doesn't reach. The troubadour owned his songs and took
 them on the road. So do you.
 
-And yes, that's him in the logo: our bard, lute in hand, mid-song, supremely
-confident that you want to hear this one. When your library syncs, his notes
-take flight — songs leaving the court, headed for the road. Unlike his
-medieval colleagues, he only plays what you asked for.
+And the logo is his lute, seen from up close: the carved rosette over the
+sound-hole, an eight-point star ringed by twelve pommels, a nod to the
+twelve-pommel Occitan cross. When your library syncs, the star turns, the
+way a sound-hole seems to while the strings are ringing. Unlike his medieval
+colleagues' audiences, you only hear what you asked for.
 
 *Trobar: to find your music, and keep it close.*
