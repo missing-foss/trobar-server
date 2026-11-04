@@ -43,11 +43,11 @@ if command -v coverage >/dev/null 2>&1; then
   # no config. The report makes the untested-code gap visible in every run,
   # and fails when the total drops below pyproject.toml's soft floor
   # (fail_under).
-  _t=$( (PYTHONPATH=app coverage run -m unittest discover -s app -p 'test_*.py' -v \
+  _t=$( (PYTHONPATH=app coverage run dev/run_unittests.py discover -s app -p 'test_*.py' -v \
     && coverage report) 2>&1 ); _rc=$?
 else
   echo "SKIP coverage (not installed — pip install -r app/requirements-dev.txt), running plain unittest"
-  _t=$( (PYTHONPATH=app python3 -m unittest discover -s app -p 'test_*.py' -v) 2>&1 ); _rc=$?
+  _t=$( (PYTHONPATH=app python3 dev/run_unittests.py discover -s app -p 'test_*.py' -v) 2>&1 ); _rc=$?
 fi
 printf '%s\n' "$_t"
 # `discover` that matches no test files exits 0 and prints "Ran 0 tests" -- a

@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 missing-foss
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Write transactions held across slow work, one per line, as dev/write_guard.py
+# names them. dev/run_unittests.py fails on anything new here, and on a line
+# that no longer happens, so this list only shrinks. Do not add to it: move the
+# slow work out of the transaction.
+credential_store.py:_read_key file

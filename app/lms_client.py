@@ -48,11 +48,14 @@ acceptance scope is `list_playlists`/`get_playlist_tracks` only.
 
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+import logging
 
 import requests
 
 import db
 import provider_config
+
+_log = logging.getLogger(__name__)
 
 # Large enough for a typical home-library playlist/playlist-count without
 # real pagination — LMS's own "start count" params require a concrete

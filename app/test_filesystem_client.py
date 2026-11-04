@@ -17,6 +17,7 @@ module) rather than mocking db itself.
 """
 import os
 import plistlib
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -295,6 +296,35 @@ class M3uEncodingTests(_FilesystemClientTestBase):
         self.assertIn("�", self._only_track("Piaf")["artist"])
 
 
+
+class UploadedPlaylistTracksTests(_FilesystemClientTestBase):
+    """filesystem_client.uploaded_playlist_tracks: an uploaded file is read
+    like one in the library, with relative entries relative to the music
+    root, since an upload has no folder of its own."""
+
+    _LINES = M3uEncodingTests._LINES
+
+    def test_a_windows_codepage_m3u_keeps_its_accents(self):
+        tracks = filesystem_client.uploaded_playlist_tracks(self._LINES.encode("cp1252"), "Piaf.m3u")
+        self.assertEqual([(t["artist"], t["title"]) for t in tracks], [("Édith Piaf", "L'hymne à l'amour")])
+
+    def test_an_m3u8_is_utf8(self):
+        tracks = filesystem_client.uploaded_playlist_tracks(self._LINES.encode("utf-8"), "Piaf.M3U8")
+        self.assertEqual(tracks[0]["artist"], "Édith Piaf")
+
+    def test_a_relative_entry_is_relative_to_the_music_root(self):
+        (self.root / "A" / "B").mkdir(parents=True)
+        (self.root / "A" / "B" / "01 Song.flac").write_bytes(b"")
+        raw = b"A/B/01 Song.flac\n"
+        tracks = filesystem_client.uploaded_playlist_tracks(raw, "Mix.m3u")
+        self.assertEqual(tracks, [{"position": 0, "title": "01 Song", "artist": "",
+                                   "path": "A/B/01 Song.flac", "album": None}])
+
+    def test_comments_and_blank_lines_are_not_entries(self):
+        raw = b"#EXTM3U\n\n# a note\n#EXTINF:10,A - T\n/x/A/T.flac\n"
+        self.assertEqual(len(filesystem_client.uploaded_playlist_tracks(raw, "Mix.m3u8")), 1)
+
+
 class ExtraPlaylistFolderTrackTests(_FilesystemClientTestBase):
     def test_absolute_entries_are_passed_through(self):
         extra = self._make_extra_folder()
@@ -362,6 +392,20 @@ class ExtraPlaylistFolderTrackTests(_FilesystemClientTestBase):
             [{"position": 0, "title": "secret", "artist": "", "path": "/music/secret.mp3",
               "album": None}])
         self.assertTrue((extra).is_dir())
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

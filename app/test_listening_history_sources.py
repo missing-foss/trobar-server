@@ -104,3 +104,44 @@ class ListenBrainzApiBaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LastfmPrivacyTests(unittest.TestCase):
+    """Every Last.fm call carries the API key in its query string, and a
+    requests error's text holds the request URL."""
+
+    KEY = "the-users-lastfm-key"
+
+    def test_the_default_base_is_https(self):
+        import importlib
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("LASTFM_API_BASE", None)
+            self.addCleanup(importlib.reload, lastfm)
+            importlib.reload(lastfm)
+            self.assertTrue(lastfm.API_BASE.startswith("https://"), lastfm.API_BASE)
+
+    def _failing_get(self, *args, **kwargs):
+        import requests
+        url = f"https://ws.audioscrobbler.com/2.0/?method=x&api_key={self.KEY}&format=json"
+        raise requests.exceptions.HTTPError(f"500 Server Error: Internal for url: {url}")
+
+    def _assert_logged_without_key(self, call):
+        with mock.patch("requests.get", side_effect=self._failing_get), \
+                self.assertLogs("lastfm", level="WARNING") as logs:
+            call()
+        text = "\n".join(logs.output)
+        self.assertNotIn(self.KEY, text)
+        self.assertIn("[key]", text)
+
+    def test_a_failed_similar_artists_logs_no_key(self):
+        self._assert_logged_without_key(
+            lambda: lastfm.similar_artists("Boards of Canada", api_key=self.KEY))
+
+    def test_a_failed_top_albums_logs_no_key(self):
+        self._assert_logged_without_key(
+            lambda: lastfm.top_albums("privacy-top", api_key=self.KEY))
+
+    def test_a_failed_recent_tracks_logs_no_key(self):
+        self._assert_logged_without_key(
+            lambda: lastfm.recent_tracks("privacy-recent", api_key=self.KEY))

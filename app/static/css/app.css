@@ -89,3 +89,16 @@ input[type=checkbox], input[type=radio]{ accent-color:var(--c-accent); }
 .ss-brand-name{font-size:.875rem;font-weight:600;color:var(--c-gray-900);}
 .ss-brand-sub{font-size:.75rem;color:var(--c-gray-500);}
 
+/* Keyboard focus on every control: the accent, 2px clear of the control so it
+   reads on any fill. :focus-visible rather than :focus, so a mouse click on a
+   button doesn't draw it, while a text field always shows it, as browsers do.
+   gen_brand_css checks it at 3:1 on panel, panel-b and the canvas. */
+:focus-visible{outline:2px solid var(--c-accent);outline-offset:2px;}
+/* <main> takes focus only from the skip link; no ring for that. */
+main:focus{outline:none;}
+
+/* Off screen until it has focus, then over the header's top-left corner. */
+.skip-link{position:absolute;left:.5rem;top:-4rem;z-index:60;padding:.5rem .75rem;border-radius:.375rem;
+  background:var(--c-panel);color:var(--c-gray-900);font-size:.875rem;font-weight:500;
+  box-shadow:0 1px 3px rgba(0,0,0,.2);}
+.skip-link:focus{top:.5rem;}

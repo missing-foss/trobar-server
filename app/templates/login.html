@@ -33,7 +33,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       <p class="text-sm text-red-500 mb-3">{{ error }}</p>
       {% endif %}
       {% if auth_mode == 'oidc' %}
-      <a href="{{ url_for('oidc_login') }}"
+      <a href="{{ url_for('auth.oidc_login') }}"
         class="block w-full text-center text-sm px-3 py-2 rounded bg-burgundy text-on-primary hover:bg-burgundy-lo">
         {{ _("Sign in with SSO") }}
       </a>

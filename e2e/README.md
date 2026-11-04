@@ -72,7 +72,10 @@ docker run --rm -d --name lastfm-mock-e2e --network trobar-e2e-net \
 #    fine but serves outdated app code against the current test suite,
 #    producing confusing early-test failures (e.g. a JS method the tests
 #    expect that an older template genuinely doesn't have yet) that look
-#    exactly like "the harness itself won't come up".
+#    exactly like "the harness itself won't come up". global-setup checks
+#    for this before anything else: if a file under app/static, or the text of
+#    login.html or index.html, doesn't match what the server serves, the run
+#    stops with "the server under test is not running this checkout's code".
 #
 #    -p is only so you can poke the instance from the host yourself; step 3
 #    does not need it, and you can drop it if you don't want the port at all.

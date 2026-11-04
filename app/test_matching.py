@@ -27,7 +27,10 @@ def _conn() -> sqlite3.Connection:
     conn.execute(
         "CREATE TABLE tracks (id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "relative_path TEXT UNIQUE NOT NULL, artist TEXT NOT NULL, "
-        "album TEXT NOT NULL, title TEXT NOT NULL, deleted_at TEXT)"
+        "album TEXT NOT NULL, title TEXT NOT NULL, deleted_at TEXT, "
+        # Left NULL by _add: the matcher must still find such rows, as it
+        # does any row a writer other than the scanner adds.
+        "artist_norm TEXT, title_norm TEXT)"
     )
     return conn
 
@@ -150,6 +153,92 @@ class MatchByPathTests(unittest.TestCase):
         _add(self.conn, "Édith Piaf", "L'hymne à l'amour", relative_path=self._NFC_PATH)
         self.assertIsNone(matching.match_playlist_track_by_path(
             self.conn, "Édith Piaf/Chansons/01 - L'hymne a l'amour.flac"))
+
+
+
+class AlbumTiebreakTests(unittest.TestCase):
+    """The same title by the same artist on several albums: the entry's
+    album picks among them when the source gives one; without it, or when
+    none matches, the first match wins as before."""
+
+    def setUp(self):
+        self.conn = _conn()
+        self.studio = self._add("Glass Meridian", "Latitude", "Latitude")
+        self.live = self._add("Glass Meridian", "Live at the Harbour", "Latitude")
+        self.best = self._add("Glass Meridian", "The Best Of", "Latitude")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _add(self, artist, album, title, relative_path=None):
+        relative_path = relative_path or f"{artist}/{album}/{title}.flac"
+        return self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title) VALUES (?, ?, ?, ?)",
+            (relative_path, artist, album, title)).lastrowid
+
+    def test_the_entrys_album_picks_the_version(self):
+        self.assertEqual(matching.match_playlist_track(self.conn, "Glass Meridian", "Latitude",
+                                                       "Live at the Harbour"), self.live)
+        self.assertEqual(matching.match_playlist_track(self.conn, "Glass Meridian", "Latitude",
+                                                       "the best of"), self.best, "album is normalised")
+
+    def test_no_album_or_an_unknown_one_keeps_the_first_match(self):
+        for album in (None, "", "Some Other Album"):
+            self.assertEqual(matching.match_playlist_track(self.conn, "Glass Meridian", "Latitude", album),
+                             self.studio, album)
+
+    def test_album_breaks_ties_in_the_annotation_stripped_and_close_steps(self):
+        self.assertEqual(matching.match_playlist_track(self.conn, "Glass Meridian", "Latitude (Remastered)",
+                                                       "The Best Of"), self.best)
+        a = self._add("Cinder & Ash", "Emberwake", "night drive")
+        b = self._add("Cinder & Ash", "Embers Live", "night drive")
+        self.assertEqual(matching.match_playlist_track(self.conn, "Cinder & Ash", "night driv"), a)
+        self.assertEqual(matching.match_playlist_track(self.conn, "Cinder & Ash", "night driv", "Embers Live"), b)
+
+    def test_album_never_overrides_a_better_title_match(self):
+        other = self._add("Glass Meridian", "Live at the Harbour", "Two Suns")
+        self.assertEqual(matching.match_playlist_track(self.conn, "Glass Meridian", "Two Suns", "Latitude"),
+                         other)
+
+    def test_a_bare_file_name_shared_by_several_files_is_picked_by_album(self):
+        a = self._add("A", "First", "Intro", "A/First/01 Intro.flac")
+        b = self._add("A", "Second", "Intro", "A/Second/01 Intro.flac")
+        self.assertEqual(matching.match_playlist_track_by_path(self.conn, "01 Intro.flac"), a)
+        self.assertEqual(matching.match_playlist_track_by_path(self.conn, "01 Intro.flac", "Second"), b)
+        self.assertEqual(matching.match_playlist_track_by_path(self.conn, "/x/A/First/01 Intro.flac", "Second"),
+                         a, "a longer path that names one file is not overridden by album")
+
+
+
+class CloseMatchNormalisationTests(unittest.TestCase):
+    """The close step compares normalised titles on both sides, like the
+    exact and annotation-stripped steps before it."""
+
+    def setUp(self):
+        self.conn = _conn()
+        self.track = _add(self.conn, "Glass Meridian", "Latitude")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_a_near_miss_of_a_capitalised_title_matches(self):
+        # 0.93 with both sides normalised; 0.80 against "Latitude" as stored.
+        self.assertEqual(matching.match_playlist_track(self.conn, "Glass Meridian", "Latitud"), self.track)
+
+    def test_an_accented_capital_is_case_folded_too(self):
+        # normalize() folds case, accented capitals included; it doesn't
+        # strip accents, on either side.
+        accented = _add(self.conn, "Ondine Laroche", "Été Indien")
+        self.assertEqual(matching.match_playlist_track(self.conn, "Ondine Laroche", "été indie"), accented)
+
+    def test_the_cutoff_still_holds(self):
+        self.assertIsNone(matching.match_playlist_track(self.conn, "Glass Meridian", "Longitude"))
+
+    def test_two_different_songs_a_few_letters_apart_do_not_match(self):
+        # "copper days" against "paper days" scores 0.857: different songs,
+        # and a wrong match is worse than a miss.
+        _add(self.conn, "Marigold Avenue", "Paper Days")
+        self.assertIsNone(matching.match_playlist_track(self.conn, "Marigold Avenue", "Copper Days"))
 
 
 if __name__ == "__main__":

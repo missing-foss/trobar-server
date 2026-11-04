@@ -67,11 +67,11 @@ and Trobar isn't there yet. Until it is, the settings reach the watch as a
 You need the Connect IQ SDK's simulator, running **the same build** you
 sideloaded.
 
-1. **Get everything ready first.** The pairing code is valid for **one
-   hour** and works once. It's used at the watch's next sync, not when you
+1. **Get everything ready first.** The pairing code is valid for **20
+   minutes** and works once. It's used at the watch's next sync, not when you
    copy the file.
 2. Start the app in the simulator on `fenix5plus`.
-3. In the trobar-server web UI, create the device: **Profile → Devices → Add
+3. In the trobar-server web UI, create the device: **Devices → Add
    mobile device (QR / code)** (see
    [Clients overview → device tokens](index.md#device-tokens)). Note the
    server URL and the code; the QR code isn't used here.
@@ -85,7 +85,7 @@ sideloaded.
    **under the same base name as the Trobar `.prg` on the watch**. Check
    whether the `.prg` is in `GARMIN/APPS/` or `GARMIN/APPS/MEDIA/`; the
    simulator keeps an audio app in `MEDIA/`. Disconnect.
-7. Let the watch sync on its own Wi-Fi within the hour (see
+7. Let the watch sync on its own Wi-Fi within those 20 minutes (see
    [Wi-Fi requirements](#wi-fi-requirements)).
 
 Open Trobar in the watch's Music app to see the outcome. **"Paired: *device

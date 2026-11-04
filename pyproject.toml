@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 files = ["app"]
 exclude = ["app/translations/"]
 # Most of the codebase already carries real annotations (return types,

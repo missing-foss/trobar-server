@@ -13,11 +13,14 @@ whose behaviour under concurrent access is the thing worth testing.
 
     python3 -m unittest test_jobs -v      # from app/
 """
+import json
 import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import db
@@ -39,6 +42,9 @@ class _JobsTestBase(unittest.TestCase):
 
         self._orig_idle_hooks = list(jobs._idle_hooks)
         self.addCleanup(self._restore_idle_hooks)
+
+        self.addCleanup(jobs._cancel_requests.clear)
+        self.addCleanup(jobs._cancelled_types.clear)
 
         self.conn = db.get_conn()
         self.addCleanup(self.conn.close)
@@ -338,6 +344,53 @@ class RunOneTests(_JobsTestBase):
         self.assertIsNone(row["result"])
 
 
+class OnRetryTests(_JobsTestBase):
+    """register(on_retry=) rewrites the payload whenever a job goes back to the
+    queue on its own, and only then."""
+
+    def setUp(self):
+        super().setUp()
+        # Cleanups run last-in first-out: clear, then restore the originals.
+        self.addCleanup(jobs._ON_RETRY.update, dict(jobs._ON_RETRY))
+        self.addCleanup(jobs._ON_RETRY.clear)
+
+    def _payload(self, job_id):
+        return json.loads(self._row(job_id)["payload"])
+
+    def _cheaper(self, payload):
+        return {**payload, "full": False}
+
+    def test_a_failure_retry_gets_the_rewritten_payload(self):
+        jobs.register("demo", lambda payload, report=None: (_ for _ in ()).throw(RuntimeError("nope")),
+                      on_retry=self._cheaper)
+        job_id = self._enqueue("demo", payload={"full": True, "keep": 1})
+        jobs.run_one()
+        self.assertEqual(self._row(job_id)["state"], "queued")
+        self.assertEqual(self._payload(job_id), {"full": False, "keep": 1})
+
+    def test_a_requeue_after_a_restart_gets_the_rewritten_payload(self):
+        jobs.register("demo", lambda payload, report=None: None, on_retry=self._cheaper)
+        job_id = self._enqueue("demo", payload={"full": True})
+        jobs.claim(self.conn)
+        jobs.requeue_interrupted(self.conn)
+        self.assertEqual(self._row(job_id)["state"], "queued")
+        self.assertEqual(self._payload(job_id), {"full": False})
+
+    def test_other_types_and_a_first_run_keep_their_payload(self):
+        jobs.register("demo", lambda payload, report=None: None, on_retry=self._cheaper)
+        jobs.register("other", lambda payload, report=None: (_ for _ in ()).throw(RuntimeError("nope")))
+        other = self._enqueue("other", payload={"full": True})
+        jobs.run_one()
+        self.assertEqual(self._payload(other), {"full": True})
+        seen = []
+        jobs.register("demo", lambda payload, report=None: seen.append(payload), on_retry=self._cheaper)
+        self._enqueue("demo", payload={"full": True})
+        self.conn.execute("UPDATE jobs SET run_after = datetime('now', '+1 hour') WHERE id = ?", (other,))
+        self.conn.commit()
+        jobs.run_one()
+        self.assertEqual(seen, [{"full": True}])
+
+
 class RetryTests(_JobsTestBase):
     def test_a_failure_requeues_with_a_backoff_and_records_the_error(self):
         jobs.register("demo", lambda payload, report=None: (_ for _ in ()).throw(RuntimeError("nope")))
@@ -608,7 +661,7 @@ class StatusTests(_JobsTestBase):
     def test_status_counts_every_state(self):
         self.assertEqual(
             jobs.status(self.conn),
-            {"queued": 0, "running": 0, "done": 0, "failed": 0})
+            {"queued": 0, "running": 0, "done": 0, "failed": 0, "cancelled": 0})
         jobs.enqueue(self.conn, "demo")
         self.assertEqual(jobs.status(self.conn)["queued"], 1)
 
@@ -658,6 +711,236 @@ class WorkerTests(_JobsTestBase):
         # and the slot is free again, so a later start_worker() works
         self.assertTrue(jobs.start_worker())
         self.addCleanup(jobs.stop_worker)
+
+
+class CancelTests(_JobsTestBase):
+    """A running job asked to stop raises from its next `report`: an admin's
+    cancel ends it `cancelled`, a shutdown queues it again."""
+
+    def _stops_at_report(self, job_id_box, at=2, reason=jobs.CANCEL_ADMIN):
+        """A handler that reports items 0, 1, 2…, asking for its own cancel
+        just before item `at`, and records each item it gets past."""
+        done = []
+
+        def _handler(payload, report):
+            for i in range(5):
+                if i == at:
+                    jobs.request_cancel(job_id_box[0], reason)
+                report(i, 5)
+                done.append(i)
+            return {"items": len(done)}
+        return _handler, done
+
+    def _run(self, reason=jobs.CANCEL_ADMIN, at=2):
+        box = [0]
+        handler, done = self._stops_at_report(box, at=at, reason=reason)
+        jobs.register("demo", handler)
+        box[0] = self._enqueue("demo")
+        self.assertTrue(jobs.run_one())
+        return box[0], done
+
+    def test_an_admin_cancel_stops_at_the_next_report_and_ends_cancelled(self):
+        job_id, done = self._run()
+        self.assertEqual(done, [0, 1])
+        row = self._row(job_id)
+        self.assertEqual(row["state"], "cancelled")
+        self.assertIsNotNone(row["finished_at"])
+        self.assertIsNone(row["result"])
+        # where it stopped stays visible, like a failure's
+        self.assertEqual(json.loads(row["progress"]), {"done": 1, "total": 5})
+        self.assertEqual(row["attempts"], 1)
+
+    def test_a_cancelled_job_is_never_claimed_again(self):
+        job_id, _ = self._run()
+        self.assertFalse(jobs.run_one())
+        jobs.requeue_interrupted(self.conn)
+        self.assertEqual(self._row(job_id)["state"], "cancelled")
+
+    def test_a_handlers_own_except_exception_cannot_swallow_the_cancel(self):
+        box = [0]
+
+        def _handler(payload, report):
+            for i in range(3):
+                try:
+                    if i == 1:
+                        jobs.request_cancel(box[0])
+                    report(i, 3)
+                except Exception:
+                    pass  # a handler that carries on past per-item errors
+            return {"finished": True}
+
+        jobs.register("demo", _handler)
+        box[0] = self._enqueue("demo")
+        jobs.run_one()
+        self.assertEqual(self._row(box[0])["state"], "cancelled")
+
+    def test_a_shutdown_queues_the_job_again_and_gives_back_its_attempt(self):
+        jobs.register("demo", lambda payload, report=None: None,
+                      on_retry=lambda payload: {**payload, "cheaper": True})
+        self.addCleanup(jobs._ON_RETRY.pop, "demo", None)
+        job_id, done = self._run(reason=jobs.CANCEL_SHUTDOWN)
+        self.assertEqual(done, [0, 1])
+        row = self._row(job_id)
+        self.assertEqual(row["state"], "queued")
+        self.assertEqual(row["attempts"], 0)
+        self.assertIsNone(row["started_at"])
+        self.assertIsNone(row["finished_at"])
+        self.assertEqual(row["last_error"],
+                         "the server shut down while this job was running; it has been queued again")
+
+    def test_a_shutdown_requeue_gets_the_on_retry_payload(self):
+        box = [0]
+        handler, _ = self._stops_at_report(box, reason=jobs.CANCEL_SHUTDOWN)
+        jobs.register("demo", handler, on_retry=lambda payload: {**payload, "cheaper": True})
+        self.addCleanup(jobs._ON_RETRY.pop, "demo", None)
+        box[0] = self._enqueue("demo", payload={"n": 1})
+        jobs.run_one()
+        self.assertEqual(json.loads(self._row(box[0])["payload"]), {"n": 1, "cheaper": True})
+
+    def test_an_admin_cancel_is_not_turned_into_a_requeue_by_a_later_shutdown(self):
+        jobs.request_cancel(7, jobs.CANCEL_ADMIN)
+        jobs.request_cancel(7, jobs.CANCEL_SHUTDOWN)
+        self.assertEqual(jobs._cancel_requests[7], jobs.CANCEL_ADMIN)
+
+    def test_the_request_is_forgotten_once_the_job_has_ended(self):
+        job_id, _ = self._run()
+        self.assertFalse(jobs.cancel_requested(job_id))
+        # and for a job that finished before it reached a report
+        box = [0]
+
+        def _handler(payload, report):
+            jobs.request_cancel(box[0])
+            return {"ok": True}
+
+        jobs.register("demo", _handler)
+        box[0] = self._enqueue("demo")
+        jobs.run_one()
+        self.assertEqual(self._row(box[0])["state"], "done")
+        self.assertFalse(jobs.cancel_requested(box[0]))
+
+    def test_recent_says_which_running_jobs_are_cancelling(self):
+        running = self._enqueue("demo")
+        jobs.claim(self.conn)
+        queued = self._enqueue("demo")
+        jobs.request_cancel(running)
+        jobs.request_cancel(queued)  # only a running job can be "cancelling"
+        by_id = {row["id"]: row for row in jobs.recent(self.conn)}
+        self.assertTrue(by_id[running]["cancelling"])
+        self.assertFalse(by_id[queued]["cancelling"])
+
+    def test_cancelled_this_run_names_only_types_an_admin_cancelled(self):
+        self._run(reason=jobs.CANCEL_SHUTDOWN)
+        self.assertFalse(jobs.cancelled_this_run("demo"))
+        self.conn.execute("DELETE FROM jobs")  # the requeued job would be claimed first
+        self.conn.commit()
+        self._run()
+        self.assertTrue(jobs.cancelled_this_run("demo"))
+        self.assertFalse(jobs.cancelled_this_run("other"))
+
+    def test_old_cancelled_rows_are_pruned_like_done_ones(self):
+        for days_ago in (30, 20):
+            self.conn.execute(
+                "INSERT INTO jobs (type, state, finished_at) VALUES ('demo', 'cancelled', "
+                "datetime('now', ?))", (f"-{days_ago} days",))
+        self.conn.commit()
+        jobs._prune_finished(self.conn)
+        # past the window, only the newest of its (type, state) is kept
+        self.assertEqual(jobs.status(self.conn)["cancelled"], 1)
+
+
+class ShutdownTests(_JobsTestBase):
+    def test_shutdown_stops_a_running_job_at_its_next_report_and_requeues_it(self):
+        started = threading.Event()
+
+        def _handler(payload, report):
+            started.set()
+            for i in range(1000):
+                report(i, 1000)
+                time.sleep(0.01)
+            return {"finished": True}
+
+        jobs.register("demo", _handler)
+        job_id = self._enqueue("demo")
+        self.assertTrue(jobs.start_worker())
+        self.addCleanup(jobs.stop_worker)
+        self.assertTrue(started.wait(10), "the job never started")
+        self.assertTrue(jobs.shutdown(timeout=5.0), "the worker did not stop")
+        row = self._row(job_id)
+        self.assertEqual(row["state"], "queued")
+        self.assertEqual(row["attempts"], 0)
+
+    def test_a_job_stopped_for_shutdown_is_not_claimed_again_before_the_worker_stops(self):
+        # The stop has to be in place before any job is asked to stop: a job
+        # requeued for the shutdown, and claimed again before then, would
+        # run to its end with no cancel request left to stop it.
+        started = threading.Event()
+        runs = []
+
+        def _handler(payload, report):
+            runs.append(1)
+            started.set()
+            for i in range(1000):
+                report(i, 1000)
+                time.sleep(0.01)
+            return {"finished": True}
+
+        real_request = jobs.request_cancel
+
+        def slow_request(job_id, reason=jobs.CANCEL_ADMIN):
+            real_request(job_id, reason)
+            time.sleep(0.2)  # long enough for the job to reach its next report
+
+        jobs.register("demo", _handler)
+        job_id = self._enqueue("demo")
+        self.assertTrue(jobs.start_worker())
+        self.addCleanup(jobs.stop_worker)
+        self.assertTrue(started.wait(10), "the job never started")
+        with mock.patch.object(jobs, "request_cancel", slow_request):
+            self.assertTrue(jobs.shutdown(timeout=5.0), "the worker did not stop")
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(self._row(job_id)["state"], "queued")
+
+    def test_a_job_that_never_reports_is_left_running_for_the_next_start(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        def _handler(payload, report):
+            started.set()
+            release.wait(10)
+
+        jobs.register("demo", _handler)
+        job_id = self._enqueue("demo")
+        self.assertTrue(jobs.start_worker())
+        self.addCleanup(jobs.stop_worker)
+        self.addCleanup(release.set)
+        self.assertTrue(started.wait(10), "the job never started")
+        self.assertFalse(jobs.shutdown(timeout=0.2))
+        self.assertEqual(self._row(job_id)["state"], "running")
+        release.set()
+
+    def test_a_stop_that_times_out_keeps_the_thread_for_the_next_stop(self):
+        # A thread left running by a timed-out stop would otherwise be lost:
+        # the next start would run a second worker beside it, with the stop
+        # cleared, and the stale one would take requests meant for the new.
+        release = threading.Event()
+        started = threading.Event()
+
+        def _handler(payload, report):
+            started.set()
+            release.wait(10)
+
+        jobs.register("demo", _handler)
+        self._enqueue("demo")
+        self.assertTrue(jobs.start_worker())
+        self.addCleanup(jobs.stop_worker)
+        self.addCleanup(release.set)
+        self.assertTrue(started.wait(10), "the job never started")
+        self.assertFalse(jobs.stop_worker(timeout=0.2))
+        self.assertFalse(jobs.start_worker(), "a second worker started beside the first")
+        release.set()
+        self.assertTrue(jobs.stop_worker(timeout=5.0), "the later stop did not join the thread")
+        self.assertFalse(any(t.name.startswith("job-worker") and t.is_alive()
+                             for t in threading.enumerate()))
 
 
 class IdleHookTests(_JobsTestBase):

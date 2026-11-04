@@ -205,11 +205,21 @@ def seen_in_library(mirror_folder: Path, music_root: Path, location: str) -> boo
     reached through two mounts of one share. Checked with a file rather
     than by comparing paths or inodes, which differ between mount types: a
     uniquely named probe is written through the mirror mount and looked
-    for under the library, then removed. False when it can't be written."""
+    for under the library, then removed. False when it can't be written.
+
+    `location` must name a folder inside MUSIC_ROOT. The caller already
+    refuses ".." and backslashes; this checks containment where the path
+    is built as well, so no caller can reach outside the library with it.
+    `mirror_folder` is the admin's chosen output folder, so any writable
+    folder is valid there by design."""
+    root = os.path.normpath(str(music_root))
+    library_dir = os.path.normpath(os.path.join(root, location))
+    if not library_dir.startswith(root + os.sep):
+        return False
     try:
         mirror_folder.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=mirror_folder, prefix=".trobar-probe-") as probe:
-            return (music_root / location / Path(probe.name).name).is_file()
+            return os.path.isfile(os.path.join(library_dir, os.path.basename(probe.name)))
     except OSError:
         return False
 
@@ -234,8 +244,7 @@ def delete_mirror(conn, playlist_id: int) -> None:
     playlist_sync.py's stale-playlist cleanup (BEFORE the playlist row
     itself is deleted, since this needs mirror_filename first) so a
     removed golden source doesn't leave an orphaned mirror file behind.
-    Does not commit — same convention as sync_state.record_unresolved_
-    playlist_tracks, the caller's own trailing commit covers it."""
+    mirror_sinks commits around it."""
     row = conn.execute(
         "SELECT mirror_filename FROM playlists WHERE id = ?", (playlist_id,)
     ).fetchone()
@@ -265,11 +274,9 @@ def write_mirror(conn, playlist_id: int) -> None:
     """Idempotent full rewrite of this playlist's mirror file. No-ops
     (touches nothing) if the playlist isn't mirror_enabled or no
     mirror_folder is configured. Never raises — every failure mode is
-    instead persisted to mirror_last_error for the admin overview. Does
-    not commit — same convention as sync_state.record_unresolved_
-    playlist_tracks, the caller's own trailing commit covers it (this
-    runs inline in playlist_sync.py's per-playlist commit and must not
-    itself abort or fragment that transaction)."""
+    instead persisted to mirror_last_error for the admin overview.
+    mirror_sinks commits around it, and it commits the user's folder name
+    before touching the mirror folder, which can be a network share."""
     row = conn.execute(
         "SELECT title, owner_user_id, mirror_enabled, mirror_filename FROM playlists WHERE id = ?",
         (playlist_id,),
@@ -284,6 +291,7 @@ def write_mirror(conn, playlist_id: int) -> None:
     # The owner's folder, holding Kodi's two subfolders; unowned playlists
     # go to SHARED_FOLDER.
     user_dir = _safe_path(folder, user_folder_name(conn, row["owner_user_id"]))
+    conn.commit()
     music_dir = _safe_path(user_dir, "music") if user_dir is not None else None
     if user_dir is None or music_dir is None:
         _set_error(conn, playlist_id, "bad_filename", str(user_dir))

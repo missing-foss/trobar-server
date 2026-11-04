@@ -56,3 +56,26 @@ not create. See
     If your server exposes more than one API dialect, use its **Subsonic**
     endpoint/credentials here. Native (non-Subsonic) APIs aren't used by this
     provider.
+
+## How Trobar signs in, and what that risks
+
+The Subsonic API signs each request with an MD5 hash of your password and a
+fresh random salt, and that is the sign-in every server in this family shares.
+Trobar can't replace it. MD5 is weak, and this matters in three ways:
+
+- The hash and salt travel in each request's URL. Over plain `http://`, anyone
+  who can see the traffic can reuse them, or try to work out the password from
+  them offline. Server access logs can hold them too.
+- The server has to be able to check the hash, so most Subsonic servers keep your
+  password in a form they can read.
+- Trobar needs the password itself to make the hash, so it keeps it in plain text
+  in its database, like other provider credentials. See
+  [Backups](../operations/backups.md).
+
+So:
+
+- Use an `https://` address if Trobar reaches the server over anything but a
+  network you trust.
+- Give Trobar its own account on the server, with a password you use nowhere else.
+  If that account leaks, nothing else does.
+- Give that account only the access it needs.

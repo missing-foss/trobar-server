@@ -15,12 +15,21 @@ the filesystem fallback) at all, and once an image is cached it keeps working
 even if the provider is later offline or unreachable. Cache is cleared on
 provider switch (see main.py's admin config handler) since a cached image is
 tied to whichever provider (or the filesystem fallback) supplied it, not to
-the artist name alone."""
+the artist name alone.
+
+A miss everywhere is remembered for a day (MISS_TTL_S), as a .none marker
+beside the cache, like covers.py's: without it a long artist list asks every
+source again, for every artist without a picture, on every view. A day, not
+forever as for covers, because these sources are outside services: an
+artist with no picture today may get one when a provider is next reachable.
+Clearing the cache clears the markers with it."""
 
 import hashlib
 import io
 import json
+import time
 from pathlib import Path
+import logging
 
 from PIL import Image
 
@@ -28,7 +37,10 @@ import audiodb_client
 import db
 import filesystem_client
 
+_log = logging.getLogger(__name__)
+
 CACHE_DIR = db.DATA_DIR / "artist_images"
+MISS_TTL_S = 24 * 60 * 60
 
 
 def _cache_path(artist: str) -> Path:
@@ -50,6 +62,12 @@ def get_artist_image(artist: str, provider,
     meta_path = cache_path.with_suffix(".type")
     if cache_path.exists() and meta_path.exists():
         return cache_path.read_bytes(), meta_path.read_text(encoding="utf-8")
+    miss_path = cache_path.with_suffix(".none")
+    try:
+        if time.time() - miss_path.stat().st_mtime < MISS_TTL_S:
+            return None
+    except FileNotFoundError:
+        pass
 
     fetched = None
     source: dict = {}
@@ -66,9 +84,12 @@ def get_artist_image(artist: str, provider,
         fetched = filesystem_client.get_artist_image(artist)
         source = {"source": "filesystem"}
     if fetched is None:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        miss_path.touch()  # a fresh mtime when an expired marker is renewed
         return None
     data, content_type = fetched
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    miss_path.unlink(missing_ok=True)
     cache_path.write_bytes(data)
     meta_path.write_text(content_type, encoding="utf-8")
     cache_path.with_suffix(".src").write_text(

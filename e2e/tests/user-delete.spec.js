@@ -4,6 +4,7 @@
 
 // @ts-check
 const { test, expect } = require("@playwright/test");
+const { trackFetches, settled } = require("../support/settle");
 
 // #332: the delete-user confirmation is an in-app dialog, not confirm().
 //
@@ -17,13 +18,14 @@ const { test, expect } = require("@playwright/test");
 // AdminUserOwnedCountsTests; what needs a browser is the rendering.
 
 async function gotoUsers(page) {
+  await trackFetches(page);
   await page.goto("/#/admin");
   await page.evaluate(() => {
     const app = window.Alpine.$data(document.querySelector("[x-data]"));
     app.goToTab("admin");
     app.setSubTab("admin", "users");
   });
-  await page.waitForTimeout(600);
+  await settled(page);
 }
 
 /** Open the dialog for a user with the given owned counts. */
@@ -34,7 +36,7 @@ async function openFor(page, counts) {
     const u = {...app.adminUsers[0], ...c};
     app.openDeleteUserModal(u);
   }, counts);
-  await page.waitForTimeout(300);
+  await settled(page);
 }
 
 test.describe("delete-user dialog (#332)", () => {

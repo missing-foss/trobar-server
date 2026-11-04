@@ -8,6 +8,8 @@
 import logging
 import os
 import sqlite3
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
@@ -17,6 +19,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 # deployments' databases keep opening; renaming it would orphan them all.
 DB_PATH = DATA_DIR / "music-sync.db"
 
+# Migration 1's schema, frozen: see the note above _MIGRATIONS.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,7 +166,7 @@ CREATE TABLE IF NOT EXISTS unresolved_playlist_tracks (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_unresolved_playlist_tracks_playlist
     ON unresolved_playlist_tracks(playlist_id);
--- Upsert key for sync_state._record_unresolved_playlist_tracks: a playlist
+-- Upsert key for unresolved_store.record_unresolved_playlist_tracks: a playlist
 -- entry has no stable id of its own (no path for most providers, and
 -- `position` shifts on reorder), so (artist, title, album) is the closest
 -- thing to an identity — good enough to preserve `excluded` across a
@@ -223,7 +226,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_playlist_subscriptions_identity
 -- behalf of ANY playlist's "Request missing albums" toggle -- deliberately
 -- NOT scoped per-playlist (no playlist_id here at all) and NOT stored on
 -- unresolved_playlist_tracks above: that table is fully DELETE+recreated on
--- every single playlist sync (see sync_state.record_unresolved_playlist_tracks),
+-- every single playlist sync (see unresolved_store.record_unresolved_playlist_tracks),
 -- so anything written there forgets on the very next sync. The same missing
 -- album surfacing as a gap in three different playlists must only ever be
 -- requested once -- this table is what makes that true, and what makes
@@ -315,7 +318,7 @@ CREATE TABLE IF NOT EXISTS selections (
 -- against at least one device, not sent yet" — items accumulate here from
 -- any surface (Suggestions, Recently Added/Released, Library, an artist
 -- page, a playlist) before a fan-out step turns each (device, item) pair
--- into a real `selections` row via sync_state.create_selection, exactly
+-- into a real `selections` row via selection_store.create_selection, exactly
 -- like the existing single-item device picker already does. Server-side
 -- (not client-only) so the basket survives a reload and follows the user
 -- across machines/browsers.
@@ -356,7 +359,7 @@ CREATE TABLE IF NOT EXISTS basket_items (
 -- Invariant maintained everywhere a basket_items row is touched: a row
 -- here never has zero links. A device-less basket item has nowhere to
 -- render under in the per-device basket panel, so
--- sync_state.unstage_basket_item_device deletes the basket_items row too
+-- basket_store.unstage_basket_item_device deletes the basket_items row too
 -- the moment its last link goes, rather than keeping a device-less row
 -- around the way toggle_selection_device deliberately does for
 -- `selections` (which has no per-device rendering to worry about).
@@ -433,6 +436,17 @@ CREATE TABLE IF NOT EXISTS enrollment_grants (
 -- part of #446/#474's design was never the problem, and nothing here
 -- changes it.
 -- STRICT: new tables are STRICT from now on.
+-- Sessions ended by logging out. A session cookie is re-signed on every
+-- request (its lifetime slides), so a request still in flight when the user
+-- logs out comes back with a fresh copy of the signed-in cookie; recording
+-- the session's id as ended is what keeps that copy from signing them back
+-- in. Rows older than the session lifetime are pruned, as no cookie that
+-- old can be read anyway.
+CREATE TABLE IF NOT EXISTS ended_sessions (
+    sid TEXT PRIMARY KEY,
+    ended_at TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS integration_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -479,8 +493,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     type TEXT NOT NULL,
     -- JSON object, or NULL for a job whose type says everything.
     payload TEXT,
-    -- queued -> running -> done | failed. A failed job keeps last_error and
-    -- can be requeued (by the admin, or by the retry logic in jobs.py).
+    -- queued -> running -> done | failed | cancelled. A failed job keeps
+    -- last_error and can be requeued (by the admin, or by the retry logic in
+    -- jobs.py); a cancelled one, stopped by an admin, is never retried.
     state TEXT NOT NULL DEFAULT 'queued',
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
@@ -530,7 +545,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key)
 -- instead of comparing paths.
 --
 -- Why fingerprints and not paths: identity today is a byte-exact device_path()
--- comparison (see sync_state.record_device_manifest), and device_path() is
+-- comparison (see device_store.record_device_manifest), and device_path() is
 -- built from tags, track_no/disc_no, fs_segment()'s sanitisation rules and the
 -- transcode extension. Any drift in ANY of those makes Trobar fail to
 -- recognise files it wrote itself — that's the "~50 albums listed as unknown to
@@ -562,6 +577,24 @@ CREATE TABLE IF NOT EXISTS device_provenance (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_device_provenance_pending
     ON device_provenance(device_id, state);
+-- One row per mirror write attempt, per playlist and server sink (the
+-- filesystem mirror has no target, so no rows): how many of the tracks
+-- Trobar sent ended up on the target, and which did not. Only the last
+-- mirror_runs.KEEP rows per (playlist, sink) are kept. See mirror_runs.py.
+CREATE TABLE IF NOT EXISTS mirror_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    sink TEXT NOT NULL,
+    run_at TEXT NOT NULL DEFAULT (datetime('now')),
+    total INTEGER NOT NULL,
+    on_target INTEGER NOT NULL,
+    lacked INTEGER NOT NULL,
+    refused INTEGER NOT NULL,
+    -- JSON list of {"artist", "title", "reason"}, at most mirror_runs.LIST_MAX.
+    missing TEXT NOT NULL DEFAULT '[]'
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_mirror_runs_pair
+    ON mirror_runs(playlist_id, sink, id);
 """
 
 
@@ -666,9 +699,67 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def connection() -> Iterator[sqlite3.Connection]:
+    """A get_conn() connection for one `with` block: rolled back if the block
+    raises, and closed either way. Only explicit commits persist, as with
+    the try/finally pairs this replaces (closing an uncommitted transaction
+    also discards it)."""
+    conn = get_conn()
+    try:
+        yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def write(conn: sqlite3.Connection | None = None) -> Iterator[sqlite3.Connection]:
+    """One short write transaction: committed when the block ends, rolled back
+    if it raises. New code writes through this.
+
+    Takes the write lock on entry, so keep slow work out of the block: every
+    other writer waits for as long as it runs. Read the file or call the
+    server first, then write what came back.
+
+    With `conn`, uses that connection and leaves it open. Without, opens one
+    and closes it. A transaction already open on `conn` is an error, because
+    this would commit someone else's half-done writes."""
+    own = conn is None
+    active = get_conn() if conn is None else conn
+    try:
+        if active.in_transaction:
+            raise RuntimeError("db.write() inside an open transaction")
+        active.execute("BEGIN IMMEDIATE")
+        try:
+            yield active
+        except BaseException:
+            active.rollback()
+            raise
+        active.commit()
+    finally:
+        if own:
+            active.close()
+
+
+def _new_id(cur: sqlite3.Cursor) -> int:
+    """cur.lastrowid is Optional per sqlite3's stub (None before any INSERT
+    has ever run on the cursor), but always set right after one — narrow it
+    once here instead of asserting at each call site."""
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
 # Columns added after the initial schema — CREATE TABLE IF NOT EXISTS doesn't
 # retrofit them onto an already-existing table (the prod DB had 58k rows
 # scanned before these were added), so add them explicitly, idempotently.
+#
+# Frozen, like SCHEMA: both run only inside migration 1, which a database
+# past version 1 never runs again. A new column or table goes in a new
+# numbered migration (MIGRATIONS below), or existing databases never get it.
+# test_db_migrations checks an upgraded database against a new one.
 _MIGRATIONS = [
     ("users", "lastfm_username", "TEXT"),
     ("users", "lastfm_api_key", "TEXT"),
@@ -707,6 +798,10 @@ _MIGRATIONS = [
     # which of the two a NULL is, and how stale a number is.
     ("devices", "reported_foreign_bytes", "INTEGER"),
     ("devices", "foreign_bytes_reported_at", "TEXT"),
+    # The space the device keeps free on its volume, as it reports it with
+    # its free/total figures. NULL: a client that doesn't keep one, or
+    # hasn't said; not zero.
+    ("devices", "reported_reserve_bytes", "INTEGER"),
     ("tracks", "year", "INTEGER"),
     # original release year stays in `year` (what the album list
     # sorts by); reissue_year is the file's own date/pressing year, shown
@@ -785,10 +880,9 @@ _MIGRATIONS = [
     # return a new one) — tidal_client.py callers persist the latest value
     # every time they refresh, this column is never assumed stable.
     ("users", "tidal_refresh_token", "TEXT"),
-    # Tidal's own account id — needed to address this user's collection
-    # server-side (tidal_client.list_playlists' /userCollections/{id}/...).
-    # Stashed at link time so every sync doesn't need an extra GET
-    # /v2/users/me round-trip just to re-derive it.
+    # Tidal's own account id, from GET /v2/users/me at link time. Sharing
+    # compares it with a playlist's owners; the playlist listing doesn't need
+    # it, since it addresses the account as `me`.
     ("users", "tidal_user_id", "TEXT"),
     # Tidal's own display name/username for "Connected as: X" in the
     # Profile UI — fetched once at link time (GET /v2/users/me), not kept
@@ -853,7 +947,7 @@ _MIGRATIONS = [
     # via a linked streaming provider's own account (a "dual-source"
     # playlist — the household's Roon connection and the owner's direct
     # Tidal both expose it), this points at that streaming row's
-    # playlists.id. Set purely by _infer_roon_playlist_origins at sync
+    # playlists.id. Set purely by _infer_playlist_origins at sync
     # time (recomputed fresh each run). Deliberately SEPARATE from
     # owner_user_id: owner_user_id is the *enforcement* owner (#28 hides an
     # owned+private row), and the Roon row must stay unowned/household-
@@ -941,6 +1035,39 @@ _MIGRATIONS = [
     # together, so a stale sequence value never survives past a fingerprint
     # actually going away).
     ("tracks", "fingerprint_seq", "INTEGER"),
+    # Last among the tracks columns, so a fresh database and an upgraded one
+    # (where ALTER TABLE appends) have the same column order.
+    #
+    # The file's own MusicBrainz recording id (the song, the same on every
+    # release that carries it), read from its tags at scan time: FLAC/Vorbis
+    # MUSICBRAINZ_TRACKID, MP4 "MusicBrainz Track Id", ID3 UFID. NULL when
+    # the file has none; identity.py's recording-id tier matches a source's
+    # recording id against it, then against acoustid_mbid. Files scanned
+    # before this column existed are filled by mbid_backfill.py's one-time
+    # pass, since an unchanged file is never re-read by the scanner.
+    ("tracks", "mbid", "TEXT"),
+    # matching.normalize() of artist and title, stored so the artist/title
+    # matcher's candidate query is an index lookup, not a Python call per
+    # row per lookup. Written by the scanner with the tags, and filled for
+    # existing rows at startup by _refresh_norms, which also recomputes them
+    # all when normalize() changes (matching.NORM_VERSION).
+    ("tracks", "artist_norm", "TEXT"),
+    ("tracks", "title_norm", "TEXT"),
+    # The album artist (album_artist.py): the file's albumartist tag as read,
+    # and what the library groups the album under, derived from the whole
+    # album. The second is filled for existing rows at startup.
+    ("tracks", "album_artist_tag", "TEXT"),
+    ("tracks", "album_artist", "TEXT"),
+    # Whether the scan has read this file's albumartist tag yet: NULL in
+    # album_artist_tag means "no tag" only once it's 1. A library from before
+    # these columns has every row at 0, and its next scan reads the tag of
+    # the files it would otherwise skip as unchanged.
+    ("tracks", "album_artist_read", "INTEGER NOT NULL DEFAULT 0"),
+    # Whether the file is lossless audio (scanner._lossless): 1 for FLAC, WAV,
+    # AIFF and ALAC in .m4a, 0 for lossy, NULL not yet known (a library from
+    # before this, until its next scan). sync_state transcodes only lossless
+    # files; while NULL it decides by the extension, as it did before.
+    ("tracks", "lossless", "INTEGER"),
     # #297 step 3: live progress for a running job, so the Background jobs panel
     # can show "12,431 / 58,783 files" instead of only "running". Needed as a
     # migration as well as in SCHEMA because 2.3.0 already shipped the jobs
@@ -1117,6 +1244,28 @@ _MIGRATIONS = [
     # identity across resyncs; readers take `album` first, this otherwise.
     # NULL = not looked up, or no studio album found.
     ("unresolved_playlist_tracks", "inferred_album", "TEXT"),
+    # A playlist made on a device: an entry whose card path names no file
+    # Trobar put there is matched by the artist and title its file name
+    # gives, but only as a suggestion. suggested_track_id is that guess,
+    # accepted whether its owner took it (only then is the entry matched),
+    # and source_path the entry as the card had it, for the review list.
+    ("unresolved_playlist_tracks", "suggested_track_id", "INTEGER"),
+    ("unresolved_playlist_tracks", "accepted", "INTEGER NOT NULL DEFAULT 0"),
+    ("unresolved_playlist_tracks", "source_path", "TEXT"),
+    # The device path a track was delivered under, set when its download is
+    # acked: a later format change or retag renames the expected file, and a
+    # deletion has to name the one the device actually holds. NULL = not
+    # recorded (delivered before this column); readers compute it then.
+    ("device_track_state", "delivered_path", "TEXT"),
+    # Bumped when a user's password changes or an admin resets it: a session
+    # carrying an older value is over, so every other session of that user
+    # ends (main._session_user_id).
+    ("users", "session_generation", "INTEGER NOT NULL DEFAULT 0"),
+    # Which of the playlists selected for a device it plays: NULL = all of
+    # them in one play order (Everything, the default). Cleared when that
+    # playlist is no longer selected for the device
+    # (selection_store.recompute_device_state) or is deleted (the foreign key).
+    ("devices", "play_playlist_id", "INTEGER REFERENCES playlists(id) ON DELETE SET NULL"),
 ]
 
 
@@ -1127,6 +1276,37 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
     _post_migration_indexes(conn)
     _backfill_release_date(conn)
+
+
+def _refresh_norms(conn: sqlite3.Connection) -> None:
+    """Fill tracks.artist_norm/title_norm where they're empty, or recompute
+    every row when matching.NORM_VERSION differs from the one they were
+    computed with. Does not commit."""
+    import matching  # db is imported by nearly everything; matching only here.
+
+    version = str(matching.NORM_VERSION)
+    where = "" if get_config(conn, "tracks_norm_version") != version else "WHERE artist_norm IS NULL OR title_norm IS NULL"
+    rows = conn.execute(f"SELECT id, artist, title FROM tracks {where}").fetchall()
+    conn.executemany("UPDATE tracks SET artist_norm = ?, title_norm = ? WHERE id = ?",
+                     [(matching.normalize(r["artist"]), matching.normalize(r["title"]), r["id"]) for r in rows])
+    set_config(conn, "tracks_norm_version", version)
+
+
+def _refresh_album_artists(conn: sqlite3.Connection) -> None:
+    """Fill tracks.album_artist for the whole library when any live track
+    has none yet (a library from before the column). Does not commit."""
+    if conn.execute("SELECT 1 FROM tracks WHERE album_artist IS NULL AND deleted_at IS NULL LIMIT 1").fetchone():
+        import album_artist  # only here, like matching in _refresh_norms
+        album_artist.refresh(conn)
+
+
+def _backfill_delivered_paths(conn: sqlite3.Connection) -> None:
+    """Name the file each device holds where no delivery recorded it
+    (device_store.backfill_delivered_paths). Does not commit."""
+    if conn.execute("SELECT 1 FROM device_track_state WHERE status = 'downloaded' "
+                    "AND delivered_path IS NULL LIMIT 1").fetchone():
+        import sync_state  # only here, like album_artist above
+        sync_state.backfill_delivered_paths(conn)
 
 
 def _post_migration_indexes(conn: sqlite3.Connection) -> None:
@@ -1142,6 +1322,18 @@ def _post_migration_indexes(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tracks_fingerprint ON tracks(fingerprint) "
         "WHERE fingerprint IS NOT NULL"
+    )
+    # The recording-id tier looks up every playlist entry that carries one,
+    # in the file's own id and then in the one AcoustID resolved.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tracks_mbid ON tracks(mbid) WHERE mbid IS NOT NULL"
+    )
+    # The artist/title matcher looks every entry's artist up by this; its
+    # NULL branch (rows nobody normalised) uses the same index.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tracks_artist_norm ON tracks(artist_norm)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tracks_acoustid_mbid ON tracks(acoustid_mbid) "
+        "WHERE acoustid_mbid IS NOT NULL"
     )
     # #439: GET /api/device/fingerprints filters+orders on this for its
     # incremental ?computed_after= cursor, on a device_track_state JOIN that
@@ -1277,59 +1469,36 @@ def _migrate_playlists_composite_key(conn: sqlite3.Connection) -> None:
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='playlists'"
     ).fetchone()
     if tbl is not None and "UNIQUE" in (tbl["sql"] or "").upper():
-        # Flush any transaction left open by an earlier migration step
-        # (e.g. _backfill_release_date's UPDATE) — PRAGMA foreign_keys is a
-        # no-op inside a transaction, and switching isolation_level below
-        # only behaves predictably from a clean state.
-        conn.commit()
-        # FK OFF during the swap so DROP TABLE playlists doesn't cascade-
-        # delete playlist_tracks; the pragma is a no-op inside a
-        # transaction, so drive transactions explicitly via autocommit.
-        prev_isolation = conn.isolation_level
-        conn.isolation_level = None
-        try:
-            conn.execute("PRAGMA foreign_keys=OFF")
-            conn.execute("BEGIN")
-            conn.execute(
-                "CREATE TABLE playlists_new ("
-                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                " title TEXT NOT NULL,"
-                " source_provider TEXT,"
-                " source_playlist_id TEXT,"
-                " owner_user_id INTEGER REFERENCES users(id),"
-                " shared INTEGER NOT NULL DEFAULT 1,"
-                " inferred_origin_provider TEXT,"
-                " golden_source_id INTEGER REFERENCES playlists(id) ON DELETE SET NULL,"
-                " last_synced_at TEXT)"
-            )
-            # golden_source_id (#81) is copied too: on a pre-#75 -> current
-            # upgrade _run_migrations added it (all NULL) before this rebuild
-            # runs, so it exists on the old table; omitting it here would
-            # drop the column entirely and break every query that reads it.
-            conn.execute(
-                "INSERT INTO playlists_new "
-                "(id, title, source_provider, source_playlist_id, owner_user_id, "
-                " shared, inferred_origin_provider, golden_source_id, last_synced_at) "
-                "SELECT id, title, source_provider, source_playlist_id, owner_user_id, "
-                " shared, inferred_origin_provider, golden_source_id, last_synced_at FROM playlists"
-            )
-            conn.execute("DROP TABLE playlists")
-            conn.execute("ALTER TABLE playlists_new RENAME TO playlists")
-            conn.execute("COMMIT")
-            # No foreign_key_check here on purpose: the INSERT...SELECT above
-            # copies every playlists row with its id unchanged, so no
-            # previously-valid playlist_tracks.playlist_id can be orphaned by
-            # the rebuild — the id preservation is the correctness guarantee.
-            # A global PRAGMA foreign_key_check would instead flag any
-            # *pre-existing* orphan anywhere in the DB (real DBs accumulate
-            # some — e.g. a stray selection_devices row), unrelated to this
-            # migration, and aborting on those would brick startup on upgrade.
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        finally:
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.isolation_level = prev_isolation
+        # Runs as a migration step (_run_migration_step): foreign keys are off,
+        # so DROP TABLE playlists doesn't cascade-delete playlist_tracks, and
+        # the whole swap is one transaction. A playlists_new left by an
+        # older build's interrupted run would otherwise stop the CREATE.
+        conn.execute("DROP TABLE IF EXISTS playlists_new")
+        conn.execute(
+            "CREATE TABLE playlists_new ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " title TEXT NOT NULL,"
+            " source_provider TEXT,"
+            " source_playlist_id TEXT,"
+            " owner_user_id INTEGER REFERENCES users(id),"
+            " shared INTEGER NOT NULL DEFAULT 1,"
+            " inferred_origin_provider TEXT,"
+            " golden_source_id INTEGER REFERENCES playlists(id) ON DELETE SET NULL,"
+            " last_synced_at TEXT)"
+        )
+        # golden_source_id (#81) is copied too: on a pre-#75 -> current
+        # upgrade _run_migrations added it (all NULL) before this rebuild
+        # runs, so it exists on the old table; omitting it here would
+        # drop the column entirely and break every query that reads it.
+        conn.execute(
+            "INSERT INTO playlists_new "
+            "(id, title, source_provider, source_playlist_id, owner_user_id, "
+            " shared, inferred_origin_provider, golden_source_id, last_synced_at) "
+            "SELECT id, title, source_provider, source_playlist_id, owner_user_id, "
+            " shared, inferred_origin_provider, golden_source_id, last_synced_at FROM playlists"
+        )
+        conn.execute("DROP TABLE playlists")
+        conn.execute("ALTER TABLE playlists_new RENAME TO playlists")
     # Idempotent — for fresh DBs (no rebuild) and rebuilt ones alike. Two
     # partial indexes so each row is covered by exactly one: id-keyed rows
     # by the first, title-keyed (Roon) rows by the second.
@@ -1341,7 +1510,6 @@ def _migrate_playlists_composite_key(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_provider_title "
         "ON playlists(source_provider, title) WHERE source_playlist_id IS NULL"
     )
-    conn.commit()
 
 
 def _migrate_tracks_strict(conn: sqlite3.Connection) -> None:
@@ -1392,6 +1560,9 @@ def _migrate_tracks_strict(conn: sqlite3.Connection) -> None:
         ("isrc", "TEXT"), ("fingerprint", "TEXT"), ("acoustid_isrc", "TEXT"),
         ("acoustid_mbid", "TEXT"), ("fingerprint_checked_at", "TEXT"),
         ("fingerprint_failed_at", "TEXT"), ("fingerprint_seq", "INTEGER"),
+        ("mbid", "TEXT"), ("artist_norm", "TEXT"), ("title_norm", "TEXT"),
+        ("album_artist_tag", "TEXT"), ("album_artist", "TEXT"), ("album_artist_read", "INTEGER"),
+        ("lossless", "INTEGER"),
     ]
 
     # Report what the CAST is about to repair, before it disappears. Counted per
@@ -1423,31 +1594,14 @@ def _migrate_tracks_strict(conn: sqlite3.Connection) -> None:
         else f"{name} {decl}"
         for name, decl in columns)
 
-    # Flush anything an earlier migration step left open: PRAGMA foreign_keys is
-    # a no-op inside a transaction, so the swap has to be driven from autocommit.
-    conn.commit()
-    prev_isolation = conn.isolation_level
-    conn.isolation_level = None
-    try:
-        # FK OFF so DROP TABLE tracks doesn't cascade-delete device_track_state
-        # and playlist_tracks.
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute("BEGIN")
-        conn.execute(f"CREATE TABLE tracks_new ({ddl}) STRICT")
-        conn.execute(f"INSERT INTO tracks_new ({names}) SELECT {select} FROM tracks")
-        conn.execute("DROP TABLE tracks")
-        conn.execute("ALTER TABLE tracks_new RENAME TO tracks")
-        conn.execute("COMMIT")
-        # No PRAGMA foreign_key_check, same reasoning as the playlists rebuild:
-        # ids are copied unchanged so this migration can't orphan anything, while
-        # a global check would flag pre-existing orphans real databases
-        # accumulate and abort startup over something unrelated.
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.isolation_level = prev_isolation
+    # Runs as a migration step (_run_migration_step): foreign keys are off, so
+    # DROP TABLE tracks doesn't cascade-delete device_track_state and
+    # playlist_tracks, and the whole swap is one transaction.
+    conn.execute("DROP TABLE IF EXISTS tracks_new")
+    conn.execute(f"CREATE TABLE tracks_new ({ddl}) STRICT")
+    conn.execute(f"INSERT INTO tracks_new ({names}) SELECT {select} FROM tracks")
+    conn.execute("DROP TABLE tracks")
+    conn.execute("ALTER TABLE tracks_new RENAME TO tracks")
 
     # DROP TABLE took both indexes with it. idx_tracks_artist_album lives in
     # SCHEMA (already executed by now) and idx_tracks_fingerprint in
@@ -1457,7 +1611,6 @@ def _migrate_tracks_strict(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tracks_artist_album ON tracks(artist, album)")
     _post_migration_indexes(conn)
-    conn.commit()
 
 
 def _migrate_unresolved_playlist_tracks_strict(conn: sqlite3.Connection) -> None:
@@ -1468,7 +1621,8 @@ def _migrate_unresolved_playlist_tracks_strict(conn: sqlite3.Connection) -> None
     those two), so an existing DB's copy still needs the same
     create-new/copy/drop/rename rebuild as _migrate_tracks_strict — SQLite
     can't ALTER a table into STRICT. Its columns are SCHEMA's 9 plus
-    inferred_album, which _MIGRATIONS adds before this runs.
+    inferred_album, suggested_track_id, accepted and source_path, which
+    _MIGRATIONS adds before this runs.
 
     playlist_id's own FK (REFERENCES playlists(id) ON DELETE CASCADE) is
     preserved verbatim in the rebuilt table. Nothing else has a FK *into*
@@ -1487,7 +1641,8 @@ def _migrate_unresolved_playlist_tracks_strict(conn: sqlite3.Connection) -> None
         ("artist", "TEXT"), ("title", "TEXT"), ("album", "TEXT"),
         ("isrc", "TEXT"), ("excluded", "INTEGER"), ("first_seen_at", "TEXT"),
         # Added by _MIGRATIONS, which runs before this rebuild.
-        ("inferred_album", "TEXT"),
+        ("inferred_album", "TEXT"), ("suggested_track_id", "INTEGER"), ("accepted", "INTEGER"),
+        ("source_path", "TEXT"),
     ]
 
     for name, decl in columns:
@@ -1513,35 +1668,24 @@ def _migrate_unresolved_playlist_tracks_strict(conn: sqlite3.Connection) -> None
         else "playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE"
         if name == "playlist_id"
         else f"{name} {decl} NOT NULL DEFAULT (datetime('now'))" if name == "first_seen_at"
-        else f"{name} {decl} NOT NULL DEFAULT 0" if name == "excluded"
+        else f"{name} {decl} NOT NULL DEFAULT 0" if name in ("excluded", "accepted")
         else f"{name} {decl} NOT NULL" if name == "position"
         else f"{name} {decl}"
         for name, decl in columns)
 
-    conn.commit()
-    prev_isolation = conn.isolation_level
-    conn.isolation_level = None
-    try:
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute("BEGIN")
-        conn.execute(f"CREATE TABLE unresolved_playlist_tracks_new ({ddl}) STRICT")
-        conn.execute(
-            f"INSERT INTO unresolved_playlist_tracks_new ({names}) "
-            f"SELECT {select} FROM unresolved_playlist_tracks")
-        conn.execute("DROP TABLE unresolved_playlist_tracks")
-        conn.execute(
-            "ALTER TABLE unresolved_playlist_tracks_new RENAME TO unresolved_playlist_tracks")
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.isolation_level = prev_isolation
+    # A migration step, like _migrate_tracks_strict.
+    conn.execute("DROP TABLE IF EXISTS unresolved_playlist_tracks_new")
+    conn.execute(f"CREATE TABLE unresolved_playlist_tracks_new ({ddl}) STRICT")
+    conn.execute(
+        f"INSERT INTO unresolved_playlist_tracks_new ({names}) "
+        f"SELECT {select} FROM unresolved_playlist_tracks")
+    conn.execute("DROP TABLE unresolved_playlist_tracks")
+    conn.execute(
+        "ALTER TABLE unresolved_playlist_tracks_new RENAME TO unresolved_playlist_tracks")
 
     # DROP TABLE took both indexes with it; neither creator runs again on a
     # DB past its first init. Losing idx_unresolved_playlist_tracks_identity
-    # wouldn't error — sync_state._record_unresolved_playlist_tracks would
+    # wouldn't error — unresolved_store.record_unresolved_playlist_tracks would
     # just start inserting duplicate rows on every resync instead of
     # preserving `excluded` across one.
     conn.execute(
@@ -1550,24 +1694,297 @@ def _migrate_unresolved_playlist_tracks_strict(conn: sqlite3.Connection) -> None
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_playlist_tracks_identity "
         "ON unresolved_playlist_tracks(playlist_id, artist, title, album)")
+
+
+def _migration_1(conn: sqlite3.Connection) -> None:
+    """Every schema change made before versioning: each step below probes
+    for what it changes and skips it when it is already done, so this runs
+    the same on an empty database and on one from any earlier release."""
+    _migrate_api_tokens_table(conn)
+    _migrate_playlist_tables(conn)
+    conn.executescript(SCHEMA)
+    _run_migrations(conn)
+    _dedupe_selections(conn)
+    # Lidarr requests that failed only because Lidarr didn't answer were
+    # once recorded as attempted, so they were never asked for again.
+    # They are no longer recorded (lidarr_requests.TRANSIENT_REASONS);
+    # clearing the old rows lets the next run retry those albums.
+    # Idempotent: nothing writes such rows any more.
+    conn.execute(
+        "DELETE FROM lidarr_requested_albums WHERE status = 'failed' AND error = 'unreachable'"
+    )
+
+
+def _migrate_users_thanks_and_tidal_scopes(conn: sqlite3.Connection) -> None:
+    """Two users columns.
+
+    thanks_card_dismissed: whether this user dismissed the thank-you card the
+    web UI shows admins once the server's device syncs reach a milestone. Per
+    user: each admin dismisses it for themselves, and it never comes back.
+
+    tidal_scopes: the scopes this user's Tidal link was granted
+    (space-separated), so Profile can ask for a reconnect when sharing needs
+    playlists.write and the link predates it. NULL for links made before
+    this was recorded, which counts as read-only.
+
+    Either may already exist: builds before this migration added them in
+    migration 1, which a new database still ran."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "thanks_card_dismissed" not in existing:
+        conn.execute("ALTER TABLE users ADD COLUMN thanks_card_dismissed INTEGER NOT NULL DEFAULT 0")
+    if "tidal_scopes" not in existing:
+        conn.execute("ALTER TABLE users ADD COLUMN tidal_scopes TEXT")
+
+
+def _migrate_tidal_shares(conn: sqlite3.Connection) -> None:
+    """The tidal_shares table: a copy of one member's Tidal playlist kept
+    in another member's own Tidal account (see tidal_shares.py). Ids in it
+    are Tidal's: the source playlist, and the copy, recorded when Trobar
+    created it and the only playlist on the recipient's side it ever writes
+    to. `snapshot` is the merged track list (JSON, Tidal track ids) after the
+    last good pass; the two `unavailable_*` lists are tracks Tidal refused
+    on that side. One live share per playlist and recipient; ended ones are
+    history."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tidal_shares (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            recipient_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            source_remote_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'ended')),
+            two_way INTEGER NOT NULL DEFAULT 0,
+            copy_remote_id TEXT,
+            copy_title TEXT,
+            snapshot TEXT,
+            unavailable_owner TEXT,
+            unavailable_recipient TEXT,
+            last_synced_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            accepted_at TEXT,
+            ended_at TEXT,
+            CHECK (owner_user_id != recipient_user_id)
+        ) STRICT""")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tidal_shares_live
+        ON tidal_shares(source_remote_id, recipient_user_id) WHERE status != 'ended'""")
+
+
+def _migrate_tidal_shares_delete_original(conn: sqlite3.Connection) -> None:
+    """When the owner of an ended share asked for their original to be
+    deleted, when the sync deleted it, and, when it refused because the
+    copy lacks tracks, which ones (JSON list of {"track_id", "position"}).
+    Tidal writes happen only in the playlist sync, so the request waits for
+    the next pass."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(tidal_shares)")}
+    if "delete_original_requested_at" not in existing:
+        conn.execute("ALTER TABLE tidal_shares ADD COLUMN delete_original_requested_at TEXT")
+    if "original_deleted_at" not in existing:
+        conn.execute("ALTER TABLE tidal_shares ADD COLUMN original_deleted_at TEXT")
+    if "delete_blocked_tracks" not in existing:
+        conn.execute("ALTER TABLE tidal_shares ADD COLUMN delete_blocked_tracks TEXT")
+
+
+def _migrate_playlists_rule(conn: sqlite3.Connection) -> None:
+    """A rule playlist's rule (JSON, see rule_playlists.py); NULL for every
+    other playlist."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(playlists)")}
+    if "rule" not in existing:
+        conn.execute("ALTER TABLE playlists ADD COLUMN rule TEXT")
+
+
+def _migrate_device_plays(conn: sqlite3.Connection) -> None:
+    """Plays reported by devices (device_plays.py), and each person's switch
+    for keeping them, off until they turn it on. A device's removal leaves its
+    plays with their owner; removing the person removes them."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "device_plays_enabled" not in existing:
+        conn.execute("ALTER TABLE users ADD COLUMN device_plays_enabled INTEGER NOT NULL DEFAULT 0")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS device_plays (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+            track_id INTEGER NOT NULL,
+            artist TEXT,
+            title TEXT,
+            album TEXT,
+            played_at TEXT NOT NULL,
+            UNIQUE (user_id, track_id, played_at)
+        ) STRICT""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_device_plays_user_time ON device_plays(user_id, played_at)")
+
+
+def _migrate_scrobble_credentials(conn: sqlite3.Connection) -> None:
+    """Credentials for sending plays, encrypted by credential_store.py."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    for column in ("maloja_api_key_enc", "listenbrainz_token_enc"):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+
+
+def _migrate_play_sends(conn: sqlite3.Connection) -> None:
+    """How far each person's plays have gone to each target (play_forward.py).
+    That mark is a play id, so device_plays is rebuilt with AUTOINCREMENT: an id
+    is never used again after a delete, and a new play always comes after it."""
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'device_plays'").fetchone()[0]
+    if "AUTOINCREMENT" not in sql:
+        conn.execute("ALTER TABLE device_plays RENAME TO device_plays_old")
+        conn.execute("DROP INDEX IF EXISTS idx_device_plays_user_time")
+        conn.execute("""
+            CREATE TABLE device_plays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+                track_id INTEGER NOT NULL,
+                artist TEXT,
+                title TEXT,
+                album TEXT,
+                played_at TEXT NOT NULL,
+                UNIQUE (user_id, track_id, played_at)
+            ) STRICT""")
+        conn.execute("INSERT INTO device_plays SELECT * FROM device_plays_old")
+        conn.execute("DROP TABLE device_plays_old")
+        conn.execute("CREATE INDEX idx_device_plays_user_time ON device_plays(user_id, played_at)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS play_sends (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            target TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            last_play_id INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            rejected INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, target)
+        ) STRICT""")
+
+
+def _migrate_lastfm_session(conn: sqlite3.Connection) -> None:
+    """A person's Last.fm session for sending plays, encrypted by
+    credential_store.py, and the account name it belongs to."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    for column in ("lastfm_session_enc", "lastfm_session_name"):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+
+
+def _migrate_setup_completed_for_old_installs(conn: sqlite3.Connection) -> None:
+    """Setup is the only thing that sets setup_completed, so an install older
+    than the setup wizard never got it, and without it scheduled and after-scan
+    playlist syncs quietly never run. Such an install has a user and has
+    finished a scan. A finished scan's job is kept only for days, so live
+    tracks with no scan under way count too. The wizard starts its scan after
+    setting the flag, so an install still in the wizard normally has none and
+    finishes it; one that scanned outside the wizard and cancelled part-way
+    would skip it, a small harm next to old installs never syncing."""
+    if get_config(conn, "setup_completed") is not None:
+        return
+    if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None:
+        return
+    states = {row[0] for row in conn.execute("SELECT DISTINCT state FROM jobs WHERE type = 'library_scan'")}
+    tracks = conn.execute("SELECT 1 FROM tracks WHERE deleted_at IS NULL LIMIT 1").fetchone() is not None
+    if "done" in states or (tracks and not states & {"queued", "running"}):
+        set_config(conn, "setup_completed", "1")
+
+
+# The numbered schema migrations. PRAGMA user_version records how many have
+# run; each runs once, in order. Append, never edit or reorder one that has
+# shipped: a database that already ran it will not run it again.
+#
+# 2-4 are the table rebuilds, which used to sit inside migration 1. They list
+# columns that migration 1's _MIGRATIONS adds, so they come after it. Each
+# checks the table's own CREATE sql first, so on a database migration 1 had
+# already rebuilt, and on a fresh one, they do nothing.
+MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
+    _migration_1,
+    _migrate_tracks_strict,
+    _migrate_unresolved_playlist_tracks_strict,
+    _migrate_playlists_composite_key,
+    _migrate_users_thanks_and_tidal_scopes,
+    _migrate_tidal_shares,
+    _migrate_tidal_shares_delete_original,
+    _migrate_playlists_rule,
+    _migrate_device_plays,
+    _migrate_scrobble_credentials,
+    _migrate_play_sends,
+    _migrate_lastfm_session,
+    _migrate_setup_completed_for_old_installs,
+)
+
+
+def _foreign_key_violations(conn: sqlite3.Connection) -> int:
+    return len(conn.execute("PRAGMA foreign_key_check").fetchall())
+
+
+def _run_migration_step(conn: sqlite3.Connection, step: Callable[[sqlite3.Connection], None],
+                        version: int | None = None) -> None:
+    """One migration after the first: inside BEGIN IMMEDIATE, with foreign
+    keys off (a table rebuild's DROP would otherwise cascade-delete the rows
+    that reference it, and the pragma is a no-op inside a transaction), and
+    committed together with its version. If it raises, nothing it did stays.
+
+    Foreign keys are checked by count, before and after: a step that leaves
+    more violations than it found fails. A plain check would also fail on
+    orphans the database already had, which real databases collect, and
+    stop the start over something no migration did."""
+    # The pragma needs no open transaction; nothing should be pending here.
     conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        before = _foreign_key_violations(conn)
+        step(conn)
+        after = _foreign_key_violations(conn)
+        if after > before:
+            raise RuntimeError(
+                f"migration {version}: {after - before} new foreign key violation(s); "
+                "nothing was changed")
+        if version is not None:
+            conn.execute(f"PRAGMA user_version = {version}")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Run the migrations this database has not had yet. Each runs through
+    _run_migration_step, so one that is interrupted leaves nothing behind
+    and runs again on the next start. Migration 1 is the exception: it
+    commits as it goes (executescript), and is safe to run again because
+    every step in it checks first. A database from a newer build stops the
+    start, since this build cannot know what that build changed."""
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    known = len(MIGRATIONS)
+    if current > known:
+        raise SystemExit(
+            f"The database is at schema version {current}, but this build of Trobar "
+            f"only knows versions up to {known}. Run the newer build again, or restore "
+            "the backup taken before upgrading.")
+    for version in range(current + 1, known + 1):
+        if version == 1:
+            MIGRATIONS[0](conn)
+            conn.execute("PRAGMA user_version = 1")
+            conn.commit()
+        else:
+            _run_migration_step(conn, MIGRATIONS[version - 1], version)
 
 
 def init_db() -> None:
-    conn = get_conn()
-    try:
-        _migrate_api_tokens_table(conn)
-        _migrate_playlist_tables(conn)
-        conn.executescript(SCHEMA)
-        _run_migrations(conn)
-        # After _run_migrations: the rebuild lists columns that _MIGRATIONS adds.
-        _migrate_tracks_strict(conn)
-        _migrate_unresolved_playlist_tracks_strict(conn)
-        _migrate_playlists_composite_key(conn)
-        _dedupe_selections(conn)
+    with connection() as conn:
+        _apply_migrations(conn)
+        # Maintenance that runs on every start, not once: each step checks
+        # whether it has anything to do.
+        _refresh_norms(conn)
+        _refresh_album_artists(conn)
+        _backfill_delivered_paths(conn)
         # device_type taxonomy split (phone/tablet/watch/dap/sdcard)
         # replaced the old 'android' catch-all — reclassify existing rows so
         # they get the right icon instead of silently falling back to phone.
+        # Every start, not once: the API accepted 'android' until it left
+        # DEVICE_TYPES, so a database past migration 1 can still hold some.
         conn.execute("UPDATE devices SET device_type = 'phone' WHERE device_type = 'android'")
         # #501 (caught in review): basket_items gained a required device
         # dimension via the new basket_item_devices join table, but every
@@ -1577,17 +1994,16 @@ def init_db() -> None:
         # device-scoped fan-out filters it out of what it considers
         # sendable, so it can never be sent OR cleared by any normal path.
         # A basket is a transient staging list, not data worth preserving
-        # across this shape change -- delete them. Naturally idempotent
-        # (nothing left to match after the first run), unlike a seed-once
-        # default, so no written-once guard is needed here.
+        # across this shape change -- delete them. Every start, not once:
+        # replacing a device (device_store.transfer_device) can still leave an
+        # item staged only for the old one with no link.
         conn.execute(
             "DELETE FROM basket_items WHERE id NOT IN "
             "(SELECT DISTINCT basket_item_id FROM basket_item_devices)"
         )
         _seed_spotify_experimental_default(conn)
+        _seed_playlist_sync_interval_default(conn)
         conn.commit()
-    finally:
-        conn.close()
 
 
 def get_config(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
@@ -1613,12 +2029,49 @@ def _seed_spotify_experimental_default(conn: sqlite3.Connection) -> None:
     set_config(conn, "experimental_spotify_enabled", "1" if has_credentials else "0")
 
 
+def _seed_playlist_sync_interval_default(conn: sqlite3.Connection) -> None:
+    """The scheduled playlist sync is on (every 6 h) for a fresh install
+    and off for an existing one, which keeps the behaviour it had: an
+    upgrade must not start syncing, and so writing to mirrors, on a timer
+    nobody set. "Existing" means setup has been completed. Decided once,
+    when the key has never been set, like _seed_spotify_experimental_default
+    above: an admin's later choice, either way, holds."""
+    if get_config(conn, "playlist_sync_interval_hours") is not None:
+        return
+    set_config(conn, "playlist_sync_interval_hours",
+               "0" if get_config(conn, "setup_completed") else "6")
+
+
 def set_config(conn: sqlite3.Connection, key: str, value: str | None) -> None:
     conn.execute(
         "INSERT INTO app_config (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+# Successful device syncs reported to this server, across every device of
+# every account: one count, kept in app_config, never broken down by device
+# or user. It starts at zero on the version that added it.
+DEVICE_SYNCS_KEY = "device_syncs_completed"
+
+
+def record_device_sync(conn: sqlite3.Connection) -> None:
+    """One more successful device sync. A single upsert, so two devices
+    reporting at once can't lose one."""
+    conn.execute(
+        "INSERT INTO app_config (key, value) VALUES (?, '1') "
+        "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        (DEVICE_SYNCS_KEY,),
+    )
+
+
+def device_syncs_completed(conn: sqlite3.Connection) -> int:
+    value = get_config(conn, DEVICE_SYNCS_KEY)
+    try:
+        return int(value) if value is not None else 0
+    except ValueError:
+        return 0
 
 
 def get_music_root() -> Path:

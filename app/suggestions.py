@@ -9,13 +9,16 @@ library lookup and per-album device coverage (a suggestion is only
 suppressed once it's synced to *every* device the caller manages, not just
 "a selection exists somewhere")."""
 
+import logging
 import sqlite3
+
+_log = logging.getLogger(__name__)
 
 
 def local_library_index(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[str, str]]:
     """Lowercased (artist, album) -> exact on-disk casing. Providers' casing/
     punctuation can differ from the tags actually on disk, and selection
-    resolution matches exactly (see sync_state._resolve_selection_track_ids)
+    resolution matches exactly (see selection_store._resolve_selection_track_ids)
     — passing a provider's own casing as a selection target could silently
     resolve to zero tracks."""
     return {

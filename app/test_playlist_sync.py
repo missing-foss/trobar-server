@@ -18,7 +18,10 @@ CREATE TABLE) — no Flask, no fixtures on disk. A minimal stub stands in
 for a provider module (only get_playlist_tracks() is ever called by
 _sync_one_playlist).
 """
+import contextlib
+import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -28,6 +31,7 @@ from unittest import mock
 import db
 import jobs
 import playlist_sync
+import selection_store
 import spotify_client
 import sync_state
 import tidal_client
@@ -39,7 +43,7 @@ def _make_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(db.SCHEMA)
     db._run_migrations(conn)
-    db._migrate_playlists_composite_key(conn)  # #75 composite unique indexes
+    db._run_migration_step(conn, db._migrate_playlists_composite_key)  # #75 composite unique indexes
     return conn
 
 
@@ -329,22 +333,24 @@ class SyncOnePlaylistMirrorEmbyTests(unittest.TestCase):
 
 
 class SyncOnePlaylistLidarrRequestsTests(unittest.TestCase):
-    """#494: not a mirror sink, but called from the same shared call site
-    right after the four sinks above — same wiring-only shape (its own
-    behavior is covered by test_lidarr_requests.py)."""
+    """#494: not a mirror sink, but queued from the same shared call site
+    right after the sinks above — same wiring-only shape (its own
+    behavior is covered by test_lidarr_requests.py). Queued, not run: a run
+    is a Lidarr round trip per album, and the playlist's transaction is
+    still open here."""
 
     def setUp(self):
         self.conn = _make_conn()
         self.provider = _StubProvider(_ONE_TRACK)
 
-    def test_run_for_playlist_is_called_with_the_new_playlists_id(self):
-        with mock.patch.object(playlist_sync.lidarr_requests, "run_for_playlist") as run_mock:
+    def test_requests_are_queued_with_the_new_playlists_id(self):
+        with mock.patch.object(playlist_sync.lidarr_requests, "enqueue") as run_mock:
             playlist_sync._sync_one_playlist(self.conn, self.provider, "roon", "Mix")
         playlist_id = self.conn.execute("SELECT id FROM playlists WHERE title = 'Mix'").fetchone()["id"]
         run_mock.assert_called_once_with(self.conn, playlist_id)
 
-    def test_run_for_playlist_is_called_on_every_sync_regardless_of_enabled(self):
-        with mock.patch.object(playlist_sync.lidarr_requests, "run_for_playlist") as run_mock:
+    def test_requests_are_queued_on_every_sync_regardless_of_enabled(self):
+        with mock.patch.object(playlist_sync.lidarr_requests, "enqueue") as run_mock:
             playlist_sync._sync_one_playlist(self.conn, self.provider, "roon", "Mix")
             playlist_sync._sync_one_playlist(self.conn, self.provider, "roon", "Mix")
         self.assertEqual(run_mock.call_count, 2)
@@ -354,7 +360,7 @@ class SyncOnePlaylistLidarrRequestsTests(unittest.TestCase):
              mock.patch.object(playlist_sync.mirror_subsonic, "write_mirror") as subsonic_mock, \
              mock.patch.object(playlist_sync.mirror_jellyfin, "write_mirror") as jellyfin_mock, \
              mock.patch.object(playlist_sync.mirror_emby, "write_mirror") as emby_mock, \
-             mock.patch.object(playlist_sync.lidarr_requests, "run_for_playlist") as lidarr_mock:
+             mock.patch.object(playlist_sync.lidarr_requests, "enqueue") as lidarr_mock:
             playlist_sync._sync_one_playlist(self.conn, self.provider, "roon", "Mix")
         fs_mock.assert_called_once()
         subsonic_mock.assert_called_once()
@@ -386,6 +392,34 @@ class StaleCleanupMirrorTests(unittest.TestCase):
         for f in self._tmp.glob("*"):
             f.unlink()
         self._tmp.rmdir()
+
+    def test_one_run_hands_every_playlist_the_same_cache_per_sink(self):
+        # One target index build per sink per run, not one per playlist:
+        # every write in a run gets that sink's one dict, and no two sinks
+        # share one.
+        provider = _FullStubProvider(
+            [{"id": "src1", "title": "Mix"}, {"id": "src2", "title": "Drive"}],
+            [{"position": 0, "artist": "A", "title": "T", "path": None, "album": None}],
+        )
+        sinks = {
+            playlist_sync.mirror_subsonic: "tag_index_cache",
+            playlist_sync.mirror_jellyfin: "tag_index_cache",
+            playlist_sync.mirror_emby: "tag_index_cache",
+            playlist_sync.mirror_music_assistant: "index_cache",
+            playlist_sync.mirror_plex: "index_cache",
+        }
+        with contextlib.ExitStack() as stack:
+            mocks = {m: stack.enter_context(mock.patch.object(m, "write_mirror")) for m in sinks}
+            playlist_sync.sync_playlists(provider, "subsonic")
+        per_sink = []
+        for module, keyword in sinks.items():
+            caches = [c.kwargs[keyword] for c in mocks[module].call_args_list]
+            with self.subTest(sink=module.__name__):
+                self.assertEqual(len(caches), 2)
+                self.assertIsInstance(caches[0], dict)
+                self.assertIs(caches[0], caches[1])
+            per_sink.append(id(caches[0]))
+        self.assertEqual(len(set(per_sink)), len(sinks))
 
     def test_stale_removal_calls_delete_mirror_before_the_row_is_gone(self):
         provider = _FullStubProvider(
@@ -524,7 +558,7 @@ def _make_playlist_with_tracks(conn: sqlite3.Connection, title: str, source_prov
 class InferRoonPlaylistOriginsTests(unittest.TestCase):
     """#26: Roon's own API can't tell a native playlist from a
     Tidal-imported one — this diffs resolved track sets instead of
-    relying on title at all. See _infer_roon_playlist_origins()'s own
+    relying on title at all. See _infer_playlist_origins()'s own
     docstring for the actual scope this lands at (different-titled pairs
     only, not the literal #23 same-title-on-Roon's-own-side case, which
     this title-keyed sync model can't represent as two rows in the first
@@ -535,10 +569,74 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
         self.conn = _make_conn()
         self.tracks = [_make_track(self.conn, f"artist/album/{i:02d}.flac") for i in range(10)]
 
+    def _rows(self):
+        return {r["title"]: r for r in self.conn.execute(
+            "SELECT id, title, inferred_origin_provider, golden_source_id FROM playlists")}
+
+    def _ma(self, title, source_id):
+        pid = _make_playlist_with_tracks(self.conn, title, "music_assistant", self.tracks[0:5])
+        self.conn.execute("UPDATE playlists SET source_playlist_id = ? WHERE id = ?", (source_id, pid))
+        return pid
+
+    def _tidal(self, title, source_id, tracks=None):
+        pid = _make_playlist_with_tracks(self.conn, title, "tidal", self.tracks[0:5] if tracks is None else tracks)
+        self.conn.execute("UPDATE playlists SET source_playlist_id = ? WHERE id = ?", (source_id, pid))
+        return pid
+
+    def test_a_music_assistant_copy_links_by_the_services_own_id(self):
+        golden = self._tidal("Renamed on Tidal", "tid-1", self.tracks[5:10])
+        self._ma("Road Trip", "12")
+        playlist_sync._infer_playlist_origins(self.conn, {"12": [("tidal", "tid-1")]})
+        row = self._rows()["Road Trip"]
+        self.assertEqual((row["inferred_origin_provider"], row["golden_source_id"]), ("tidal", golden))
+
+    def test_a_music_assistant_playlist_with_no_source_is_not_matched_by_title_or_tracks(self):
+        self._tidal("Road Trip", "tid-1")
+        self._ma("Road Trip", "12")
+        playlist_sync._infer_playlist_origins(self.conn, {"12": []})
+        rows = self.conn.execute(
+            "SELECT golden_source_id FROM playlists WHERE source_provider = 'music_assistant'").fetchall()
+        self.assertEqual([r["golden_source_id"] for r in rows], [None])
+
+    def test_two_music_assistant_rows_can_share_one_golden_copy(self):
+        golden = self._tidal("T", "tid-1")
+        self._ma("Under one account", "12")
+        self._ma("Under the other", "13")
+        playlist_sync._infer_playlist_origins(self.conn, {"12": [("tidal", "tid-1")], "13": [("tidal", "tid-1")]})
+        rows = self._rows()
+        self.assertEqual({rows["Under one account"]["golden_source_id"], rows["Under the other"]["golden_source_id"]},
+                         {golden})
+
+    def test_a_source_not_synced_directly_links_nothing(self):
+        self._tidal("Another", "tid-2")
+        self._ma("Road Trip", "12")
+        playlist_sync._infer_playlist_origins(self.conn, {"12": [("tidal", "nobody-synced-this")]})
+        self.assertIsNone(self._rows()["Road Trip"]["golden_source_id"])
+
+    def test_with_no_listing_a_music_assistant_link_survives(self):
+        golden = self._tidal("T", "tid-1")
+        self._ma("Road Trip", "12")
+        playlist_sync._infer_playlist_origins(self.conn, {"12": [("tidal", "tid-1")]})
+        playlist_sync._infer_playlist_origins(self.conn, None)
+        self.assertEqual(self._rows()["Road Trip"]["golden_source_id"], golden)
+
+    def test_a_link_goes_when_the_source_does(self):
+        self._tidal("T", "tid-1")
+        self._ma("Road Trip", "12")
+        playlist_sync._infer_playlist_origins(self.conn, {"12": [("tidal", "tid-1")]})
+        playlist_sync._infer_playlist_origins(self.conn, {"12": []})
+        self.assertIsNone(self._rows()["Road Trip"]["golden_source_id"])
+
+    def test_a_listing_gives_each_rows_sources_and_none_without_one(self):
+        self.assertEqual(playlist_sync._ma_sources(
+            {"status": "ok", "playlists": [{"id": "12", "source_ids": [("tidal", "a")]}]}), {"12": [("tidal", "a")]})
+        self.assertIsNone(playlist_sync._ma_sources({"status": "error"}))
+        self.assertIsNone(playlist_sync._ma_sources({"status": "skipped"}))
+
     def test_substantial_overlap_marks_roon_playlist_as_tidal_origin(self):
         _make_playlist_with_tracks(self.conn, "Roon Party", "roon", self.tracks[0:5])
         _make_playlist_with_tracks(self.conn, "My Tidal Mix", "tidal", self.tracks[0:5])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         row = self.conn.execute(
             "SELECT inferred_origin_provider FROM playlists WHERE title = 'Roon Party'"
         ).fetchone()
@@ -549,7 +647,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
         # not just Tidal.
         roon_id = _make_playlist_with_tracks(self.conn, "Roon Party", "roon", self.tracks[0:5])
         sp_id = _make_playlist_with_tracks(self.conn, "My Spotify Mix", "spotify", self.tracks[0:5])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         row = self.conn.execute(
             "SELECT inferred_origin_provider, golden_source_id FROM playlists WHERE id = ?",
             (roon_id,)).fetchone()
@@ -562,7 +660,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
         roon_id = _make_playlist_with_tracks(self.conn, "Roon Party", "roon", self.tracks[0:5])
         _make_playlist_with_tracks(self.conn, "Tidal Party", "tidal", self.tracks[0:3] + self.tracks[7:9])
         _make_playlist_with_tracks(self.conn, "Spotify Party", "spotify", self.tracks[0:5])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         row = self.conn.execute(
             "SELECT inferred_origin_provider FROM playlists WHERE id = ?", (roon_id,)).fetchone()
         self.assertEqual(row["inferred_origin_provider"], "spotify")
@@ -570,7 +668,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
     def test_no_overlap_leaves_it_unset(self):
         _make_playlist_with_tracks(self.conn, "Roon Party", "roon", self.tracks[0:5])
         _make_playlist_with_tracks(self.conn, "My Tidal Mix", "tidal", self.tracks[5:10])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         row = self.conn.execute(
             "SELECT inferred_origin_provider FROM playlists WHERE title = 'Roon Party'"
         ).fetchone()
@@ -582,7 +680,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
         # couple of generic/popular tracks shouldn't read as "imported".
         _make_playlist_with_tracks(self.conn, "Roon Party", "roon", self.tracks[0:5])
         _make_playlist_with_tracks(self.conn, "My Tidal Mix", "tidal", self.tracks[3:5] + self.tracks[5:8])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         row = self.conn.execute(
             "SELECT inferred_origin_provider FROM playlists WHERE title = 'Roon Party'"
         ).fetchone()
@@ -603,7 +701,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
         native_id = _make_playlist_with_tracks(self.conn, "Roon Only Mix", "roon", self.tracks[5:9])
         imported_id = _make_playlist_with_tracks(self.conn, "Some Roon Title", "roon", self.tracks[0:5])
         _make_playlist_with_tracks(self.conn, "My Tidal Party", "tidal", self.tracks[0:5])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         native_row = self.conn.execute(
             "SELECT inferred_origin_provider FROM playlists WHERE id = ?", (native_id,)
         ).fetchone()
@@ -635,7 +733,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
         # the Roon side specifically, not min(roon, tidal).
         roon_id = _make_playlist_with_tracks(self.conn, "Roon Everything", "roon", self.tracks)  # 10 tracks
         _make_playlist_with_tracks(self.conn, "Tidal Faves", "tidal", self.tracks[0:3])  # fully contained
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         row = self.conn.execute(
             "SELECT inferred_origin_provider FROM playlists WHERE id = ?", (roon_id,)
         ).fetchone()
@@ -650,7 +748,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
             "UPDATE playlists SET inferred_origin_provider = 'tidal' WHERE id = ?", (roon_id,)
         )
         self.conn.commit()
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         row = self.conn.execute(
             "SELECT inferred_origin_provider FROM playlists WHERE id = ?", (roon_id,)
         ).fetchone()
@@ -658,7 +756,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
 
     def test_no_tidal_playlists_is_a_clean_no_op(self):
         _make_playlist_with_tracks(self.conn, "Roon Party", "roon", self.tracks[0:5])
-        playlist_sync._infer_roon_playlist_origins(self.conn)  # must not raise
+        playlist_sync._infer_playlist_origins(self.conn)  # must not raise
         row = self.conn.execute(
             "SELECT inferred_origin_provider FROM playlists WHERE title = 'Roon Party'"
         ).fetchone()
@@ -669,7 +767,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
     def test_track_overlap_records_golden_source_id(self):
         roon_id = _make_playlist_with_tracks(self.conn, "Roon Mix", "roon", self.tracks[0:5])
         tidal_id = _make_playlist_with_tracks(self.conn, "Tidal Mix", "tidal", self.tracks[0:5])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         self.assertEqual(
             self.conn.execute("SELECT golden_source_id FROM playlists WHERE id=?", (roon_id,)).fetchone()[0],
             tidal_id)
@@ -680,7 +778,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
         # contradict the title).
         roon_id = _make_playlist_with_tracks(self.conn, "Party", "roon", [])
         tidal_id = _make_playlist_with_tracks(self.conn, "Party", "tidal", [])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         self.assertEqual(
             self.conn.execute("SELECT golden_source_id FROM playlists WHERE id=?", (roon_id,)).fetchone()[0],
             tidal_id)
@@ -691,7 +789,7 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
         # → NOT the same playlist, no golden link.
         roon_id = _make_playlist_with_tracks(self.conn, "Party", "roon", self.tracks[0:5])
         _make_playlist_with_tracks(self.conn, "Party", "tidal", self.tracks[5:10])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         row = self.conn.execute(
             "SELECT golden_source_id, inferred_origin_provider FROM playlists WHERE id=?", (roon_id,)).fetchone()
         self.assertIsNone(row["golden_source_id"])
@@ -703,21 +801,21 @@ class InferRoonPlaylistOriginsTests(unittest.TestCase):
         # private, never surfaced via a golden badge.
         roon_id = _make_playlist_with_tracks(self.conn, "Roon Only", "roon", self.tracks[0:5])
         _make_playlist_with_tracks(self.conn, "Private Tidal", "tidal", self.tracks[5:10])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         self.assertIsNone(
             self.conn.execute("SELECT golden_source_id FROM playlists WHERE id=?", (roon_id,)).fetchone()[0])
 
     def test_golden_link_cleared_when_tidal_row_disconnects(self):
         roon_id = _make_playlist_with_tracks(self.conn, "Mix", "roon", self.tracks[0:5])
         tidal_id = _make_playlist_with_tracks(self.conn, "Mix", "tidal", self.tracks[0:5])
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         self.assertEqual(
             self.conn.execute("SELECT golden_source_id FROM playlists WHERE id=?", (roon_id,)).fetchone()[0],
             tidal_id)
         # Tidal disconnected → its row gone; recompute clears the stale link.
         self.conn.execute("DELETE FROM playlists WHERE id=?", (tidal_id,))
         self.conn.commit()
-        playlist_sync._infer_roon_playlist_origins(self.conn)
+        playlist_sync._infer_playlist_origins(self.conn)
         self.assertIsNone(
             self.conn.execute("SELECT golden_source_id FROM playlists WHERE id=?", (roon_id,)).fetchone()[0])
 
@@ -851,7 +949,7 @@ class CompositeKeyMigrationTests(unittest.TestCase):
         self.assertIn("UNIQUE", conn.execute(
             "SELECT sql FROM sqlite_master WHERE name='playlists'").fetchone()["sql"].upper())
 
-        db._migrate_playlists_composite_key(conn)
+        db._run_migration_step(conn, db._migrate_playlists_composite_key)
 
         # UNIQUE gone; ids + shared preserved exactly.
         self.assertNotIn("UNIQUE", conn.execute(
@@ -864,13 +962,13 @@ class CompositeKeyMigrationTests(unittest.TestCase):
 
     def test_rebuild_is_idempotent(self):
         conn = self._old_shape_conn()
-        db._migrate_playlists_composite_key(conn)
-        db._migrate_playlists_composite_key(conn)  # second run must be a clean no-op
+        db._run_migration_step(conn, db._migrate_playlists_composite_key)
+        db._run_migration_step(conn, db._migrate_playlists_composite_key)  # second run must be a clean no-op
         self.assertEqual(conn.execute("SELECT COUNT(*) AS n FROM playlists").fetchone()["n"], 2)
 
     def test_composite_uniqueness_is_enforced_after_migration(self):
         conn = self._old_shape_conn()
-        db._migrate_playlists_composite_key(conn)
+        db._run_migration_step(conn, db._migrate_playlists_composite_key)
         # (source_provider, title) unique for id-NULL (Roon) rows.
         with self.assertRaises(sqlite3.IntegrityError):
             conn.execute("INSERT INTO playlists (title, source_provider, source_playlist_id) VALUES ('Party','roon',NULL)")
@@ -887,7 +985,7 @@ class CompositeKeyMigrationTests(unittest.TestCase):
         conn.execute("INSERT INTO playlist_tracks (playlist_id, position) VALUES (999, 0)")  # orphan
         conn.commit()
         conn.execute("PRAGMA foreign_keys=ON")
-        db._migrate_playlists_composite_key(conn)  # must not raise
+        db._run_migration_step(conn, db._migrate_playlists_composite_key)  # must not raise
         # Real rows still intact; the orphan is left as-is (not this
         # migration's job to clean up), same as before.
         self.assertEqual(conn.execute("SELECT COUNT(*) AS n FROM playlists").fetchone()["n"], 2)
@@ -1110,7 +1208,7 @@ class TidalPerOwnerCleanupTests(unittest.TestCase):
                 raise tidal_client.TidalTransientError("network down")
             return ("bob-access", "bob-rt")
 
-        def fake_list(access_token, tidal_user_id):
+        def fake_list(access_token):
             # Bob's fetch succeeds but lists nothing — his old row is
             # genuinely stale this run.
             return {"status": "ok", "playlists": []}
@@ -1132,6 +1230,105 @@ class TidalPerOwnerCleanupTests(unittest.TestCase):
                 conn.execute("SELECT 1 FROM playlists WHERE id=?", (bob_pid,)).fetchone())
         finally:
             conn.close()
+
+    def _run(self, **patches):
+        from unittest import mock
+
+        provider = _FullStubProvider([], [])
+        active = [mock.patch.object(tidal_client, name, **spec) for name, spec in patches.items()]
+        for patch in active:
+            patch.start()
+            self.addCleanup(patch.stop)
+        with self.assertLogs("playlist_sync", level="WARNING") as logs:
+            result = playlist_sync.sync_playlists(provider, "subsonic")
+        return result, "\n".join(logs.output)
+
+    def _linked(self):
+        conn = db.get_conn()
+        user = _make_user(conn, "alice")
+        conn.execute("UPDATE users SET tidal_refresh_token='alice-rt', tidal_user_id='alice-tid' WHERE id=?", (user,))
+        conn.commit()
+        conn.close()
+        return user
+
+    def test_a_refresh_that_fails_says_so_in_the_result_and_the_log(self):
+        user = self._linked()
+        result, logged = self._run(
+            refresh_access_token={"side_effect": tidal_client.TidalTransientError("network down")})
+        self.assertEqual(result["source_failures"],
+                         [{"provider": "tidal", "user_id": user, "reason": "network down"}])
+        self.assertIn("network down", logged)
+        self.assertNotIn("alice-rt", logged)
+
+    def test_a_listing_that_fails_says_why(self):
+        self._linked()
+        result, _ = self._run(
+            refresh_access_token={"return_value": ("access", "alice-rt")},
+            list_playlists={"return_value": {"status": "error", "reason": "http_403"}})
+        self.assertEqual(result["source_failures"][0]["reason"], "http_403")
+
+    def test_playlists_that_cant_be_read_are_counted(self):
+        self._linked()
+        result, logged = self._run(
+            refresh_access_token={"return_value": ("access", "alice-rt")},
+            list_playlists={"return_value": {"status": "ok", "playlists": [
+                {"id": "a", "title": "One"}, {"id": "b", "title": "Two"}]}},
+            get_playlist_tracks={"return_value": {"status": "error", "reason": "rate_limited"}})
+        self.assertEqual(result["source_failures"][0]["reason"], "2 of 2 playlists not read")
+        self.assertIn("rate_limited", logged)
+
+    def test_a_rejected_token_is_a_failure_too(self):
+        self._linked()
+        result, _ = self._run(refresh_access_token={"side_effect": tidal_client.TidalAuthError("no")})
+        self.assertEqual(result["source_failures"][0]["reason"], "token_rejected")
+
+    def test_a_sync_with_music_assistant_active_links_its_copies(self):
+        from unittest import mock
+
+        user = self._linked()
+        ma_list = {"status": "ok", "playlists": [{"id": "12", "title": "Copy", "source_ids": [("tidal", "tid-1")]}]}
+        tracks = {"status": "ok", "tracks": []}
+        with mock.patch.object(tidal_client, "refresh_access_token", return_value=("a", "alice-rt")), \
+                mock.patch.object(tidal_client, "list_playlists",
+                                  return_value={"status": "ok", "playlists": [{"id": "tid-1", "title": "Original"}]}), \
+                mock.patch.object(tidal_client, "get_playlist_tracks", return_value=tracks), \
+                mock.patch.object(playlist_sync.music_assistant_client, "list_playlists", return_value=ma_list), \
+                mock.patch.object(playlist_sync.music_assistant_client, "get_playlist_tracks", return_value=tracks):
+            playlist_sync.sync_playlists(playlist_sync.music_assistant_client, "music_assistant")
+        conn = db.get_conn()
+        try:
+            rows = {r["source_provider"]: r for r in conn.execute("SELECT * FROM playlists")}
+        finally:
+            conn.close()
+        self.assertEqual(rows["music_assistant"]["golden_source_id"], rows["tidal"]["id"])
+        self.assertEqual(rows["tidal"]["owner_user_id"], user)
+
+    def test_a_healthy_sync_has_no_failures(self):
+        from unittest import mock
+
+        self._linked()
+        with mock.patch.object(tidal_client, "refresh_access_token", return_value=("a", "alice-rt")), \
+                mock.patch.object(tidal_client, "list_playlists", return_value={"status": "ok", "playlists": []}):
+            result = playlist_sync.sync_playlists(_FullStubProvider([], []), "subsonic")
+        self.assertNotIn("source_failures", result)
+
+    def test_a_viewer_sees_only_their_own_failure_and_an_admin_all(self):
+        from unittest import mock
+
+        conn = db.get_conn()
+        alice = _make_user(conn, "alice")
+        bob = _make_user(conn, "bob")
+        conn.commit()
+        last = {"status": "ok", "source_failures": [
+            {"provider": "tidal", "user_id": alice, "reason": "x"},
+            {"provider": "spotify", "user_id": bob, "reason": "y"}]}
+        with mock.patch.object(playlist_sync, "sync_status",
+                               side_effect=lambda: {"running": False, "last_result": json.loads(json.dumps(last))}):
+            mine = playlist_sync.sync_status_for(conn, alice, False)["last_result"]["source_failures"]
+            everyone = playlist_sync.sync_status_for(conn, bob, True)["last_result"]["source_failures"]
+        conn.close()
+        self.assertEqual([(f["provider"], f["username"]) for f in mine], [("tidal", "alice")])
+        self.assertEqual(len(everyone), 2)
 
     def test_auth_revocation_protects_that_users_rows_too(self):
         from unittest import mock
@@ -1158,6 +1355,86 @@ class TidalPerOwnerCleanupTests(unittest.TestCase):
             # The stale link was cleared so the UI prompts a reconnect.
             self.assertIsNone(
                 conn.execute("SELECT tidal_refresh_token FROM users WHERE id=?", (alice,)).fetchone()[0])
+        finally:
+            conn.close()
+
+    def test_shares_get_this_passs_tokens_and_no_second_refresh(self):
+        from unittest import mock
+
+        conn = db.get_conn()
+        alice = _make_user(conn, "alice")
+        bob = _make_user(conn, "bob")
+        carol = _make_user(conn, "carol")
+        for uid, name in ((alice, "alice"), (bob, "bob"), (carol, "carol")):
+            conn.execute("UPDATE users SET tidal_refresh_token = ?, tidal_user_id = ?, tidal_scopes = 'x' "
+                         "WHERE id = ?", (f"{name}-rt", f"{name}-tid", uid))
+        conn.commit()
+        conn.close()
+
+        def fake_refresh(client_id, client_secret, refresh_token):
+            if refresh_token == "carol-rt":
+                raise tidal_client.TidalTransientError("network down")
+            return (refresh_token.replace("-rt", "-access"), refresh_token)
+
+        provider = _FullStubProvider([], [])
+        with mock.patch.object(tidal_client, "refresh_access_token", side_effect=fake_refresh) as refresh, \
+                mock.patch.object(tidal_client, "list_playlists", return_value={"status": "ok", "playlists": []}), \
+                mock.patch.object(playlist_sync.tidal_shares, "sync_all") as sync_all:
+            playlist_sync.sync_playlists(provider, "subsonic")
+        self.assertEqual(refresh.call_count, 3)            # once per linked user, never again for shares
+        sync_all.assert_called_once()
+        self.assertEqual(sync_all.call_args.args[1], {alice: "alice-access", bob: "bob-access"})
+
+    def test_an_auth_revocation_also_drops_the_recorded_scopes(self):
+        from unittest import mock
+
+        conn = db.get_conn()
+        alice = _make_user(conn, "alice")
+        conn.execute("UPDATE users SET tidal_refresh_token = 'rt', tidal_user_id = 't', "
+                     "tidal_scopes = 'playlists.write' WHERE id = ?", (alice,))
+        conn.commit()
+        conn.close()
+        with mock.patch.object(tidal_client, "refresh_access_token",
+                               side_effect=tidal_client.TidalAuthError("revoked")):
+            playlist_sync.sync_playlists(_FullStubProvider([], []), "subsonic")
+        conn = db.get_conn()
+        try:
+            self.assertIsNone(conn.execute("SELECT tidal_scopes FROM users WHERE id = ?", (alice,)).fetchone()[0])
+        finally:
+            conn.close()
+
+
+class RulePlaylistSyncTests(unittest.TestCase):
+    """Rule playlists are refreshed by every playlist sync, and its stale
+    cleanup never takes one for a playlist the source stopped listing."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="trobar-test-rule-"))
+        self._prev = db.DB_PATH, db.DATA_DIR
+        db.DATA_DIR = self._tmp
+        db.DB_PATH = self._tmp / "test.db"
+        db.init_db()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        db.DB_PATH, db.DATA_DIR = self._prev
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_the_sync_refreshes_rule_playlists_and_keeps_them(self):
+        conn = db.get_conn()
+        t = conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime, year) "
+                         "VALUES ('A/a.flac', 'A', 'B', 'T', 1, 0, 1999)").lastrowid
+        pid = conn.execute(
+            "INSERT INTO playlists (title, source_provider, shared, rule) VALUES ('Rule', 'rule', 0, ?)",
+            ('{"match": "all", "conditions": [{"field": "year", "op": "is", "value": 1999}]}',)).lastrowid
+        conn.commit()
+        conn.close()
+        playlist_sync.sync_playlists(_FullStubProvider([], []), "subsonic")
+        conn = db.get_conn()
+        try:
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM playlists WHERE id = ?", (pid,)).fetchone())
+            self.assertEqual([r[0] for r in conn.execute(
+                "SELECT matched_track_id FROM playlist_tracks WHERE playlist_id = ?", (pid,))], [t])
         finally:
             conn.close()
 
@@ -1215,7 +1492,7 @@ class PrimaryListingFailureTests(unittest.TestCase):
         def fake_refresh(cid, csecret, rt):
             return ("alice-access", "alice-rt")
 
-        def fake_list(access_token, tidal_user_id):
+        def fake_list(access_token):
             return {"status": "ok", "playlists": [{"id": "t-1", "title": "Alice Tidal"}]}
 
         def fake_tracks(title, source_playlist_id=None, **_kwargs):
@@ -1851,6 +2128,417 @@ class PerUserProviderMappingTests(unittest.TestCase):
         with mock.patch.object(playlist_sync.jellyfin_client, "list_playlists", side_effect=_list_playlists):
             result = playlist_sync.sync_playlists(playlist_sync.jellyfin_client, "jellyfin")  # must not raise
         self.assertEqual(result["status"], "ok")
+
+
+class CancelSyncTests(unittest.TestCase):
+    """The job's `report` runs before each playlist: a cancel stops the sync
+    there, with every playlist before it committed and the stale cleanup not
+    run, since a playlist not reached yet isn't one the source stopped listing."""
+
+    setUp = UpgradeSyncIntegrationTests.setUp
+    tearDown = UpgradeSyncIntegrationTests.tearDown
+
+    def test_a_cancel_stops_before_the_next_playlist_and_removes_nothing(self):
+        conn = db.get_conn()
+        gone = _make_playlist_with_tracks(conn, "Gone", "subsonic", [])
+        conn.execute("UPDATE playlists SET source_playlist_id = 'gone' WHERE id = ?", (gone,))
+        conn.commit()
+        conn.close()
+        seen = []
+
+        def report(done):
+            seen.append(done)
+            if done == 1:
+                raise jobs.JobCancelled(jobs.CANCEL_ADMIN)
+
+        provider = _FullStubProvider(
+            [{"id": "one", "title": "One"}, {"id": "two", "title": "Two"}],
+            [{"position": 0, "artist": "A", "title": "T", "path": None, "album": None}])
+        with self.assertRaises(jobs.JobCancelled):
+            playlist_sync.sync_playlists(provider, "subsonic", report)
+        self.assertEqual(seen, [0, 1])
+        conn = db.get_conn()
+        try:
+            titles = sorted(r["title"] for r in conn.execute("SELECT title FROM playlists"))
+        finally:
+            conn.close()
+        self.assertEqual(titles, ["Gone", "One"])
+
+    def test_a_complete_sync_reports_each_playlist(self):
+        report = mock.Mock()
+        provider = _FullStubProvider(
+            [{"id": "one", "title": "One"}, {"id": "two", "title": "Two"}],
+            [{"position": 0, "artist": "A", "title": "T", "path": None, "album": None}])
+        playlist_sync.sync_playlists(provider, "subsonic", report)
+        self.assertEqual(report.call_args_list, [mock.call(0), mock.call(1)])
+
+
+class ScheduledPlaylistSyncTimingTests(unittest.TestCase):
+    """playlist_sync.sync_due and next_scheduled_sync_at: the timing half of
+    the scheduled playlist sync (the hook that acts on it is main.py's, and
+    is tested in test_routes)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-scheduled-sync-")
+        self._saved = (db.DATA_DIR, db.DB_PATH)
+        db.DATA_DIR = Path(self._tmp)
+        db.DB_PATH = Path(self._tmp) / "music-sync.db"
+        db.init_db()
+        self.addCleanup(self._restore)
+        self.conn = db.get_conn()
+        self.addCleanup(self.conn.close)
+
+    def _restore(self):
+        db.DATA_DIR, db.DB_PATH = self._saved
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _set_interval(self, hours) -> None:
+        db.set_config(self.conn, "playlist_sync_interval_hours", str(hours))
+        self.conn.commit()
+
+    def _add_finished_sync(self, state: str, hours_ago: float) -> None:
+        self.conn.execute(
+            "INSERT INTO jobs (type, state, finished_at) VALUES (?, ?, datetime('now', ?))",
+            (playlist_sync.JOB_TYPE, state, f"-{hours_ago} hours"))
+        self.conn.commit()
+
+    def test_off_is_never_due(self):
+        self._set_interval(0)
+        self._add_finished_sync("done", hours_ago=1000)
+        self.assertFalse(playlist_sync.sync_due(self.conn))
+        self.assertIsNone(playlist_sync.next_scheduled_sync_at(self.conn))
+
+    def test_never_synced_and_enabled_is_due_now(self):
+        self._set_interval(6)
+        self.assertTrue(playlist_sync.sync_due(self.conn))
+        self.assertIsNone(playlist_sync.next_scheduled_sync_at(self.conn))
+
+    def test_not_due_within_the_interval(self):
+        self._set_interval(6)
+        self._add_finished_sync("done", hours_ago=1)
+        self.assertFalse(playlist_sync.sync_due(self.conn))
+
+    def test_due_once_the_interval_has_passed(self):
+        self._set_interval(6)
+        self._add_finished_sync("done", hours_ago=7)
+        self.assertTrue(playlist_sync.sync_due(self.conn))
+
+    def test_a_failed_sync_restarts_the_interval_too(self):
+        # Otherwise a provider that is down is retried on every idle poll.
+        self._set_interval(6)
+        self._add_finished_sync("done", hours_ago=30)
+        self._add_finished_sync("failed", hours_ago=1)
+        self.assertFalse(playlist_sync.sync_due(self.conn))
+
+    def test_a_cancelled_sync_restarts_the_interval_too(self):
+        # Otherwise the schedule starts again the sync an admin just stopped.
+        self._set_interval(6)
+        self._add_finished_sync("done", hours_ago=30)
+        self._add_finished_sync("cancelled", hours_ago=1)
+        self.assertFalse(playlist_sync.sync_due(self.conn))
+
+    def test_a_cancelled_sync_reports_no_counts(self):
+        self.conn.execute(
+            "INSERT INTO jobs (type, state, result, finished_at) VALUES (?, 'done', ?, datetime('now', '-1 hour'))",
+            (playlist_sync.JOB_TYPE, json.dumps({"status": "ok", "playlists": 3})))
+        self._add_finished_sync("cancelled", hours_ago=0)
+        self.assertEqual(playlist_sync.sync_status(),
+                         {"running": False, "last_result": {"status": "error", "reason": "cancelled"}})
+
+    def test_a_queued_or_running_sync_is_not_a_finished_one(self):
+        self._set_interval(6)
+        self._add_finished_sync("done", hours_ago=7)
+        self.conn.execute("INSERT INTO jobs (type, state) VALUES (?, 'running')",
+                          (playlist_sync.JOB_TYPE,))
+        self.conn.commit()
+        # Still due by the clock; start_sync's dedupe is what stops a second one.
+        self.assertTrue(playlist_sync.sync_due(self.conn))
+
+    def test_next_sync_is_the_last_finish_plus_the_interval(self):
+        self._set_interval(6)
+        self._add_finished_sync("done", hours_ago=1)
+        last = self.conn.execute("SELECT finished_at FROM jobs WHERE type = ?",
+                                 (playlist_sync.JOB_TYPE,)).fetchone()["finished_at"]
+        expected = self.conn.execute("SELECT datetime(?, '+6 hours')", (last,)).fetchone()[0]
+        self.assertEqual(playlist_sync.next_scheduled_sync_at(self.conn), expected)
+
+    def test_a_garbled_setting_reads_as_off(self):
+        self._set_interval("soon")
+        self.assertFalse(playlist_sync.sync_due(self.conn))
+
+
+class PlaylistSyncIntervalSeedTests(unittest.TestCase):
+    """db._seed_playlist_sync_interval_default: on for a fresh install, off
+    for an upgraded one, and an admin's choice is never overwritten."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-sync-seed-")
+        self._saved = (db.DATA_DIR, db.DB_PATH)
+        db.DATA_DIR = Path(self._tmp)
+        db.DB_PATH = Path(self._tmp) / "music-sync.db"
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        db.DATA_DIR, db.DB_PATH = self._saved
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _interval(self):
+        conn = db.get_conn()
+        try:
+            return db.get_config(conn, "playlist_sync_interval_hours")
+        finally:
+            conn.close()
+
+    def _set(self, key, value):
+        conn = db.get_conn()
+        try:
+            db.set_config(conn, key, value)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_a_fresh_install_syncs_every_six_hours(self):
+        db.init_db()
+        self.assertEqual(self._interval(), "6")
+
+    def test_an_upgraded_install_stays_off(self):
+        # An install from before the setting: set up, and the key never written.
+        db.init_db()
+        conn = db.get_conn()
+        try:
+            conn.execute("DELETE FROM app_config WHERE key = 'playlist_sync_interval_hours'")
+            conn.commit()
+        finally:
+            conn.close()
+        self._set("setup_completed", "1")
+        db.init_db()
+        self.assertEqual(self._interval(), "0")
+
+    def test_an_admin_choice_survives_a_restart(self):
+        db.init_db()
+        self._set("setup_completed", "1")
+        self._set("playlist_sync_interval_hours", "12")
+        db.init_db()
+        self.assertEqual(self._interval(), "12")
+        self._set("playlist_sync_interval_hours", "0")
+        db.init_db()
+        self.assertEqual(self._interval(), "0")
+
+
+
+class SyncPassesAlbumTests(unittest.TestCase):
+    """A provider's album reaches the resolver from a playlist sync, so the
+    right version of a title is matched."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="trobar-test-sync-album-"))
+        self._saved = (db.DB_PATH, db.DATA_DIR)
+        db.DATA_DIR = self._tmp
+        db.DB_PATH = self._tmp / "test.db"
+        db.init_db()
+        self.addCleanup(self._restore)
+        conn = db.get_conn()
+        self.ids = [conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+            "VALUES (?, 'Glass Meridian', ?, 'Latitude', 1, 0)", (f"GM/{album}/01 Latitude.flac", album)).lastrowid
+            for album in ("The Best Of", "Live at the Harbour")]
+        conn.commit()
+        conn.close()
+
+    def _restore(self):
+        db.DB_PATH, db.DATA_DIR = self._saved
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_the_entrys_album_picks_the_version(self):
+        provider = _FullStubProvider(
+            [{"id": "p1", "title": "Mix"}],
+            [{"position": 0, "artist": "Glass Meridian", "title": "Latitude", "path": None,
+              "album": "Live at the Harbour"}])
+        playlist_sync.sync_playlists(provider, "subsonic")
+        conn = db.get_conn()
+        try:
+            matched = conn.execute("SELECT matched_track_id FROM playlist_tracks").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(matched, self.ids[1])
+
+    def test_the_entrys_recording_id_finds_the_file_whatever_its_title(self):
+        mbid = "8f3471b5-7e6a-48da-86a9-c1c07a0f47ae"
+        conn = db.get_conn()
+        conn.execute("UPDATE tracks SET mbid = ? WHERE id = ?", (mbid, self.ids[1]))
+        conn.commit()
+        conn.close()
+        provider = _FullStubProvider(
+            [{"id": "p1", "title": "Mix"}],
+            [{"position": 0, "artist": "GM", "title": "Lat. (live 1998 remaster)", "path": None,
+              "album": None, "mbid": mbid}])
+        playlist_sync.sync_playlists(provider, "jellyfin")
+        conn = db.get_conn()
+        try:
+            matched = conn.execute("SELECT matched_track_id FROM playlist_tracks").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(matched, self.ids[1])
+
+
+class PlaylistChangesReachDevicesTests(unittest.TestCase):
+    """A device selecting a playlist is told when the playlist's matched
+    tracks change: by a sync, an edit of a playlist made in Trobar, or an
+    accepted guess."""
+
+    def setUp(self):
+        self.conn = _make_conn()
+        self.user = _make_user(self.conn)
+        self.device, _ = sync_state.create_device(self.conn, self.user, "phone")
+        self.ids = {}
+        for title in ("Song A", "Song B", "Song C"):
+            self.ids[title] = sync_state._new_id(self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                "VALUES (?, 'Artist A', 'Album', ?, 1, 0.0)", (f"Artist A/{title}.flac", title)))
+        self.conn.commit()
+
+    @staticmethod
+    def _entries(*titles):
+        return [{"position": i, "artist": "Artist A", "title": t, "album": None} for i, t in enumerate(titles)]
+
+    def _states(self):
+        names = {v: k for k, v in self.ids.items()}
+        return {names[r["track_id"]]: r["status"] for r in self.conn.execute(
+            "SELECT track_id, status FROM device_track_state WHERE device_id = ?", (self.device,))}
+
+    def _selected_provider_playlist(self, *titles):
+        playlist_sync._sync_one_playlist(self.conn, _StubProvider(self._entries(*titles)), "roon", "Mix")
+        playlist_id = self.conn.execute("SELECT id FROM playlists WHERE title = 'Mix'").fetchone()["id"]
+        sync_state.create_selection(self.conn, "playlist", str(playlist_id), self.user, [self.device])
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded'")
+        self.conn.commit()
+        return playlist_id
+
+    def test_a_sync_that_changes_the_playlist_reaches_the_device(self):
+        self._selected_provider_playlist("Song A", "Song B")
+        playlist_sync._sync_one_playlist(self.conn, _StubProvider(self._entries("Song A", "Song C")), "roon", "Mix")
+        self.assertEqual(self._states(), {"Song A": "downloaded", "Song B": "removed", "Song C": "pending"})
+
+    def test_a_sync_that_changes_nothing_recomputes_nothing(self):
+        self._selected_provider_playlist("Song A", "Song B")
+        with mock.patch.object(sync_state, "recompute_playlist_devices") as recompute:
+            playlist_sync._sync_one_playlist(
+                self.conn, _StubProvider(self._entries("Song B", "Song A")), "roon", "Mix")
+        recompute.assert_not_called()
+
+    def test_only_the_devices_selecting_the_playlist_are_recomputed(self):
+        other, _ = sync_state.create_device(self.conn, self.user, "player")
+        sync_state.create_selection(self.conn, "track", str(self.ids["Song C"]), self.user, [other])
+        self._selected_provider_playlist("Song A")
+        # Patched where recompute_playlist_devices looks it up.
+        with mock.patch.object(selection_store, "recompute_device_state",
+                               wraps=selection_store.recompute_device_state) as recompute:
+            playlist_sync._sync_one_playlist(
+                self.conn, _StubProvider(self._entries("Song A", "Song B")), "roon", "Mix")
+        self.assertEqual([c.args[1] for c in recompute.call_args_list], [self.device])
+        self.assertEqual(self._states(), {"Song A": "downloaded", "Song B": "pending"})
+
+    def test_editing_a_trobar_playlist_reaches_the_device(self):
+        playlist_id = playlist_sync.create_trobar_playlist(self.conn, self.user, "Mine")
+        playlist_sync.set_trobar_playlist_tracks(self.conn, playlist_id, [self.ids["Song A"]])
+        sync_state.create_selection(self.conn, "playlist", str(playlist_id), self.user, [self.device])
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded'")
+        self.conn.commit()
+        playlist_sync.set_trobar_playlist_tracks(self.conn, playlist_id, [self.ids["Song B"]])
+        self.assertEqual(self._states(), {"Song A": "removed", "Song B": "pending"})
+
+
+class DevicePlayPlaylistTests(unittest.TestCase):
+    """A device's Play choice: one of the playlists selected for it, named
+    in /changes as that playlist's file, or None for Everything. It goes
+    back to Everything when the playlist stops being selected for the
+    device or is deleted."""
+
+    def setUp(self):
+        self.conn = _make_conn()
+        self.user = _make_user(self.conn)
+        self.device, _ = sync_state.create_device(self.conn, self.user, "watch")
+        self.track = sync_state._new_id(self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+            "VALUES ('Artist A/Song A.flac', 'Artist A', 'Album', 'Song A', 1, 0.0)"))
+        self.conn.commit()
+        self.run_pl = self._selected("Run")
+        self.walk_pl = self._selected("Walk")
+
+    def _selected(self, title):
+        playlist_id = playlist_sync.create_trobar_playlist(self.conn, self.user, title)
+        playlist_sync.set_trobar_playlist_tracks(self.conn, playlist_id, [self.track])
+        sel = sync_state.create_selection(self.conn, "playlist", str(playlist_id), self.user, [self.device])
+        return playlist_id, sel
+
+    def _play(self, playlist_id):
+        self.conn.execute("UPDATE devices SET play_playlist_id = ? WHERE id = ?", (playlist_id, self.device))
+        self.conn.commit()
+
+    def _stored(self):
+        return self.conn.execute("SELECT play_playlist_id FROM devices WHERE id = ?",
+                                 (self.device,)).fetchone()[0]
+
+    def test_everything_is_the_default(self):
+        changes = sync_state.get_changes(self.conn, self.device)
+        self.assertIsNone(changes["play_playlist"])
+        self.assertEqual(sorted(p["filename"] for p in changes["playlists"]), ["Run.m3u8", "Walk.m3u8"])
+
+    def test_the_choice_is_named_by_its_file_and_the_list_is_unchanged(self):
+        self._play(self.walk_pl[0])
+        changes = sync_state.get_changes(self.conn, self.device)
+        self.assertEqual(changes["play_playlist"], "Walk.m3u8")
+        self.assertEqual(sorted(changes["playlists"][0]), ["content", "filename", "name"])
+
+    def test_unselecting_the_playlist_goes_back_to_everything(self):
+        self._play(self.walk_pl[0])
+        sync_state.delete_selection(self.conn, self.run_pl[1])  # another one: kept
+        self.assertEqual(self._stored(), self.walk_pl[0])
+        sync_state.delete_selection(self.conn, self.walk_pl[1])
+        self.assertIsNone(self._stored())
+        # Selecting it again does not bring the old choice back.
+        sync_state.create_selection(self.conn, "playlist", str(self.walk_pl[0]), self.user, [self.device])
+        self.assertIsNone(sync_state.get_changes(self.conn, self.device)["play_playlist"])
+
+    def test_unselecting_it_from_this_device_clears_it_while_another_keeps_it(self):
+        # Selected for both devices and chosen on both; unselected from this
+        # one only. "Selected for this device" is per device, not "anywhere".
+        other, _ = sync_state.create_device(self.conn, self.user, "phone")
+        sync_state.toggle_selection_device(self.conn, self.user, "playlist", str(self.walk_pl[0]), other, True)
+        self._play(self.walk_pl[0])
+        self.conn.execute("UPDATE devices SET play_playlist_id = ? WHERE id = ?", (self.walk_pl[0], other))
+        self.conn.commit()
+        sync_state.toggle_selection_device(self.conn, self.user, "playlist", str(self.walk_pl[0]), self.device, False)
+        self.assertIsNone(self._stored())
+        self.assertEqual(self.conn.execute("SELECT play_playlist_id FROM devices WHERE id = ?",
+                                           (other,)).fetchone()[0], self.walk_pl[0])
+
+    def test_deleting_the_playlist_goes_back_to_everything(self):
+        self._play(self.walk_pl[0])
+        playlist_sync.delete_trobar_playlist(self.conn, self.walk_pl[0])
+        self.assertIsNone(self._stored())
+
+    def test_a_playlist_row_deleted_without_its_selections_clears_it_too(self):
+        # Every removal today goes through delete_selection first, so the
+        # recompute has already cleared the choice; the foreign key is what
+        # holds if a later path deletes the row alone. Forced here.
+        self._play(self.walk_pl[0])
+        self.conn.execute("DELETE FROM playlists WHERE id = ?", (self.walk_pl[0],))
+        self.conn.commit()
+        self.assertIsNone(self._stored())
+
+    def test_a_replacement_device_keeps_the_choice(self):
+        self._play(self.walk_pl[0])
+        new, _ = sync_state.create_device(self.conn, self.user, "new watch")
+        sync_state.transfer_device(self.conn, self.device, new)
+        self.assertEqual(sync_state.get_changes(self.conn, new)["play_playlist"], "Walk.m3u8")
+
+    def test_a_chosen_playlist_with_nothing_on_the_device_names_no_file(self):
+        self._play(self.walk_pl[0])
+        playlist_sync.set_trobar_playlist_tracks(self.conn, self.walk_pl[0], [])
+        changes = sync_state.get_changes(self.conn, self.device)
+        self.assertEqual([p["filename"] for p in changes["playlists"]], ["Run.m3u8"])
+        self.assertIsNone(changes["play_playlist"])
 
 
 if __name__ == "__main__":

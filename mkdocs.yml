@@ -14,6 +14,9 @@ theme:
   # brand/tokens/trobar-themes.json; that stylesheet also swaps the mark for
   # Nuèch's in the dark scheme. The site follows the system setting until
   # the toggle is used.
+  # No font service: the brand fonts are self-hosted by
+  # docs/stylesheets/fonts.css, with the files copied in by the hook below.
+  font: false
   logo: assets/brand/trobar-mark-small-troubadour.svg
   favicon: assets/brand/favicon.svg
   palette:
@@ -40,6 +43,10 @@ theme:
 
 extra_css:
   - stylesheets/brand.css
+  - stylesheets/fonts.css
+
+hooks:
+  - dev/mkdocs_fonts.py
 
 # Build strictly: every docs/*.md must be in nav, internal links must resolve,
 # and internal anchors must exist. External links (GitHub, README, SECURITY.md,
@@ -127,6 +134,7 @@ nav:
       - Backups & DATA_DIR: operations/backups.md
       - Upgrading: operations/upgrading.md
   - Troubleshooting: troubleshooting.md
+  - Privacy: privacy.md
   - Reference:
       - Environment Variables: reference/environment.md
       - Architecture & Sync Protocol: reference/architecture.md

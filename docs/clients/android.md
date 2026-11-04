@@ -38,10 +38,18 @@ The app has four tabs — **Home**, **Library**, **Playlists** and
    another from its list, and the phone keeps the choice.
 2. **Library**: browse artists and albums, and double-tap an album to add
    it to the basket for that device. Its cover flies to the basket, and the
-   basket's count goes up once the server has it. A single tap does
-   nothing. **Sync entire artist** adds a whole artist the same way. The
-   album grids on Home take the same double-tap. An album already in the
-   basket for that device is not added twice; the app says so instead.
+   basket's count goes up once the server has it. A single tap opens the
+   album: its cover, year and tracks, with **Add to basket**; tap a track
+   to add it to a playlist of yours or a new one. On a server below App API
+   level 5 the album opens without its tracks; from level 5, **Add to
+   playlist…** there adds the whole album. From App API level 6 the Library groups by album artist, as
+   the web UI does: a compilation shows once, and an artist's page lists
+   **Also appears on**. An album from there opens whole, with that artist's
+   tracks marked, and adding or staging it takes only those. **Sync entire
+   artist** adds a whole artist the same way. The album grids on Home take
+   the same tap and double-tap, for albums the library holds. An album
+   already in the basket for that device is not added twice; the app says so
+   instead.
 3. **Basket**: review what is staged, grouped by device, and send each
    device's section. Sending turns it into selections on the server — the
    same thing the web UI's basket does. When the section is for this phone,
@@ -72,6 +80,13 @@ and follows the sync while it runs. Everything the web UI's playlist
 section does is here, except mirroring and the filter that hides playlists
 with no matches (the app lists every playlist):
 
+- **New playlist**, from App API level 3, asks for a name, and nothing is
+  created until there is one.
+- **Edit a playlist made in Trobar** that is yours, or anyone's if you are an
+  admin: rename it, drag a track by its handle or use the arrows to reorder,
+  and swipe a track away to remove it, with an Undo. **Delete** asks first;
+  its selections and any mirror of it go too. If the playlist changed
+  elsewhere, the app reads it again and says so instead of overwriting it.
 - **Stage one** by double-tapping it, as an album; a single tap opens it.
   Double-tapping an open playlist's summary stages it too.
 - **Open one** to see its tracks, with the ones your library has no match

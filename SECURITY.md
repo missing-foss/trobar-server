@@ -67,9 +67,17 @@ to `DATA_DIR` or the host.
 - **Session cookies** are set `Secure`, `SameSite=Lax`, `HttpOnly`
  explicitly. `Secure` can be disabled for plain-HTTP local development with
  `SESSION_COOKIE_SECURE=0`.
+- **Sessions expire** after `SESSION_LIFETIME_DAYS` (default 30) without a
+ visit; each request renews the cookie, and its age is checked server-side
+ when it's read. Logging out ends the session on the server too, so a copy
+ of its cookie can't sign back in. Changing your own password asks for the
+ current one, once the account has one, and ends your other sessions; an
+ admin password reset ends all of the user's sessions.
 - **Brute-force backoff.** A per-IP failure counter throttles password login
  (10 failures / 5 min) and device Bearer-token auth (30 / 5 min) with `429`s.
-  Passwords are stored as Werkzeug PBKDF hashes; device tokens are
+ A wrong current password on a password change is throttled per account
+ (10 / 5 min), so a signed-in session can't be used to guess it.
+  Passwords are stored as Werkzeug scrypt hashes; device tokens are
  `secrets.token_urlsafe(32)` stored only as SHA-256.
 - **CSRF.** `SameSite=Lax` plus an `Origin`-header check that rejects
  state-changing requests carrying a cross-origin `Origin`. The device Bearer
@@ -95,7 +103,8 @@ to `DATA_DIR` or the host.
 - `roon_token.json` — the Roon Core pairing token;
 - `avatars/` — uploaded profile images.
 
-**Provider credentials are stored in cleartext by design.** The app needs the
+**Provider credentials are stored in cleartext by design**, with one exception
+below. The app needs the
 usable secret to authenticate to each provider on every sync, and this is a
 single-file self-hosted database — encrypting at rest would only move the key
 problem elsewhere on the same host without raising the bar against the actual
@@ -105,6 +114,14 @@ boundary**, not encryption:
 - Trobar sets `DATA_DIR` to `0o700` and the secret-key / token / database files
  to `0o600` on creation (best-effort — some bind-mounted filesystems ignore
  `chmod`).
+- **The exception:** the Maloja API key, ListenBrainz user token and Last.fm
+  session used to send someone's plays, and the install's Last.fm shared secret,
+  can write to accounts, so they are encrypted with
+  AES-256-GCM. The key is a separate file, `credential_key` in `DATA_DIR`, or
+  wherever `TROBAR_CREDENTIAL_KEY_FILE` points. That protects a leaked database
+  or snapshot. It protects against someone who can read all of `DATA_DIR` only
+  if the key is kept elsewhere. Per-user Tidal refresh tokens are not encrypted
+  yet.
 - **You should:** treat `DATA_DIR` like a password store — keep it on a volume
   only the container's user can read, and **back it up encrypted**. Do not commit
  it or bake it into an image (the `Dockerfile` copies only `app/`, and
@@ -149,7 +166,10 @@ process on purpose**: the scan lock, the transcode-concurrency limit, and the
 per-IP brute-force counters are all in-process state, so a multi-process worker
 model (e.g. `gunicorn -w 2`) would silently break each of them. For local
 development you can opt back into the Werkzeug server (reloader/debugger) with
-`TROBAR_DEV_SERVER=1`.
+`TROBAR_DEV_SERVER=1`. The same flag, in `forward` mode, also lets a request
+**without** the proxy's identity header in as `DEV_USER` (without
+`FORWARD_AUTH_SECRET`, that's any request that reaches the port), where it
+would otherwise be refused. Never set it on an instance anyone else can reach.
 
 This still expects the intended deployment — a household instance behind a
 trusted, TLS-terminating reverse proxy. Keep that proxy (and, in `forward`

@@ -17,6 +17,9 @@ Jellyfin and Emby is the resolved user id, not the username."""
 
 import contextlib
 import contextvars
+import logging
+
+_log = logging.getLogger(__name__)
 
 _OVERRIDE: contextvars.ContextVar[tuple[str, tuple] | None] = contextvars.ContextVar(
     "provider_config_override", default=None)

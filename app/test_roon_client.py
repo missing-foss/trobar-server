@@ -28,7 +28,9 @@ cannot prove Roon still answers that way. That is the live Core's job.
 import os
 import socket
 import stat
+import shutil
 import tempfile
+import threading
 import unittest
 import unittest.mock as mock
 from pathlib import Path
@@ -43,6 +45,7 @@ import db  # noqa: E402
 db.DATA_DIR = Path(_TMP)
 
 import roon_client  # noqa: E402
+from artist_image_keys import ArtistImageKeys  # noqa: E402
 from roonapi.roonapi import RoonApiException  # noqa: E402
 
 
@@ -114,7 +117,7 @@ class _RoonBase(unittest.TestCase):
             mock.patch.object(roon_client, "TOKEN_FILE", Path(self._token_dir) / "roon_token.json"),
             mock.patch.object(roon_client, "_roon", None),
             mock.patch.object(roon_client, "_last_connect_attempt", 0.0),
-            mock.patch.object(roon_client, "_artist_image_key_map", None),
+            mock.patch.object(roon_client, "_artist_image_key_map", ArtistImageKeys()),
             mock.patch.object(roon_client, "_ENV_ROON_HOST", ""),
             mock.patch.object(roon_client, "_ENV_ROON_PORT", "9330"),
             mock.patch.object(roon_client.time, "sleep"),  # the retries and the pairing wait, instant
@@ -190,6 +193,72 @@ class HostAndConnectionTests(_RoonBase):
         self.assertEqual(api.call_args.args[1:4], ("kept", "new-core.invalid", 9400))
         self.assertEqual(roon_client._current_host_port(), ("new-core.invalid", 9400))
         self.assertEqual(state["state"], "paired")
+
+    def _switched_away(self):
+        conn = db.get_conn()
+        db.set_config(conn, "provider", "music_assistant")
+        conn.commit()
+        conn.close()
+
+    def test_stop_ends_the_connection_and_keeps_the_pairing(self):
+        roon_client._save_token("kept")
+        fake = mock.Mock()
+        roon_client._roon = fake
+        roon_client.stop()
+        fake.stop.assert_called_once()
+        self.assertIsNone(roon_client._roon)
+        self.assertEqual(roon_client._load_token(), "kept")
+
+    def test_stop_with_nothing_connected_is_fine(self):
+        roon_client.stop()
+        self.assertIsNone(roon_client._roon)
+
+    def test_stop_survives_a_socket_that_never_opened(self):
+        fake = mock.Mock()
+        fake.stop.side_effect = OSError("no socket")
+        roon_client._roon = fake
+        roon_client.stop()
+        self.assertIsNone(roon_client._roon)
+
+    def test_stop_really_ends_the_librarys_retry_loop(self):
+        # The real watcher, on a socket that has failed: left alone it retries
+        # for ever, which is what kept logging after a switch.
+        roon = object.__new__(roon_client.RoonApi)
+        roon._exit = False
+        roon._roonsocket = mock.Mock(failed_state=True)
+        roon._server_setup = mock.Mock()
+        roon._host, roon._port = "core.invalid", 9330
+        thread = threading.Thread(target=roon._socket_watcher, daemon=True)
+        thread.start()
+        roon_client._roon = roon
+        roon_client.stop()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "the retry loop is still running")
+
+    def test_a_new_connection_stops_the_one_before(self):
+        conn = db.get_conn()
+        db.set_config(conn, "roon_host", "core.invalid")
+        conn.commit()
+        conn.close()
+        old = mock.Mock()
+        roon_client._roon = old
+        with mock.patch.object(roon_client, "RoonApi", return_value=_FakeRoon([])):
+            roon_client.retry_pairing()
+        old.stop.assert_called_once()
+
+    def test_storing_an_address_opens_no_connection(self):
+        with mock.patch.object(roon_client, "RoonApi") as api:
+            roon_client.store_address("core.invalid", 9400)
+        api.assert_not_called()
+        self.assertEqual(roon_client._current_host_port(), ("core.invalid", 9400))
+
+    def test_status_says_whether_roon_is_the_library_source(self):
+        self.assertTrue(roon_client.status()["active"])
+        self._switched_away()
+        with mock.patch.object(roon_client, "RoonApi") as api:
+            status = roon_client.status()
+        self.assertEqual((status["state"], status["active"]), ("disconnected", False))
+        api.assert_not_called()
 
     def test_status_says_pending_until_the_core_approves(self):
         fake = self._paired(_FakeRoon([]))
@@ -359,7 +428,7 @@ class ArtistImageTests(_RoonBase):
         # attempt searching inside it rather than at the root.
         for artists_at in ("library", "root", "root_beside_library"):
             with self.subTest(artists_at=artists_at):
-                roon_client._artist_image_key_map = None
+                roon_client._artist_image_key_map.clear()
                 self._paired(_FakeRoon(_library(artists=["Autechre"], artists_at=artists_at)))
                 with mock.patch("requests.get", return_value=self._image_response()) as get:
                     self.assertEqual(roon_client.get_artist_image("Autechre"), (b"jpeg bytes", "image/png"))
@@ -380,6 +449,20 @@ class ArtistImageTests(_RoonBase):
             get.assert_not_called()
         with mock.patch("requests.get", return_value=self._image_response(status=404)):
             self.assertIsNone(roon_client.get_artist_image("Autechre"))
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

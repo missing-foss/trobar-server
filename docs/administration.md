@@ -6,9 +6,22 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 # The Administration panel
 
-**Profile → Administration.** Only the `ADMIN_USERNAME` account sees it;
-everything else in the app (own profile, own devices, own selections) is
-per-user and needs no admin.
+**Profile → Administration.** Every admin account sees it; everything else
+in the app (own profile, own devices, own selections) is per-user and needs
+no admin.
+
+An account becomes an admin in one of three ways, and in no other:
+
+- it is the first account created on a fresh `local` install (when
+  `ADMIN_USERNAME` is set, that first account must use that name);
+- under `forward` or `oidc`, it signs in with the username set in
+  `ADMIN_USERNAME`;
+- it is created or granted admin with the `create-admin` command (see
+  *Locked out of the admin account?* below).
+
+Accounts created from the **Users** tab are never admins, and there is no
+control, in the web UI or the API, that makes an existing account an admin
+or takes admin away. Usernames can't be changed either.
 
 This page is the admin-panel reference. Related admin-managed topics have their
 own pages: [Devices & Storage](using/devices.md),
@@ -37,11 +50,11 @@ open. After that, which sections are open is remembered in this browser.
 
 | Section | What's in it |
 |---|---|
-| Library | The library source, automatic rescan, artist images (TheAudioDB) |
+| Library | The library source, automatic rescan, automatic playlist sync, artist images (TheAudioDB) |
 | Playlist sources | Local playlist sources, Music Assistant, Tidal, Spotify |
 | Playlists | Playlist track matching (AcoustID), playlist mirroring, Lidarr: missing-album requests |
 | Listening | The default Last.fm key, listening history sources |
-| Devices | Transcoding (CPU controls) |
+| Devices | Transcoding (CPU controls, cache) |
 | Maintenance | Background job history |
 | Security | The sign-in mode, and under OIDC the break-glass admin password |
 
@@ -106,8 +119,13 @@ First-run setup keeps its own provider picker: there is nothing to lose yet.
 
 #### API keys
 
-Two keys live in different sections:
+Three keys live in different sections:
 
+- **Last.fm API account for sending plays** (**Listening → Listening history**) —
+  an API key and shared secret from a Last.fm API account of your own. With
+  both set, members can connect their Last.fm and send plays to it. The secret
+  is stored encrypted and never shown again. Set its callback URL to your
+  server's address.
 - **Default Last.fm API key** (**Listening → Listening history**) — used for suggestions and listening stats for any
   user who hasn't set a personal key in their own profile.
 - **TheAudioDB API key** (**Library → Artist images**) — when set, artist pictures are fetched
@@ -150,7 +168,9 @@ OAuth app **once** here under **Configuration** so those logins have something t
 authenticate against:
 
 - **[Tidal](providers/tidal.md)** — client ID/secret; three developer-console
-  permissions must be enabled or the login fails at Tidal's own screen.
+  permissions must be enabled or the login fails at Tidal's own screen. A
+  fourth, `playlists.write`, is optional: enable it there first, then tick
+  **My Tidal app has playlists.write enabled**.
 - **[Spotify](providers/spotify.md)** — client ID/secret (**validation
   pending**; Dev-Mode Premium + 5-user limits apply).
 
@@ -176,7 +196,8 @@ accounts**.
 #### Listening history sources
 
 Suggestions (top-played / recently-played) read from Last.fm, ListenBrainz
-and/or Maloja — **read-only**, nothing here ever submits a scrobble. Maloja is
+and/or Maloja. Each person can also choose to send their devices' plays to their
+own Maloja, ListenBrainz or Last.fm, off until they turn it on. Maloja is
 set per user, on their Profile (see [Suggestions](using/suggestions.md#maloja)),
 so any user can point the server at an address on your LAN; loopback,
 link-local, unspecified and multicast addresses are refused, and Maloja
@@ -200,6 +221,13 @@ Leave either blank to use the default (the real service, or the
 
 **Transcoding (CPU controls)**: how many transcodes run at once, and at what
 priority (nice level).
+
+**Transcode cache (GB)**: how much disk the server may use to keep finished
+transcodes, in `DATA_DIR/transcode`. A device that syncs a track again, or a
+second device with the same format, is then sent the kept file instead of
+waiting for a new encode. When the cache is full, the files served least
+recently are removed first. The default is 2 GB; 0 keeps nothing and empties
+the cache when saved. A track whose file changes is transcoded again.
 
 ### Maintenance
 
@@ -252,9 +280,11 @@ Save button.
   account.
 - Each user's row also says whom they manage and who manages them, when a
   delegation links them.
-- Deleting a user who still owns devices or selections fails with a clear
-  message — reassign or remove those first. Deleting one removes their
-  delegations too.
+- Deleting a user who still owns devices, selections or playlists fails, and
+  the dialog lists what they own. Delete those first. Ownership can't be
+  moved from here; a playlist's owner only changes by re-syncing it.
+  Deleting a user removes their delegations too. Your own account and the last admin account can't be deleted, nor,
+  under `oidc`, the only account that can still sign in with a password.
 
 ### Delegations
 

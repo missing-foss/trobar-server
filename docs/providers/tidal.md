@@ -24,6 +24,12 @@ something to authenticate against.
  - `user.read`
  - `collection.read`
  - `playlists.read`
+
+   A fourth, `playlists.write`, is optional. Members need it to keep a copy
+   of a playlist in each other's Tidal accounts. Enable it in the console
+   first, then tick **My Tidal app has playlists.write enabled** in the same
+   Tidal block of Configuration. Trobar requests it only once that box is
+   ticked, so an app without it keeps working for everything else.
 4. Enter the **Client ID** and **Client secret** under
    [Administration → Configuration](../administration.md).
 
@@ -41,3 +47,7 @@ Each household member connects their own account from their own **Profile →
 Streaming accounts** tab. Playlists then merge into the shared pool; per-playlist
 ownership/sharing controls keep a personal playlist private if you want — see
 [Playlists](../using/playlists.md).
+
+If you linked your account before the admin enabled `playlists.write`, the
+link can still only read. Profile then says so, with a **Reconnect Tidal**
+link that asks Tidal for the new permission.

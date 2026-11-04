@@ -4,6 +4,7 @@
 
 // @ts-check
 const { test, expect } = require("@playwright/test");
+const { trackFetches, settled } = require("../support/settle");
 
 // #410/#507: the Playlists row's mirror controls. global-setup seeds an
 // empty library with no provider connected (see e2e/README.md), so there's
@@ -74,6 +75,9 @@ async function gotoPlaylists(page) {
   page.on("requestfinished", (r) => { if (isPlaylistsFetch(r)) { inFlight -= 1; settled += 1; } });
   page.on("requestfailed", (r) => { if (isPlaylistsFetch(r)) { inFlight -= 1; settled += 1; } });
 
+  // Also the generic tracker, for settled() in the tests below; this helper's
+  // own count stays, since it waits for the one start-up load by number.
+  await trackFetches(page);
   await page.goto("/#/playlists");
 
   // Alpine attaches after the server-rendered DOM exists, so reaching $data
@@ -93,6 +97,12 @@ async function gotoPlaylists(page) {
     .toBe(true);
 }
 
+/** The row's Mirror… item, its Actions menu (#287) opened. */
+async function mirrorItem(page) {
+  await page.getByRole("button", { name: "Actions" }).click();
+  return page.getByRole("menuitem", { name: "Mirror…" });
+}
+
 test.describe("Playlists row mirror picker (#507)", () => {
   test("the Mirror… button is disabled with a hint when no sink is configured", async ({ page }) => {
     await gotoPlaylists(page);
@@ -109,9 +119,9 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
-    const mirrorButton = page.getByRole("button", { name: "Mirror…" });
+    const mirrorButton = await mirrorItem(page);
     await expect(mirrorButton).toBeDisabled();
     await expect(mirrorButton).toHaveAttribute("title", /ask an admin/i);
   });
@@ -135,9 +145,9 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
-    const mirrorButton = page.getByRole("button", { name: "Mirror…" });
+    const mirrorButton = await mirrorItem(page);
     await expect(mirrorButton).toBeEnabled();
 
     // #507 item 3: the identity row now carries a badge for the on sink,
@@ -174,9 +184,9 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
-    const mirrorButton = page.getByRole("button", { name: "Mirror…" });
+    const mirrorButton = await mirrorItem(page);
     await expect(mirrorButton).toBeEnabled();
     await expect(mirrorButton).toHaveAttribute("title", "");
   });
@@ -196,9 +206,9 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
-    await page.getByRole("button", { name: "Mirror…" }).click();
+    await (await mirrorItem(page)).click();
     await expect(page.getByRole("button", { name: "Mirror to Subsonic…" })).toBeVisible();
     // No rows for sinks that aren't configured — the issue's own "no rows
     // for targets that don't exist" requirement.
@@ -222,9 +232,9 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
-    await page.getByRole("button", { name: "Mirror…" }).click();
+    await (await mirrorItem(page)).click();
     const jellyfinRow = page.getByRole("button", { name: "Mirroring to Jellyfin" });
     await expect(jellyfinRow).toBeVisible();
     // Greyed (not the still-off rows' darker, actionable treatment), and
@@ -251,12 +261,12 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     await expect(page.locator(
       "[title=\"Mirrored to Music Assistant — Music Assistant's copy doesn't hold what was written: 1 of 3 tracks missing after the write\"]",
     )).toBeVisible();
-    await page.getByRole("button", { name: "Mirror…" }).click();
+    await (await mirrorItem(page)).click();
     await expect(page.getByRole("button", { name: "Mirroring to Music Assistant" })).toBeVisible();
   });
 
@@ -279,12 +289,12 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     await expect(page.locator(
       "[title=\"Mirrored to Plex — Plex's copy doesn't hold what was written: 1 of 2 tracks missing after the write\"]",
     )).toBeVisible();
-    await page.getByRole("button", { name: "Mirror…" }).click();
+    await (await mirrorItem(page)).click();
     await expect(page.getByRole("button", { name: "Mirroring to Plex" })).toBeVisible();
   });
 
@@ -304,7 +314,7 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     // Not a bare glyph — a real accessible name, per the issue's own item 5.
     await expect(page.getByText("E2E Badge Playlist")).toBeVisible();
@@ -342,9 +352,9 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
-    await page.getByRole("button", { name: "Mirror…" }).click();
+    await (await mirrorItem(page)).click();
     await expect(page.locator("#mirror-picker-overlay")).toBeVisible();
     await expect(page.getByRole("button", { name: "Mirroring", exact: true })).toBeVisible();
 
@@ -364,7 +374,7 @@ test.describe("Playlists row mirror picker (#507)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     // The whole overlay (backdrop included) is gone — not a dimmed,
     // undismissable dead end.
@@ -396,10 +406,10 @@ test.describe("Playlists row layout on mobile (#410 parts 1+2)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     const titleBox = await page.getByText("E2E Narrow Viewport Playlist").boundingBox();
-    const selectBox = await page.getByRole("button", { name: "Sync to…" }).boundingBox();
+    const selectBox = await page.getByRole("button", { name: "Actions" }).boundingBox();
     expect(titleBox).toBeTruthy();
     expect(selectBox).toBeTruthy();
     // Stacked, not squeezed onto the title's own line.
@@ -419,10 +429,10 @@ test.describe("Playlists row layout on mobile (#410 parts 1+2)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     const titleBox = await page.getByText("E2E Wide Viewport Playlist").boundingBox();
-    const selectBox = await page.getByRole("button", { name: "Sync to…" }).boundingBox();
+    const selectBox = await page.getByRole("button", { name: "Actions" }).boundingBox();
     expect(titleBox).toBeTruthy();
     expect(selectBox).toBeTruthy();
     // Vertically overlapping, not stacked — sm:flex-row's job.
@@ -450,7 +460,7 @@ test.describe("Playlists row layout on mobile (#410 parts 1+2)", () => {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     const overflowsHorizontally = await page.evaluate(() =>
       document.documentElement.scrollWidth > document.documentElement.clientWidth);
@@ -472,7 +482,7 @@ test.describe("Shared/Private toggle affordance (#410 part 2)", () => {
       }];
       app.profile.is_admin = true;
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     const sharedToggle = page.getByRole("button", { name: "Shared" });
     await expect(sharedToggle).toBeVisible();
@@ -482,7 +492,7 @@ test.describe("Shared/Private toggle affordance (#410 part 2)", () => {
     // state toggle rather than a fourth action button.
     await expect(sharedToggle).toHaveClass(/border-amber-300/);
 
-    const selectButton = page.getByRole("button", { name: "Sync to…" });
+    const selectButton = page.getByRole("button", { name: "Actions" });
     await expect(selectButton).not.toHaveClass(/border-amber-300/);
   });
 });
@@ -566,7 +576,7 @@ test.describe("Hide zero-match playlists filter (#411)", () => {
     await page.reload();
     await page.evaluate(() =>
       window.Alpine.$data(document.querySelector("[x-data]")).goToTab("playlists"));
-    await page.waitForTimeout(400);
+    await settled(page);
 
     await expect(page.getByRole("checkbox", { name: "Hide playlists with no local tracks" })).toBeChecked();
   });
@@ -622,18 +632,26 @@ test.describe("Playlists row Lidarr requests", () => {
     await expect(page.getByText("E2E Lidarr Playlist")).toBeVisible();
   }
 
-  const lidarrButton = (page) => page.getByRole("button", { name: /missing albums/ });
+  // Since #287 the toggle is an item of the row's Actions menu. The menu is
+  // opened first, so "hidden" below means the item is, not that the menu is
+  // closed.
+  async function lidarrButton(page) {
+    const actions = page.getByRole("button", { name: "Actions" });
+    if ((await actions.getAttribute("aria-expanded")) !== "true") await actions.click();
+    await expect(page.getByRole("menu")).toBeVisible();
+    return page.getByRole("menuitem", { name: /missing albums/ });
+  }
 
   test("without Lidarr configured the button is not there at all", async ({ page }) => {
     await gotoPlaylists(page);
     await seedLidarrRow(page, { lidarr_request_configured: false, lidarr_request_connected: false });
-    await expect(lidarrButton(page)).toBeHidden();
+    await expect(await lidarrButton(page)).toBeHidden();
   });
 
   test("with Lidarr connected but not fully configured the button is not there either", async ({ page }) => {
     await gotoPlaylists(page);
     await seedLidarrRow(page, { lidarr_request_configured: false });
-    await expect(lidarrButton(page)).toBeHidden();
+    await expect(await lidarrButton(page)).toBeHidden();
   });
 
   test("a playlist whose requests were on stays without button or error once Lidarr is gone", async ({ page }) => {
@@ -643,28 +661,28 @@ test.describe("Playlists row Lidarr requests", () => {
       lidarr_request_enabled: true, lidarr_request_last_error_code: "unset_target",
       lidarr_request_last_run_at: "2026-10-01T10:00:00Z",
     });
-    await expect(lidarrButton(page)).toBeHidden();
+    await expect(await lidarrButton(page)).toBeHidden();
     await expect(page.getByText(/Lidarr requests aren't set up/)).toBeHidden();
   });
 
   test("a playlist with nothing missing says so, not that its source lacks album data", async ({ page }) => {
     await gotoPlaylists(page);
     await seedLidarrRow(page, { matched_count: 10, unresolved_count: 0, lidarr_request_has_albums: false });
-    await expect(lidarrButton(page)).toBeDisabled();
-    await expect(lidarrButton(page)).toHaveAttribute("title", /^Nothing is missing/);
+    await expect(await lidarrButton(page)).toBeDisabled();
+    await expect(await lidarrButton(page)).toHaveAttribute("title", /^Nothing is missing/);
   });
 
   test("a playlist whose gaps carry no album keeps the source hint", async ({ page }) => {
     await gotoPlaylists(page);
     await seedLidarrRow(page, { lidarr_request_has_albums: false });
-    await expect(lidarrButton(page)).toBeDisabled();
-    await expect(lidarrButton(page)).toHaveAttribute("title", /source doesn't provide album information/);
+    await expect(await lidarrButton(page)).toBeDisabled();
+    await expect(await lidarrButton(page)).toHaveAttribute("title", /source doesn't provide album information/);
   });
 
   test("a playlist with gaps that carry albums can be switched on", async ({ page }) => {
     await gotoPlaylists(page);
     await seedLidarrRow(page, {});
-    await expect(lidarrButton(page)).toBeEnabled();
-    await expect(lidarrButton(page)).toHaveAttribute("title", /^Request this playlist's missing albums/);
+    await expect(await lidarrButton(page)).toBeEnabled();
+    await expect(await lidarrButton(page)).toHaveAttribute("title", /^Request this playlist's missing albums/);
   });
 });

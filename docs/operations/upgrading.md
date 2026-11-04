@@ -11,11 +11,22 @@ git pull && docker compose up -d --build
 ```
 
 Schema migrations run **automatically at startup** — there are no manual
-migration steps in the normal case.
+migration steps in the normal case. Each runs once, and the database records
+how far it has got, so an upgrade interrupted part-way carries on at the next
+start.
 
-!!! tip "Back up `DATA_DIR` first"
-    A backup taken *before* upgrading is your rollback point — see
-    [Backups & DATA_DIR](backups.md).
+!!! warning "Back up `DATA_DIR` first: there is no downgrade"
+    A backup taken *before* upgrading is your only rollback point — see
+    [Backups & DATA_DIR](backups.md). Once a newer release has migrated the
+    database, an older release refuses to start on it, and says so in one
+    line in the log:
+
+    ```
+    The database is at schema version 3, but this build of Trobar only knows versions up to 2. ...
+    ```
+
+    To go back, stop the server, restore the backup, then start the older
+    release.
 
 Sections below that need something from you say so up front; a section with no
 such flag needs nothing.
@@ -223,9 +234,9 @@ folder, or at `_shared/`, instead.
 ## Pairing shows a short code for every device (2.16.0)
 
 **Profile → Devices** now pairs every device with an 8-character code and
-its QR code, valid for an hour: **Re-pair in app** on an existing device,
-and the dialog after **Create device** for a DAP, removable storage or a
-local folder. **Regenerate + QR**, which showed the device's raw token, is
+its QR code, valid for an hour: **Re-pair in app** on an
+existing device, and the dialog after **Create device** for a DAP, removable
+storage or a local folder. **Regenerate + QR**, which showed the device's raw token, is
 gone.
 
 **Action needed for the desktop app.** trobar-desktop v0.11.0, the current
@@ -236,3 +247,104 @@ issues a new token, shown as a QR code and a downloadable
 immediately. A desktop release that reads codes will make this step
 unnecessary. Cards already paired keep working; nothing changes for them
 until they're paired again.
+
+## Pairing codes last 20 minutes (2.17.0)
+
+A pairing code is now valid for 20 minutes, not an hour. A code you made and
+haven't used is simply made again. Nothing is needed from you.
+
+## Playlists match by MusicBrainz recording id; a one-time tag re-read (2.17.0)
+
+Playlist entries now also match on the **MusicBrainz recording id**: the one a
+tagger such as MusicBrainz Picard writes into your files, and the one Jellyfin
+and Navidrome report for a playlist's songs. A song renamed or re-titled on one
+side still finds its file, as long as both sides carry the id.
+
+Nothing is needed from you. After the upgrade, a background job named
+`mbid_backfill` re-reads the tags of every file in the library once, to pick up
+ids from files scanned before this release; follow it under
+**Administration → Background jobs**. It only reads tags (no audio decoding,
+nothing sent anywhere), and it runs in the same queue lane as a library scan,
+so the two never overlap. On a large library it takes a while, the first time
+only. Files without MusicBrainz tags are simply matched the way they were
+before.
+
+## The first library scan reads every file once (2.17.0)
+
+Trobar now records each track's **album artist**: the file's `albumartist`
+tag, or "Various Artists" for an untagged album whose tracks name several
+artists. It's what the library will group compilations under.
+
+Nothing is needed from you, but expect the **first library scan after the
+upgrade** (yours or the scheduled one) to take longer than usual: it opens
+every file once to read that tag, about as long as a full rescan. Later scans
+are back to normal. Until that first scan has run, no album is taken for a
+compilation.
+
+## ALAC in `.m4a` is now transcoded (2.17.0)
+
+An `.m4a` file can hold lossless ALAC or lossy AAC. Trobar used to copy every
+`.m4a` as it was; now the library scan reads which one a file holds, and a
+device set to an MP3 format gets ALAC transcoded, like FLAC.
+
+Nothing is needed from you. The first library scan after the upgrade opens
+each `.m4a` file once to find out. A device set to MP3 that already holds ALAC
+tracks as `.m4a` is then sent them again as `.mp3`: expect those tracks to
+download once more. The old `.m4a` files are left on the device: the desktop
+app offers to delete them as files Trobar no longer expects there, and on
+Android they stay until you delete them. Devices that take original files are
+not affected.
+
+## New downloads go into album-artist folders (2.17.0)
+
+Music sent to a device from now on is filed under its album artist:
+`Various Artists/Now 42/…` for a compilation instead of one folder per
+performer, and a guest track in its album's folder. Nothing already on a
+device moves or downloads again: each file keeps the name it was delivered
+under, and the server records that name for every file a device held before
+the upgrade. A device that sends its file list (a reinstall, a first pairing
+with files already on the card) is recognised under either layout.
+
+## An album selection includes the album's guest tracks (2.17.0)
+
+An album you selected now also includes its tracks that credit another
+artist (a featured guest) but are tagged with the album's own album artist.
+They used to show in the Library as a separate one-track "album" under the
+guest's name, and weren't part of the selection. Expect those tracks to
+download once to the devices that select the album. Nothing is removed, and
+selections of a single performer's tracks on a compilation keep exactly the
+tracks they have.
+
+## The Library groups albums by album artist; an artist selection includes theirs (2.17.0)
+
+The web Library now lists each album under its **album artist**: a compilation
+appears once, under Various Artists (or its `albumartist` tag), with all its
+tracks, and a guest track sits with the rest of its album. An artist's page
+shows, under **Also appears on**, the albums by others that they play on;
+selecting one of those syncs only their tracks on it. The phone app's library
+keeps the old grouping for now.
+
+An **artist selection** now also includes every track of the albums that
+artist is the album artist of. Selecting "Various Artists" selects every
+compilation. For an artist you selected before, their guest tracks on their own
+albums (tracks credited "X feat. Y" on X's album) join the selection: expect
+those to download once. Nothing is removed.
+
+
+## Going back to 2.16.0 needs the backup (2.17.0)
+
+2.17.0 is the first release that records how far the database has been
+migrated, and its migrations change the database 2.16.0 knew, including one
+that records setup as done on an install older than the setup wizard. 2.16.0
+predates that record, so it does **not** refuse a database 2.17.0 has
+migrated: it doesn't check, and would start on it. To go back to 2.16.0, stop
+the server and restore the backup taken before upgrading, as the warning at
+the top of this page says. From 2.17.0 on, an older release refuses a newer
+database with the one-line message shown there.
+
+## OIDC login requires the nonce (2.17.0)
+
+**Action needed if you sign in through OIDC** with a provider that doesn't
+return the nonce. OIDC login now requires the identity provider to return the
+nonce. A provider that doesn't will refuse logins. Standard providers,
+Authentik included, are not affected.

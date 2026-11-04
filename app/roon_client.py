@@ -17,6 +17,7 @@ returned as (artist, title) only. Resolving them to an actual file on disk is
 the caller's job (see matching.py), using the locally-scanned `tracks` table.
 """
 
+import logging
 import os
 import socket
 import threading
@@ -28,6 +29,9 @@ from roonapi import RoonApi
 from roonapi.roonapi import RoonApiException
 
 import db
+from artist_image_keys import ArtistImageKeys
+
+_log = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 TOKEN_FILE = DATA_DIR / "roon_token.json"
@@ -90,8 +94,40 @@ def _current_host_port() -> tuple[str, int]:
         conn.close()
 
 
+def _is_active() -> bool:
+    """Whether Roon is the library source, as web_common._active_provider_id
+    reads it: an unset provider means Roon."""
+    conn = db.get_conn()
+    try:
+        return (db.get_config(conn, "provider") or "roon") == "roon"
+    finally:
+        conn.close()
+
+
+def _stop_locked() -> None:
+    """Ends the connection and the library's retry loop. RoonApi keeps
+    reconnecting until it's told to stop, so a connection that is only dropped
+    goes on trying for as long as the process lives. stop() can raise on a
+    socket that never opened, and by then _exit is set, so that's the end of it."""
+    global _roon
+    old, _roon = _roon, None
+    if old is not None:
+        try:
+            old.stop()
+        except Exception as e:  # pylint: disable=broad-except
+            _log.debug("stopping the Roon connection: %s", e)
+
+
+def stop() -> None:
+    """Stops talking to Roon, for a switch away from it. The address and the
+    pairing token stay, so switching back needs no new approval."""
+    with _conn_lock:
+        _stop_locked()
+
+
 def _connect_locked() -> None:
     global _roon, _last_connect_attempt
+    _stop_locked()
     _last_connect_attempt = time.time()
     token = _load_token()
     host, port = _current_host_port()
@@ -103,7 +139,7 @@ def _connect_locked() -> None:
     try:
         _roon = RoonApi(APP_INFO, token, host, port, blocking_init=False)
     except RoonApiException as e:
-        print(f"[roon_client] connect failed: {e}")
+        _log.warning("connect failed: %s", e)
         _roon = None
 
 
@@ -116,16 +152,19 @@ def ensure_started() -> None:
 
 
 def status() -> dict:
+    """The connection's state. `active` is false when Roon isn't the library
+    source: disconnected then is the normal state, and nothing here connects."""
     host, port = _current_host_port()
+    active = _is_active()
     with _conn_lock:
         if _roon is None:
-            return {"state": "disconnected", "host": host, "port": port, "provider": "roon"}
+            return {"state": "disconnected", "host": host, "port": port, "provider": "roon", "active": active}
         if _roon.ready and _roon.token:
             if _load_token() != _roon.token:
                 _save_token(_roon.token)
             return {"state": "paired", "host": host, "port": port,
-                     "core_name": _roon.core_name, "provider": "roon"}
-        return {"state": "pending_approval", "host": host, "port": port, "provider": "roon"}
+                     "core_name": _roon.core_name, "provider": "roon", "active": active}
+        return {"state": "pending_approval", "host": host, "port": port, "provider": "roon", "active": active}
 
 
 def retry_pairing() -> dict:
@@ -151,12 +190,9 @@ def test_connection(host: str, port: int) -> dict:
         return {"state": "disconnected", "host": host, "port": port, "provider": "roon"}
 
 
-def reconnect(host: str, port: int) -> dict:
-    """Admin changed the Roon host/port from the web UI — persist it and
-    force a fresh connection attempt against the new address. Reuses the
-    existing pairing token as-is: Roon ties that to the Core's identity, not
-    the address it's reachable at, same as how Roon Remote apps shrug off a
-    Core's IP changing on the LAN."""
+def store_address(host: str, port: int) -> None:
+    """Keeps the address without connecting, for a Save while Roon isn't the
+    library source: the page sends its whole config on every Save."""
     conn = db.get_conn()
     try:
         db.set_config(conn, "roon_host", host)
@@ -164,6 +200,16 @@ def reconnect(host: str, port: int) -> dict:
         conn.commit()
     finally:
         conn.close()
+
+
+def reconnect(host: str, port: int) -> dict:
+    """Admin changed the Roon host/port from the web UI — persist it and
+    force a fresh connection attempt against the new address. Reuses the
+    existing pairing token as-is: Roon ties that to the Core's identity, not
+    the address it's reachable at, same as how Roon Remote apps shrug off a
+    Core's IP changing on the LAN. A switch to Roon comes through here too,
+    which is what connects it without a restart."""
+    store_address(host, port)
     with _conn_lock:
         _connect_locked()
     time.sleep(0.5)
@@ -406,8 +452,7 @@ _ARTISTS_MENU_PATHS = (("Library", "Artists"), ("Artists",))
 
 # artist title -> image_key, built once per process lifetime (not per
 # lookup — see _get_artist_image_key_map's docstring for why that matters).
-_artist_image_key_map: dict[str, str] | None = None
-_artist_image_key_map_lock = threading.Lock()
+_artist_image_key_map = ArtistImageKeys()
 
 
 def _build_artist_image_key_map(roon: RoonApi) -> dict[str, str]:
@@ -446,11 +491,7 @@ def _get_artist_image_key_map(roon: RoonApi) -> dict[str, str]:
     out or were abandoned long before their turn came up. Confirmed directly
     against the real Roon Core, not just suspected — logs showed image
     requests completing roughly one per second."""
-    global _artist_image_key_map
-    with _artist_image_key_map_lock:
-        if _artist_image_key_map is None:
-            _artist_image_key_map = _build_artist_image_key_map(roon)
-        return _artist_image_key_map
+    return _artist_image_key_map.get(lambda: _build_artist_image_key_map(roon))
 
 
 def get_artist_image(artist_name: str) -> tuple[bytes, str] | None:

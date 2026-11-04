@@ -54,6 +54,7 @@ import acoustid
 
 import db
 import jobs
+import track_merge
 
 _log = logging.getLogger(__name__)
 
@@ -154,7 +155,7 @@ def _pending_track_rows(device_id: int) -> list:
         conn.close()
 
 
-def ensure_device_fingerprints(device_id: int) -> dict:
+def ensure_device_fingerprints(device_id: int, report=None) -> dict:
     """Computes and persists tracks.fingerprint for up to _BATCH_LIMIT of
     this device's tracks that don't have one. Returns
     {"checked": n, "computed": n}, or {..., "already_running": True} if a
@@ -170,6 +171,11 @@ def ensure_device_fingerprints(device_id: int) -> dict:
         root = db.get_music_root()
         checked = computed = 0
         for row in rows:
+            # _compute_one commits each track on its own connection, so this
+            # is between commits: a cancel here leaves every track before it
+            # done and the rest pending.
+            if report is not None:
+                report(checked, len(rows))
             checked += 1
             if _compute_one(root, row["id"], row["relative_path"]):
                 computed += 1
@@ -178,7 +184,7 @@ def ensure_device_fingerprints(device_id: int) -> dict:
         _PROVENANCE_LOCK.release()
 
 
-def run_device_fingerprints_job(payload: dict, _report=None) -> dict:
+def run_device_fingerprints_job(payload: dict, report=None) -> dict:
     """#297 job handler for JOB_TYPE_DEVICE_FINGERPRINTS. Thin adapter over
     ensure_device_fingerprints — same shape as scanner.run_job wrapping
     _scan_library: the payload/report calling convention lives here, kept
@@ -188,7 +194,7 @@ def run_device_fingerprints_job(payload: dict, _report=None) -> dict:
     device_id = (payload or {}).get("device_id")
     if device_id is None:
         raise ValueError("provenance_device_fingerprints requires a device_id in its payload")
-    return ensure_device_fingerprints(device_id)
+    return ensure_device_fingerprints(device_id, report)
 
 
 def _clean_duration(value) -> float | None:
@@ -209,7 +215,7 @@ def _clean_duration(value) -> float | None:
 
 def _compute_one(root, track_id: int, relative_path: str) -> bool:
     """Own short transaction per track, never one long one — same principle
-    as scanner.py's periodic commits and fingerprint._resolve_one's. Returns
+    as scanner.py's commit per file and fingerprint._resolve_one's. Returns
     True iff a fingerprint was computed and persisted."""
     try:
         duration, raw_fingerprint = acoustid.fingerprint_file(
@@ -234,15 +240,11 @@ def _compute_one(root, track_id: int, relative_path: str) -> bool:
         # keeps `pending` above zero forever and, in bulk, starves every
         # fingerprintable track behind it.
         _log.warning("fingerprinting failed for %s", relative_path, exc_info=True)
-        conn = db.get_conn()
-        try:
+        with db.write() as conn:
             conn.execute(
                 "UPDATE tracks SET fingerprint_failed_at = datetime('now') WHERE id = ?",
                 (track_id,),
             )
-            conn.commit()
-        finally:
-            conn.close()
         return False
 
     # pyacoustid hands back ASCII bytes, not str. Decode before storing:
@@ -467,7 +469,16 @@ def ensure_library_fingerprints(_payload: dict | None = None, report=None) -> di
                 remaining = still_pending
                 break
             remaining = still_pending
-        return {"checked": checked, "computed": computed, "remaining": remaining}
+        merged = 0
+        if computed:
+            # New fingerprints can say a vanished track and a new one are the
+            # same audio: a file the scan couldn't match as moved.
+            conn = db.get_conn()
+            try:
+                merged = track_merge.merge_moved_tracks(conn)
+            finally:
+                conn.close()
+        return {"checked": checked, "computed": computed, "remaining": remaining, "merged": merged}
     finally:
         _PROVENANCE_LOCK.release()
 
@@ -544,13 +555,15 @@ def _rematch_one(conn, root, device_id: int, row, library_incomplete: bool) -> s
         return "unmatched"
 
     # Believed. Mark it held so it isn't re-downloaded — same upsert
-    # record_device_manifest uses for its own path-based matches.
+    # record_device_manifest uses for its own path-based matches, recording
+    # the path the device holds it under for a later deletion.
     conn.execute(
-        "INSERT INTO device_track_state (device_id, track_id, status) "
-        "VALUES (?, ?, 'downloaded') "
+        "INSERT INTO device_track_state (device_id, track_id, status, delivered_path) "
+        "VALUES (?, ?, 'downloaded', ?) "
         "ON CONFLICT(device_id, track_id) DO UPDATE SET "
-        "  status = 'downloaded', updated_at = datetime('now')",
-        (device_id, candidate["id"]),
+        "  status = 'downloaded', delivered_path = excluded.delivered_path, "
+        "  updated_at = datetime('now')",
+        (device_id, candidate["id"], row["path"]),
     )
     conn.execute(
         "UPDATE device_provenance SET state = 'matched', matched_track_id = ? "
@@ -565,7 +578,7 @@ def _rematch_one(conn, root, device_id: int, row, library_incomplete: bool) -> s
     return "matched"
 
 
-def rematch_device(payload: dict | None = None, _report=None) -> dict:
+def rematch_device(payload: dict | None = None, report=None) -> dict:
     """#297 job handler for JOB_TYPE_REMATCH. Rematches up to _BATCH_LIMIT of
     one device's pushed provenance rows by fingerprint.
 
@@ -615,7 +628,11 @@ def rematch_device(payload: dict | None = None, _report=None) -> dict:
             conn.close()
 
         matched = unmatched = deferred = 0
-        for row in rows:
+        for done, row in enumerate(rows):
+            # Before the row's connection opens, so a cancel stops between two
+            # rows' commits; the rows left stay pending for the next pass.
+            if report is not None:
+                report(done, len(rows))
             # Own short transaction per row, same principle as _compute_one:
             # a long recovery must leave partial progress durable.
             conn = db.get_conn()

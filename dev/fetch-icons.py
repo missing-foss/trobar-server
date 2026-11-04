@@ -41,6 +41,15 @@ ICONS = {
     # #218: local-folder sync targets, distinct from a removable SD/USB
     # device -- same glyph as provider-filesystem (also lucide:folder).
     "device-folder": "lucide:folder",
+    # #266: the empty states' pictures (Library, its search, Users).
+    "empty-library": "lucide:music",
+    "empty-search": "lucide:search",
+    "empty-users": "lucide:users",
+    # #287: a playlist row's Actions menu and its items.
+    "action-menu": "lucide:ellipsis-vertical",
+    "action-edit": "lucide:pencil",
+    "action-download": "lucide:download",
+    "action-delete": "lucide:trash",  # trash-2 is an alias of it now
     # providers (header status badge). Brand glyphs, nominative
     # interoperability use: an all-generic set made the badges
     # indistinguishable from each other.
@@ -103,6 +112,9 @@ ICONS = {
     # glyph already used for source_provider/inferred_origin_provider so
     # "mirrored TO here" doesn't read as "came FROM here".
     "mirror-hand": "lucide:hand-helping",
+    # A playlist added by a public link: the same link the phone's button
+    # for those links carries, beside the provider glyph.
+    "public-link": "lucide:link",
 }
 
 OUT = Path(__file__).resolve().parent.parent / "app" / "static" / "js" / "icons.js"

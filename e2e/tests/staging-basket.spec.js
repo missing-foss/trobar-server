@@ -4,6 +4,7 @@
 
 // @ts-check
 const { test, expect } = require("@playwright/test");
+const { trackFetches, settled } = require("../support/settle");
 
 // #303/#501: the cross-surface staging basket, now per-device. Drives the
 // real API (server-persisted, so this also proves the backend round-trip,
@@ -31,10 +32,11 @@ function appData(page, fn, arg) {
 }
 
 async function gotoHome(page) {
+  await trackFetches(page);
   await page.goto("/#/home");
   await page.evaluate(() =>
     window.Alpine.$data(document.querySelector("[x-data]")).goToTab("home"));
-  await page.waitForTimeout(400);
+  await settled(page);
 }
 
 async function stage(page, type, target, deviceId) {
@@ -53,6 +55,62 @@ test.describe("cross-surface staging basket (#303/#501)", () => {
   // it's a backstop so a leak anywhere doesn't cascade into failures here.
   test.beforeEach(async ({ page }) => {
     await page.request.delete("/api/basket");
+  });
+
+  /** Holds GET /api/basket answers from now on; hold.release(i) lets the i-th go. */
+  async function holdBasketLoads(page) {
+    const held = [];
+    await page.route("**/api/basket", async (route) => {
+      if (route.request().method() !== "GET") return route.fallback();
+      // The slot is taken before the fetch, so held is in request order: two
+      // fetches can finish in either order.
+      const released = new Promise((resolve) => { held.push(resolve); });
+      const response = await route.fetch();
+      await released;
+      await route.fulfill({ response });
+    });
+    return {
+      release: (i) => held[i](),
+      seen: async (n) => expect.poll(() => held.length).toBeGreaterThanOrEqual(n),
+    };
+  }
+
+  test("an older basket answer arriving last doesn't bring sent items back", async ({ page }) => {
+    const device = await (await page.request.post("/api/devices", { data: { name: "basket-race-device" } })).json();
+    await stage(page, "album", "E2E Artist||E2E Album", device.id);
+    await gotoHome(page);
+    const basketButton = page.locator('[title="Basket"]');
+    await expect(basketButton).toHaveText("1");
+    await basketButton.click();
+    const hold = await holdBasketLoads(page);
+    // The older load: read before the send, answered after it.
+    await page.evaluate(() => { window.olderLoad = window.Alpine.store("basket").load(); });
+    await hold.seen(1);
+    await page.getByRole("button", { name: "Send" }).click();
+    await hold.seen(2);
+    hold.release(1);
+    await expect(basketButton).toBeHidden();
+    hold.release(0);
+    await page.evaluate(() => window.olderLoad);
+    await expect(basketButton).toBeHidden();
+    expect(await page.evaluate(() => window.Alpine.store("basket").count)).toBe(0);
+    await page.request.delete(`/api/devices/${device.id}`);
+  });
+
+  test("an older load finishes only when the newest has", async ({ page }) => {
+    await gotoHome(page);
+    const hold = await holdBasketLoads(page);
+    await page.evaluate(() => {
+      window.done = [];
+      window.Alpine.store("basket").load().then(() => window.done.push("older"));
+      window.Alpine.store("basket").load().then(() => window.done.push("newest"));
+    });
+    await hold.seen(2);
+    hold.release(0);
+    await page.waitForTimeout(200);
+    expect(await page.evaluate(() => window.done)).toEqual([]);
+    hold.release(1);
+    await expect.poll(() => page.evaluate(() => window.done.length)).toBe(2);
   });
 
   test("items staged for one device accumulate in its section, and sending it creates one selection per item", async ({ page }) => {
@@ -388,6 +446,8 @@ test.describe("cross-surface staging basket (#303/#501)", () => {
     // "not visible" immediately after click() would trivially pass on
     // BOTH the buggy and fixed code, since the DOM hasn't reacted to
     // either yet at that instant.
+    // Clear asks first; this test is about what happens once it's agreed.
+    page.once("dialog", (dialog) => dialog.accept());
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/basket") && r.request().method() === "DELETE"),
       page.getByRole("button", { name: "Clear" }).click(),

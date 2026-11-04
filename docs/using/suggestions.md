@@ -16,14 +16,45 @@ everywhere**:
 
 Suggestions work regardless of your library provider — including on
 [Filesystem](../providers/filesystem.md) — because listening data comes from
-Last.fm/ListenBrainz/Maloja and your own library, not from the provider. With
-more than one set up, their suggestions merge, one copy per album.
+Last.fm/ListenBrainz/Maloja, plays kept from your own devices while you have
+that switched on, and your own library, not from the provider. With more than one set up, their suggestions
+merge, one copy per album.
 
-## Listening history is read-only
+**Most played over** sets the period top-played draws on: the last 7 days,
+month, 3 months, 6 months (the default), year, or all time. The home
+**Most played** widget has the same control; the choice is remembered in your
+browser and shared by both.
 
-Trobar **only ever reads** listening history — nothing here submits a scrobble
-anywhere. Each user can set a personal Last.fm key in their profile; the admin
-can set an app-wide fallback key (`LASTFM_API_KEY`).
+**Plays from your devices** are one of those sources, if you want them. Turn on
+**Keep plays from my devices** on your Profile, and what your devices report feeds
+your own Suggestions and Most played. With it off, stored plays stay stored but
+aren't used, until you delete them. Nothing is kept unless you turn it on.
+
+**When a source doesn't answer**, the tab says so above what the others found
+("Last.fm didn't answer, so its most-played albums are missing below"), with
+**Retry**. If nothing is left to show, the notice takes the place of the
+empty grid, so an outage never reads as "nothing played". **Refresh** and
+**Retry** also refresh the source dots at the top of the page.
+
+What the services answer is kept for five minutes, so moving between tabs
+doesn't wait on them each time; **Refresh** and **Retry** always ask them
+again. A source that didn't answer isn't kept: the next look asks it again.
+Which albums are already on your devices is worked out fresh every time.
+
+## Reading and sending listening history
+
+Trobar reads your listening history from these services. It sends to them only
+if you ask it to, and only from your own devices' plays: keep plays from your
+devices, then turn on **Also send my plays to** for Maloja, ListenBrainz or
+Last.fm on your Profile. Last.fm needs **Connect Last.fm** first, once an admin
+has set it up. Each is a switch of its own, off until you turn it on. It sends
+plays from then on, once each, and never your older history. Turn off keeping
+plays and sending stops too.
+
+Each user can set a personal Last.fm key in their profile. A user without one
+uses the admin's
+[**Default Last.fm API key**](../administration.md#api-keys), and, if that
+is empty too, the deployment's `LASTFM_API_KEY` environment variable.
 
 ## Pointing at self-hosted services
 

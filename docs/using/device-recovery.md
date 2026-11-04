@@ -71,12 +71,13 @@ cooperation needed from either device:
 
 1. Pair the new device normally first (it needs to already exist before you
    can transfer anything onto it).
-2. On the new device's card in **Profile → Devices**, click **"Replaces…"**
+2. On the new device's card on the **Devices** tab, click **"Replaces…"**
    and pick the old device from the list.
 3. Confirm. The new device inherits the old one's assigned selections and
    per-device settings (transcode format, storage limit, auto-fit, artist
-   pictures), and the old device is deleted — its token stops working
-   immediately.
+   pictures, *Keep device content*, what a watch plays), and its Home
+   widgets unless the new device already has its own. The old device is
+   deleted — its token stops working immediately.
 
 By default, the tracks the old device held are marked to **re-download
 fresh** on the new device, rather than assumed already present — the safe
@@ -98,11 +99,13 @@ this server-side one. It's also the only mechanism for genuine loss or theft:
 the physical files are gone either way, but the household doesn't have to
 re-configure what should sync to the replacement from scratch.
 
-Only the device's owner or an admin can perform a transfer, and touching two
-devices with different owners (an admin re-homing devices between household
-members) requires admin either way — one person managing their own delegated
-device can't use this to redirect someone else's synced content onto their
-own hardware.
+Anyone who can manage both devices can transfer between two devices of the
+same owner: the owner, an admin, or someone an admin has given
+[delegated management](delegation.md) of the owner's devices (helping a
+household member onto a new phone). Two devices with
+different owners (an admin re-homing devices between household members)
+require admin, so someone with delegated access can't use this to move
+another person's synced content onto their own hardware.
 
 !!! note "Complementary, not overlapping, with the DB-loss case above"
     A household hitting both at once — a fresh server database *and* a
@@ -155,7 +158,7 @@ unneeded .
 
 A **dying or already-dead card** is a different situation — there's nothing
 left to move. That's the [device-to-device transfer](#client-replaced-server-intact)
-case instead: pair the new card fresh, then use "Replaces…" from the old
-card's entry to carry over its selections and settings; the files themselves
+case instead: pair the new card fresh, then use "Replaces…" on the new
+card's entry and pick the old card, to carry over its selections and settings; the files themselves
 need a full re-sync onto the new card, same as any other replaced device
 where "already has these files" is left unchecked.

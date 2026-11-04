@@ -148,9 +148,18 @@ class GetPlaylistTracksTests(unittest.TestCase):
             result = spotify_client.get_playlist_tracks(
                 "PL", source_playlist_id="pl1", access_token="at1")
         self.assertEqual(result["tracks"], [
-            {"position": 0, "artist": "Artist A", "title": "First", "album": "Album A"},
-            {"position": 1, "artist": "Artist B", "title": "Second", "album": "Album B"}])
+            {"position": 0, "artist": "Artist A", "title": "First", "album": "Album A", "isrc": None},
+            {"position": 1, "artist": "Artist B", "title": "Second", "album": "Album B", "isrc": None}])
         self.assertIn("/playlists/pl1/items", get.call_args[0][0])  # #146: /items, not /tracks
+
+    def test_passes_the_tracks_isrc_through(self):
+        item = _track_item("First", "Artist A", "Album A")
+        item["track"]["external_ids"] = {"isrc": "GBAYE0601498"}
+        broken = _track_item("Second", "Artist B", "Album B")
+        broken["track"]["external_ids"] = ["not", "a", "dict"]
+        with mock.patch("requests.get", return_value=_resp(json_body=_tracks_page([item, broken]))):
+            result = spotify_client.get_playlist_tracks("PL", source_playlist_id="pl1", access_token="at1")
+        self.assertEqual([t["isrc"] for t in result["tracks"]], ["GBAYE0601498", None])
 
     def test_skips_null_track_and_episode_keeping_contiguous_positions(self):
         page = _tracks_page([
@@ -222,7 +231,7 @@ class RetryAndTruncationTests(unittest.TestCase):
         with mock.patch("time.sleep"), \
                 mock.patch("requests.get", return_value=_resp(status_code=404)) as get:
             result = spotify_client.list_playlists("at1")
-        self.assertEqual(result, {"status": "error", "reason": "http_error"})
+        self.assertEqual(result, {"status": "error", "reason": "http_404"})
         self.assertEqual(get.call_count, 1)
 
     def test_max_pages_truncation_logs_a_warning(self):

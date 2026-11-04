@@ -29,9 +29,20 @@ track has finished transcoding.
 Concurrency and CPU priority are admin-configurable (Administration >
 Transcoding, app_config keys transcode_concurrency/transcode_nice_level)
 rather than hardcoded — transcoding is CPU-heavy and must never crowd out
-everything else running alongside this container. This is resource
-hygiene, not crash prevention: a request blocks until a slot frees up
-rather than being rejected.
+everything else running alongside this container. A request waits for a
+free slot for up to SLOT_WAIT_SECONDS and is then answered 503 with
+Retry-After, and an encode that runs past ENCODE_TIMEOUT_SECONDS is
+killed: neither a busy server nor a hung ffmpeg may hold a web thread or a
+slot for ever.
+
+Finished transcodes are kept on disk under DATA_DIR/transcode, one file per
+track, source modification time and format, so a re-sync, a retry or a
+second device with the same format is served the file instead of encoding
+the same track again. The cache is capped (Administration > Transcoding,
+app_config key transcode_cache_gb, DEFAULT_CACHE_GB unless set; 0 keeps
+nothing), and the least recently served files go first. A file whose source
+changes gets a new name, so a stale encode is never served; the old one
+ages out like any other.
 """
 import logging
 import os
@@ -39,6 +50,8 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
+from pathlib import Path
 
 _log = logging.getLogger(__name__)
 
@@ -46,6 +59,12 @@ BITRATES = {"mp3_320": "320k", "mp3_256": "256k", "mp3_192": "192k", "mp3_128": 
 
 _cond = threading.Condition()
 _active = 0
+
+
+DEFAULT_CACHE_GB = 2
+_CACHE_DIR_NAME = "transcode"
+_TEMP_PREFIX = "trobar-transcode-"
+_evict_lock = threading.Lock()
 
 
 class TranscodeStartError(Exception):
@@ -56,16 +75,29 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def acquire_slot(limit: int) -> None:
-    """Blocks until fewer than `limit` transcodes are running. `limit` is
-    read fresh by the caller on every call (not fixed at process start),
-    so an admin's change to the concurrency setting takes effect on the
-    next request — no restart, no resizing a fixed-size Semaphore."""
+# How long a request waits for a free transcode slot before it is answered
+# 503 with Retry-After, and how long one encode may run before it is killed.
+# Each waiting request holds one of the server's few web threads, and one
+# hung ffmpeg would otherwise hold its slot, and every device waiting on it,
+# for ever. ffmpeg encodes MP3 many times faster than real time, so ten
+# minutes is far beyond any track.
+SLOT_WAIT_SECONDS = 60
+ENCODE_TIMEOUT_SECONDS = 600
+
+
+def acquire_slot(limit: int, timeout: float | None = None) -> bool:
+    """Waits until fewer than `limit` transcodes are running and takes a
+    slot; returns False, holding none, if `timeout` seconds pass first
+    (None waits for ever). `limit` is read fresh by the caller on every call
+    (not fixed at process start), so an admin's change to the concurrency
+    setting takes effect on the next request — no restart, no resizing a
+    fixed-size Semaphore."""
     global _active
     with _cond:
-        while _active >= max(1, limit):
-            _cond.wait()
+        if not _cond.wait_for(lambda: _active < max(1, limit), timeout=timeout):
+            return False
         _active += 1
+        return True
 
 
 def release_slot() -> None:
@@ -75,24 +107,111 @@ def release_slot() -> None:
         _cond.notify()
 
 
-def start(abs_path, transcode_format: str, nice_level: int) -> tuple[subprocess.Popen, str, str]:
+def cache_dir(data_dir) -> Path:
+    return Path(data_dir) / _CACHE_DIR_NAME
+
+
+def cache_path(data_dir, track_id: int, source_mtime_ns: int, transcode_format: str) -> Path:
+    """Where this track's transcode in this format is kept. The source's
+    modification time is part of the name, so a re-tagged or replaced file
+    is encoded afresh instead of being served its old transcode."""
+    return cache_dir(data_dir) / f"{track_id}-{source_mtime_ns}-{transcode_format}.mp3"
+
+
+def cache_hit(path: Path) -> bool:
+    """True when `path` holds a finished transcode. Marks it used now, which
+    is what eviction orders by: in its access time, not its modification
+    time, which send_file builds the ETag and Last-Modified from."""
+    try:
+        os.utime(path, ns=(time.time_ns(), path.stat().st_mtime_ns))
+    except OSError:
+        return False
+    return True
+
+
+def keep(out_path: str, err_path: str, final_path: Path, cap_bytes: int) -> bool:
+    """Moves a finished transcode (wait_for() returned True) into the cache,
+    then removes the stderr log, releases the slot and evicts down to
+    `cap_bytes`. False, with everything left as it was, when the move fails:
+    the caller then streams it with iter_file() as if there were no cache.
+    out_path must be in final_path's directory (see start's out_dir), so the
+    move is a rename and a reader never sees half a file."""
+    try:
+        os.replace(out_path, final_path)
+    except OSError:
+        _log.warning("could not keep the transcode %s", final_path, exc_info=True)
+        return False
+    _cleanup(err_path)
+    evict(final_path.parent, cap_bytes, spare=final_path)
+    return True
+
+
+def evict(directory: Path, cap_bytes: int, spare: Path | None = None) -> None:
+    """Removes the least recently used transcodes until the rest fit in
+    `cap_bytes` (0 removes them all). `spare`, the file about to be served,
+    is never removed, even when it alone is over the cap. Also removes
+    encodes a crash left half written, once they are older than any encode
+    may run; a newer one may still be in progress and is left alone."""
+    with _evict_lock:
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            return
+        kept = []
+        stale_before = time.time() - 2 * ENCODE_TIMEOUT_SECONDS
+        for entry in entries:
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            if entry.name.startswith(_TEMP_PREFIX):
+                if stat.st_mtime < stale_before:
+                    _remove(entry.path)
+            elif entry.name.endswith(".mp3") and (spare is None or entry.path != str(spare)):
+                kept.append((stat.st_atime, stat.st_size, entry.path))
+        total = sum(size for _atime, size, _path in kept)
+        if spare is not None:
+            try:
+                total += spare.stat().st_size
+            except OSError:
+                pass
+        for _atime, size, path in sorted(kept):
+            if total <= cap_bytes:
+                break
+            _remove(path)
+            total -= size
+
+
+def _remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def start(abs_path, transcode_format: str, nice_level: int,
+          out_dir: Path | None = None) -> tuple[subprocess.Popen, str, str]:
     """Starts ffmpeg transcoding abs_path to transcode_format into a fresh
     temp file (see module docstring for why not stdout/pipe:1) and returns
     (proc, out_path, err_path). stderr is captured to its own temp file,
     not a pipe: a review of an earlier version of this fix caught that a
     PIPE nobody reads is a deadlock waiting to happen — ffmpeg blocks
-    writing to a full ~64KB pipe buffer, iter_output()'s proc.wait() never
+    writing to a full ~64KB pipe buffer, wait_for()'s proc.wait() never
     returns, the concurrency slot is never released, and with the default
     transcode_concurrency=1 that one hang wedges every future transcode. A
     file can't fill up like that, and unlike the old discard-it-unread
     PIPE, it's actually readable afterwards for diagnosing a failure (see
-    iter_output). Caller must already hold a concurrency slot
+    wait_for). Caller must already hold a concurrency slot
     (acquire_slot) and is responsible for releasing it, and for removing
     out_path/err_path, once the process is fully drained or killed (see
-    iter_output — it does all of this)."""
-    fd, out_path = tempfile.mkstemp(suffix=".mp3", prefix="trobar-transcode-")
+    wait_for and iter_file — they do all of this). With `out_dir`, the
+    output is written there instead of the system temp directory, so keep()
+    can move it into the cache with a rename."""
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    fd, out_path = tempfile.mkstemp(suffix=".mp3", prefix=_TEMP_PREFIX, dir=out_dir)
     os.close(fd)
-    err_fd, err_path = tempfile.mkstemp(suffix=".log", prefix="trobar-transcode-")
+    err_fd, err_path = tempfile.mkstemp(suffix=".log", prefix=_TEMP_PREFIX)
     cmd = [
         "nice", "-n", str(nice_level),
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -117,49 +236,77 @@ def start(abs_path, transcode_format: str, nice_level: int) -> tuple[subprocess.
     return proc, out_path, err_path
 
 
-def iter_output(proc: subprocess.Popen, out_path: str, err_path: str):
-    """Waits for ffmpeg to finish writing out_path, then streams the
-    finished file back in chunks (a Flask Response generator). Nothing
-    can be safely read before ffmpeg exits — the ID3v2 tag on disk is
-    only correct once ffmpeg has seeked back and patched its size field
-    in, right at the end (see module docstring). One consequence: unlike
-    the old stdout-pipe version, a client disconnecting *during* the wait
-    has no way to interrupt it (there's no yield point to receive that
-    signal until ffmpeg is already done) — the transcode just runs to
-    completion on an abandoned connection instead of being killed early.
-    Rare and not a correctness/deadlock risk (the slot still frees itself
-    right after), just a minor CPU-efficiency cost, accepted as part of
-    this fix. Always cleans up: kills the process if it's somehow still
-    running when we're done (belt-and-suspenders — proc.wait() above
-    means it never should be), removes both temp files, and releases the
-    concurrency slot."""
+def wait_for(proc: subprocess.Popen, out_path: str, err_path: str,
+             timeout: float = ENCODE_TIMEOUT_SECONDS) -> bool:
+    """Waits for ffmpeg to finish writing out_path. True when it exited 0:
+    the caller then streams the file with iter_file(), which cleans up.
+    False when it failed or ran past `timeout` (then it is killed): the
+    reason is logged, both temp files are removed and the slot released, so
+    the caller answers with an error before sending a byte. A failed encode
+    used to be streamed as an empty 200, which every client took for a
+    successful download."""
     try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
         proc.wait()
-        if proc.returncode == 0:
-            with open(out_path, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
-        else:
-            stderr = _read_stderr(err_path)
-            _log.warning("transcode of %s failed (exit %d): %s", out_path, proc.returncode, stderr)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
-        for path in (out_path, err_path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        release_slot()
+        _log.warning("transcode to %s killed after %d s", out_path, timeout)
+        _cleanup(out_path, err_path)
+        return False
+    if proc.returncode != 0:
+        _log.warning("transcode of %s failed (exit %d): %s", out_path, proc.returncode, _read_stderr(err_path))
+        _cleanup(out_path, err_path)
+        return False
+    return True
+
+
+class iter_file:
+    """Streams a finished transcode (after wait_for() returned True) in
+    chunks, as a Flask Response body, then removes the temp files and
+    releases the slot, however the response ends. A class rather than a
+    generator: the WSGI server always calls close(), even when the client
+    leaves before the first chunk, and an unstarted generator's finally
+    would never run."""
+
+    def __init__(self, out_path: str, err_path: str):
+        self._out_path = out_path
+        self._err_path = err_path
+        self._closed = False
+        try:
+            self._file = open(out_path, "rb")
+        except OSError:
+            self.close()
+            raise
+
+    def __iter__(self):
+        try:
+            while True:
+                chunk = self._file.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        file = getattr(self, "_file", None)
+        if file is not None:
+            file.close()
+        _cleanup(self._out_path, self._err_path)
+
+
+def _cleanup(*paths: str) -> None:
+    for path in paths:
+        _remove(path)
+    release_slot()
 
 
 def _read_stderr(path: str) -> str:
     """Best-effort read of ffmpeg's captured stderr — the caller removes
-    the file right after regardless (see iter_output's finally), this just
+    the file right after regardless (see _cleanup), this just
     folds its content into a single log line first."""
     try:
         with open(path, "rb") as f:

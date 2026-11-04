@@ -37,6 +37,7 @@ import logging
 
 import db
 import matching
+import mirror_runs
 import plex_client
 
 _log = logging.getLogger(__name__)
@@ -99,7 +100,7 @@ def delete_mirror(conn, playlist_id: int) -> None:
     mirroring is switched off and from playlist_sync's removal path, before
     the row goes. The stored key is cleared either way, as the other sinks
     do: a lost copy is the lesser problem next to a row that can never
-    write a fresh one. Does not commit."""
+    write a fresh one. mirror_sinks commits around it."""
     row = conn.execute(
         "SELECT plex_mirror_remote_id, plex_mirror_machine FROM playlists WHERE id = ?", (playlist_id,)
     ).fetchone()
@@ -123,7 +124,8 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
     """Idempotent full rewrite of this playlist's Plex copy. Does nothing
     unless the playlist has mirroring to Plex on. Never raises: every
     failure is stored in plex_mirror_last_error (code and detail), as the
-    other sinks do. Does not commit."""
+    other sinks do. mirror_sinks commits around it, and it commits before
+    calling out again after a write."""
     row = conn.execute(
         "SELECT title, plex_mirror_enabled, plex_mirror_remote_id, plex_mirror_machine "
         "FROM playlists WHERE id = ?", (playlist_id,),
@@ -148,13 +150,19 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
         "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)
     ).fetchone()[0]
     keys: list[str] = []
+    lacked = []
+    placed = {}  # Plex key -> the local track placed there, for refusals
     for track in tracks:
         found = _resolve(index, track)
-        if found is not None and found not in keys:
+        if found is None:
+            lacked.append(track)
+        elif found not in placed:
             keys.append(found)
+            placed[found] = track
     # Something matched locally but nothing on the target: a target pointed
     # at another library, not a partial mirror. Reported, not written.
     if tracks and not keys:
+        mirror_runs.record(conn, playlist_id, "plex", len(lacked), 0, lacked)
         _set_error(conn, playlist_id, "no_target_matches")
         return
 
@@ -167,6 +175,7 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
         # playlist, so it is never used. A fresh copy is made.
         conn.execute("UPDATE playlists SET plex_mirror_remote_id = NULL, plex_mirror_machine = NULL "
                      "WHERE id = ?", (playlist_id,))
+        conn.commit()
         remote_id = None
     current = plex_client.mirror_read(remote_id) if remote_id else None
     if remote_id and current is None:
@@ -180,6 +189,7 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
         # Gone on the target: write a fresh copy.
         conn.execute("UPDATE playlists SET plex_mirror_remote_id = NULL, plex_mirror_machine = NULL "
                      "WHERE id = ?", (playlist_id,))
+        conn.commit()
         remote_id = None
 
     if remote_id is None:
@@ -189,6 +199,7 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
             return
         conn.execute("UPDATE playlists SET plex_mirror_remote_id = ?, plex_mirror_machine = ? WHERE id = ?",
                      (remote_id, index["machine"], playlist_id))
+        conn.commit()
         current = {"title": name, "summary": "", "keys": None}
     assert current is not None
 
@@ -198,6 +209,11 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
             return
         written = plex_client.mirror_read(remote_id)
         if written is None or written["keys"] != keys:
+            if written is not None:
+                held = set(written["keys"])
+                refused = [placed[k] for k in keys if k not in held]
+                mirror_runs.record(conn, playlist_id, "plex", len(keys) + len(lacked),
+                                   len(keys) - len(refused), lacked, refused)
             _set_error(conn, playlist_id, "readback_mismatch",
                        _mismatch(keys, written["keys"] if written else None))
             return
@@ -211,3 +227,5 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
         "plex_mirror_last_error = NULL, plex_mirror_last_error_code = NULL WHERE id = ?",
         (playlist_id,),
     )
+    # Duplicates of a placed track are mirrored once and counted once.
+    mirror_runs.record(conn, playlist_id, "plex", len(keys) + len(lacked), len(keys), lacked)

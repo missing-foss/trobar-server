@@ -12,6 +12,7 @@ be reachable from inside the module) rather than mocking db itself.
     python3 -m unittest test_lms_client -v
 """
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -225,6 +226,20 @@ class GetArtistImageTests(_LmsClientTestBase):
         # #172 scopes this provider to list_playlists/get_playlist_tracks
         # only — pin the documented stub behavior directly.
         self.assertIsNone(lms_client.get_artist_image("Anyone"))
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

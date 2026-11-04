@@ -10,8 +10,10 @@ and a real end-to-end scan against a tagged fixture file.
 
     python3 -m unittest test_scanner -v      # from app/
 """
+import json
 import os
 import shutil
+import sqlite3
 import struct
 import tempfile
 import threading
@@ -25,6 +27,7 @@ import fingerprint
 import jobs
 import provenance
 import scanner
+import sync_state
 
 
 class BackgroundScanTests(unittest.TestCase):
@@ -172,6 +175,20 @@ class BackgroundScanTests(unittest.TestCase):
         st = scanner.scan_status()
         self.assertEqual(st["last_result"]["status"], "error")
         self.assertIn("disk gone", st["last_result"]["reason"])
+
+    def test_a_cancelled_scan_reports_no_counts(self):
+        # The previous scan's counts would read as this one's.
+        scanner.start_scan(Path("/music"))
+        with mock.patch.object(scanner, "_scan_library", return_value={"added": 99}):
+            self._run_queued()
+        conn = db.get_conn()
+        try:
+            conn.execute("INSERT INTO jobs (type, state, finished_at) VALUES (?, 'cancelled', datetime('now'))",
+                         (scanner.JOB_TYPE,))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(scanner.scan_status()["last_result"], {"status": "error", "reason": "cancelled"})
 
     def test_a_missing_music_root_fails_the_job_rather_than_reporting_zero(self):
         # A silent {"added": 0} would read as "your library is empty".
@@ -354,6 +371,14 @@ class ScheduledRescanTests(unittest.TestCase):
         scanner.maybe_schedule_rescan()
         self.assertEqual(self._queued_scan_count(), 0)
 
+    def test_a_cancelled_scan_waits_out_the_interval(self):
+        # Otherwise the next idle check would queue the scan an admin just stopped.
+        self._set_interval(24)
+        self._add_finished_scan("done", hours_ago=25)
+        self._add_finished_scan("cancelled", hours_ago=1)
+        scanner.maybe_schedule_rescan()
+        self.assertEqual(self._queued_scan_count(), 0)
+
     def test_enabled_but_not_yet_due_does_nothing(self):
         self._set_interval(24)
         self._add_finished_scan("done", hours_ago=1)
@@ -374,7 +399,7 @@ class ScheduledRescanTests(unittest.TestCase):
         self.assertIsNotNone(row, "a due, enabled schedule must enqueue a scan")
         # never force=1 — the issue was explicit that a periodic forced
         # rescan (re-reading every tag on a timer) is almost never wanted.
-        self.assertEqual(row["payload"], '{"force": false}')
+        self.assertEqual(row["payload"], '{"force": false, "confirm_mass_removal": false}')
 
     def test_never_scanned_and_enabled_is_immediately_due(self):
         # Enabling this on a fresh install shouldn't mean waiting a full
@@ -491,7 +516,7 @@ class DeletedAtTimezoneTests(unittest.TestCase):
         scanner._scan_library(self.music)
         self._hold_on_a_device()
         (self.music / "A" / "B" / "gone.mp3").unlink()
-        scanner._scan_library(self.music)
+        scanner._scan_library(self.music, confirm_mass_removal=True)  # its only track goes
         conn = db.get_conn()
         try:
             row = conn.execute(
@@ -514,7 +539,7 @@ class DeletedAtTimezoneTests(unittest.TestCase):
         scanner._scan_library(self.music)
         self._hold_on_a_device()
         (self.music / "A" / "B" / "gone.mp3").unlink()
-        scanner._scan_library(self.music)
+        scanner._scan_library(self.music, confirm_mass_removal=True)  # its only track goes
         conn = db.get_conn()
         try:
             row = conn.execute(
@@ -567,6 +592,47 @@ class ScanProgressTests(unittest.TestCase):
             raise RuntimeError("no")
         with self.assertRaises(RuntimeError):
             scanner._scan_library(self.music, report=_bad)
+
+    def _second_writer(self):
+        """A write on another connection that won't wait: it fails at once if
+        the scan has a transaction open."""
+        other = sqlite3.connect(db.DB_PATH, timeout=0)
+        self.addCleanup(other.close)
+
+        def write():
+            other.execute("INSERT OR REPLACE INTO app_config (key, value) VALUES ('other_writer', '1')")
+            other.commit()
+        return write
+
+    def test_another_connection_can_write_while_files_are_read(self):
+        write = self._second_writer()
+        real_read = scanner._read_tags
+        reads = []
+
+        def read_while_someone_writes(path):
+            write()
+            reads.append(path)
+            return real_read(path)
+        with mock.patch.object(scanner, "_read_tags", read_while_someone_writes):
+            scanner._scan_library(self.music)
+        self.assertEqual(len(reads), 3)
+
+    def test_progress_is_reported_with_nothing_pending(self):
+        # A rescan where one file changed and two didn't, reporting on every
+        # file, so both paths through the loop reach a report.
+        scanner._scan_library(self.music)
+        path = self.music / "A" / "B" / "1.mp3"
+        os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 10))
+        write = self._second_writer()
+        seen = []
+
+        def report(done, total=None, label=None):
+            write()  # as jobs.set_progress does, on its own connection
+            seen.append(done)
+        with mock.patch.object(scanner, "_REPORT_EVERY", 1):
+            counts = scanner._scan_library(self.music, report=report)
+        self.assertEqual((counts["updated"], counts["unchanged"]), (1, 2))
+        self.assertEqual(seen, [0, 0, 1, 2, 3])
 
     def test_set_progress_writes_json_and_finishing_clears_it(self):
         conn = db.get_conn()
@@ -658,6 +724,169 @@ class ReadTagsIsrcTests(unittest.TestCase):
         self.assertIsNone(tags["isrc"])
 
 
+_MBID = "8f3471b5-7e6a-48da-86a9-c1c07a0f47ae"
+
+
+def _ufid_frame(owner: str, identifier: str) -> bytes:
+    payload = owner.encode("latin-1") + b"\x00" + identifier.encode("latin-1")
+    return b"UFID" + struct.pack(">I", len(payload)) + b"\x00\x00" + payload
+
+
+def _make_mp3_with_frames(path: Path, frames: bytes) -> None:
+    frames = _id3_frame(b"TPE1", "Test Artist") + _id3_frame(b"TIT2", "Test Title") + frames
+    header = b"ID3" + bytes([3, 0]) + b"\x00" + _syncsafe(len(frames))
+    path.write_bytes(header + frames + _MP3_SILENCE_FRAME * 5)
+
+
+def _make_tagged_flac(path: Path, comments: list[tuple[str, str]]) -> None:
+    """A minimal real FLAC: STREAMINFO and a Vorbis comment block, no audio
+    frames, which is all tinytag reads tags from."""
+    rate, channels, bits, samples = 44100, 2, 16, 44100
+    packed = (rate << 44) | ((channels - 1) << 41) | ((bits - 1) << 36) | samples
+    streaminfo = struct.pack(">HH", 4096, 4096) + b"\x00" * 6 + packed.to_bytes(8, "big") + b"\x00" * 16
+    vendor = b"trobar-test"
+    vorbis = struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", len(comments))
+    for key, value in comments:
+        entry = f"{key}={value}".encode("utf-8")
+        vorbis += struct.pack("<I", len(entry)) + entry
+    path.write_bytes(b"fLaC"
+                     + bytes([0]) + len(streaminfo).to_bytes(3, "big") + streaminfo
+                     + bytes([0x84]) + len(vorbis).to_bytes(3, "big") + vorbis)
+
+
+class ReadTagsMbidTests(unittest.TestCase):
+    """The file's MusicBrainz recording id, from each format's own tag, read
+    through tinytag from real files where they can be built by hand."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-scanner-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+
+    def test_flac_musicbrainz_trackid_is_the_recording_id(self):
+        path = Path(self._tmp) / "t.flac"
+        _make_tagged_flac(path, [("TITLE", "T"), ("MUSICBRAINZ_TRACKID", _MBID.upper())])
+        self.assertEqual(scanner._read_tags(path)["mbid"], _MBID)
+
+    def test_a_release_track_id_alone_is_not_taken_for_the_recording(self):
+        path = Path(self._tmp) / "t.flac"
+        _make_tagged_flac(path, [("TITLE", "T"), ("MUSICBRAINZ_RELEASETRACKID", _MBID)])
+        self.assertIsNone(scanner._read_tags(path)["mbid"])
+
+    def test_mp3_musicbrainz_ufid_is_the_recording_id(self):
+        path = Path(self._tmp) / "t.mp3"
+        _make_mp3_with_frames(path, _ufid_frame("http://musicbrainz.org", _MBID))
+        self.assertEqual(scanner._read_tags(path)["mbid"], _MBID)
+
+    def test_a_ufid_from_another_owner_is_ignored(self):
+        path = Path(self._tmp) / "t.mp3"
+        _make_mp3_with_frames(path, _ufid_frame("http://example.org", _MBID))
+        self.assertIsNone(scanner._read_tags(path)["mbid"])
+
+    def test_mp4_spelling_and_malformed_values(self):
+        # MP4's freeform atom isn't built by hand here; this is the key
+        # tinytag 2.3.0 reports it under, measured on a Picard-tagged M4A.
+        self.assertEqual(scanner._recording_mbid({"musicbrainz track id": [_MBID]}), _MBID)
+        self.assertIsNone(scanner._recording_mbid({"musicbrainz_trackid": ["not-an-id"]}))
+        self.assertIsNone(scanner._recording_mbid({}))
+        self.assertEqual(scanner._recording_mbid({"ufid": [b"http://musicbrainz.org\x00" + _MBID.encode()]}), _MBID)
+
+
+class MassRemovalGuardTests(unittest.TestCase):
+    """A scan that would remove most of the library, or that found nothing at
+    all, is refused: an unmounted share looks exactly like an empty library."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-guard-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self._orig = (db.DATA_DIR, db.DB_PATH)
+        db.DATA_DIR = Path(self._tmp)
+        db.DB_PATH = Path(self._tmp) / "music-sync.db"
+        self.addCleanup(self._restore)
+        db.init_db()
+        self.root = Path(self._tmp) / "music"
+        self.files = []
+        for album in ("One", "Two"):
+            (self.root / "Test Artist" / album).mkdir(parents=True)
+            for n in range(2):
+                path = self.root / "Test Artist" / album / f"0{n} Song {album}{n}.mp3"
+                _make_tagged_mp3(path, title=f"Song {album}{n}", album=album)
+                self.files.append(path)
+        scanner.scan_library(self.root)
+
+    def _restore(self):
+        db.DATA_DIR, db.DB_PATH = self._orig
+
+    def _live(self):
+        conn = db.get_conn()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM tracks WHERE deleted_at IS NULL").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_a_music_folder_with_no_audio_files_removes_nothing(self):
+        for path in self.files:
+            path.unlink()
+        with self.assertRaises(scanner.MassRemovalRefused) as raised:
+            scanner.scan_library(self.root)
+        self.assertIn("found no audio files", str(raised.exception))
+        self.assertEqual(self._live(), 4)
+
+    def test_removing_more_than_half_is_refused_and_half_is_not(self):
+        for path in self.files[:3]:
+            path.unlink()
+        with self.assertRaises(scanner.MassRemovalRefused) as raised:
+            scanner.scan_library(self.root)
+        self.assertIn("would remove 3 of the library's 4 tracks", str(raised.exception))
+        self.assertEqual(self._live(), 4)
+        _make_tagged_mp3(self.files[2], title="Song Two0", album="Two")
+        counts = scanner.scan_library(self.root)
+        self.assertEqual((counts["removed"], self._live()), (2, 2))
+
+    def test_an_admins_confirmation_lets_a_real_purge_through(self):
+        for path in self.files:
+            path.unlink()
+        counts = scanner.scan_library(self.root, confirm_mass_removal=True)
+        self.assertEqual((counts["removed"], self._live()), (4, 0))
+
+    def test_the_confirmation_reaches_the_scan_through_the_job(self):
+        scanner.start_scan(self.root, confirm_mass_removal=True)
+        conn = db.get_conn()
+        try:
+            payload = json.loads(conn.execute("SELECT payload FROM jobs WHERE type = ?",
+                                              (scanner.JOB_TYPE,)).fetchone()["payload"])
+        finally:
+            conn.close()
+        self.assertIs(payload["confirm_mass_removal"], True)
+        with mock.patch.object(scanner, "_scan_library", return_value={}) as scan, \
+                mock.patch.object(scanner, "_queue_post_scan_jobs"), \
+                mock.patch.object(db, "get_music_root", return_value=self.root):
+            scanner.run_job(payload, None)
+        self.assertIs(scan.call_args.kwargs["confirm_mass_removal"], True)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads any folder")
+    def test_finding_nothing_is_refused_even_when_only_half_would_go(self):
+        # Half the library is in a folder that can't be read (kept), the
+        # other half is gone: not more than half, but the walk found no audio
+        # file at all, which is what a library that isn't really there looks
+        # like.
+        locked = self.root / "Test Artist" / "Two"
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        for path in self.files[:2]:
+            path.unlink()
+        with self.assertRaises(scanner.MassRemovalRefused):
+            scanner.scan_library(self.root)
+        self.assertEqual(self._live(), 4)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads any folder")
+    def test_a_folder_that_cant_be_read_keeps_its_tracks(self):
+        locked = self.root / "Test Artist" / "Two"
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        counts = scanner.scan_library(self.root)
+        self.assertEqual((counts["removed"], counts["skipped_dirs"], self._live()), (0, 1, 4))
+
+
 class ScanLibraryIsrcTests(unittest.TestCase):
     """End-to-end (#200): a real scan_library() run over a tagged fixture
     persists isrc onto the tracks row, not just that _read_tags parses it."""
@@ -675,6 +904,26 @@ class ScanLibraryIsrcTests(unittest.TestCase):
 
     def _restore_db_globals(self):
         db.DATA_DIR, db.DB_PATH = self._orig_data_dir, self._orig_db_path
+
+    def test_scan_persists_the_recording_id_and_a_retag_replaces_it(self):
+        path = self.root / "Test Artist" / "Test Album" / "03 Ided.flac"
+        _make_tagged_flac(path, [("TITLE", "Ided"), ("MUSICBRAINZ_TRACKID", _MBID)])
+        scanner.scan_library(self.root)
+        other = "11111111-2222-3333-4444-555555555555"
+        _make_tagged_flac(path, [("TITLE", "Ided"), ("MUSICBRAINZ_TRACKID", other)])
+        os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 10))
+        conn = db.get_conn()
+        try:
+            first = conn.execute("SELECT mbid FROM tracks").fetchone()["mbid"]
+        finally:
+            conn.close()
+        scanner.scan_library(self.root)
+        conn = db.get_conn()
+        try:
+            second = conn.execute("SELECT mbid FROM tracks").fetchone()["mbid"]
+        finally:
+            conn.close()
+        self.assertEqual((first, second), (_MBID, other))
 
     def test_scan_persists_isrc_onto_the_track_row(self):
         _make_tagged_mp3(
@@ -702,6 +951,401 @@ class ScanLibraryIsrcTests(unittest.TestCase):
         finally:
             conn.close()
         self.assertIsNone(row["isrc"])
+
+
+class CoversEpochTests(unittest.TestCase):
+    """A scan that drops cached covers changes covers_epoch, the part of each
+    cover URL that makes the browser ask again; one that drops none leaves it."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-scanner-db-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self._orig_data_dir, self._orig_db_path = db.DATA_DIR, db.DB_PATH
+        db.DATA_DIR = Path(self._tmp)
+        db.DB_PATH = Path(self._tmp) / "music-sync.db"
+        db.init_db()
+        self.addCleanup(self._restore_db_globals)
+        self.root = Path(self._tmp) / "music"
+        (self.root / "Test Artist" / "Test Album").mkdir(parents=True)
+        self.track = self.root / "Test Artist" / "Test Album" / "01 Test Title.mp3"
+        _make_tagged_mp3(self.track, isrc=None)
+
+    def _restore_db_globals(self):
+        db.DATA_DIR, db.DB_PATH = self._orig_data_dir, self._orig_db_path
+
+    def _epoch(self):
+        with db.connection() as conn:
+            return db.get_config(conn, "covers_epoch")
+
+    def test_a_scan_that_adds_an_album_sets_it(self):
+        self.assertIsNone(self._epoch())
+        scanner.scan_library(self.root)
+        self.assertIsNotNone(self._epoch())
+
+    def test_a_rescan_that_changes_nothing_leaves_it(self):
+        scanner.scan_library(self.root)
+        before = self._epoch()
+        scanner.scan_library(self.root)
+        self.assertEqual(self._epoch(), before)
+
+    def test_a_changed_file_changes_it(self):
+        scanner.scan_library(self.root)
+        before = self._epoch()
+        _make_tagged_mp3(self.track, isrc="USRC17607839")
+        os.utime(self.track, (self.track.stat().st_atime, self.track.stat().st_mtime + 10))
+        scanner.scan_library(self.root)
+        self.assertNotEqual(self._epoch(), before)
+
+    def test_a_full_rescan_changes_it(self):
+        scanner.scan_library(self.root)
+        before = self._epoch()
+        scanner.scan_library(self.root, force=True)
+        self.assertNotEqual(self._epoch(), before)
+
+
+class RescanReachesDevicesTests(unittest.TestCase):
+    """A rescan changes what each device should hold: what /api/device/changes
+    lists (sync_state.get_changes) follows the library, not only selection
+    changes."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-scanner-db-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self._orig_data_dir, self._orig_db_path = db.DATA_DIR, db.DB_PATH
+        db.DATA_DIR = Path(self._tmp)
+        db.DB_PATH = Path(self._tmp) / "music-sync.db"
+        db.init_db()
+        self.addCleanup(self._restore_db_globals)
+        self.root = Path(self._tmp) / "music"
+        for n in (1, 2, 3):
+            self._add("Glass Meridian", "Latitude", f"0{n} Song {n}")
+        scanner.scan_library(self.root)
+        self.conn = db.get_conn()
+        self.addCleanup(self.conn.close)
+        cur = self.conn.execute("INSERT INTO users (username) VALUES ('owner')")
+        self.user = sync_state._new_id(cur)
+        self.device, _token = sync_state.create_device(self.conn, self.user, "phone")
+        self.conn.commit()
+
+    def _restore_db_globals(self):
+        db.DATA_DIR, db.DB_PATH = self._orig_data_dir, self._orig_db_path
+
+    def _add(self, artist, album, title):
+        folder = self.root / artist / album
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{title}.mp3"
+        _make_tagged_mp3(path, artist=artist, album=album, title=title)
+        return path
+
+    def _id(self, title):
+        return self.conn.execute("SELECT id FROM tracks WHERE title = ?", (title,)).fetchone()["id"]
+
+    def _all_downloaded(self):
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded' WHERE device_id = ?",
+                          (self.device,))
+        self.conn.commit()
+
+    def _changes(self):
+        changes = sync_state.get_changes(self.conn, self.device)
+        return ({t["track_id"] for t in changes["to_download"]},
+                {t["track_id"] for t in changes["to_delete"]})
+
+    def test_a_new_album_under_a_selected_artist_is_queued(self):
+        sync_state.create_selection(self.conn, "artist", "Glass Meridian", self.user, [self.device])
+        self._all_downloaded()
+        self._add("Glass Meridian", "Longitude", "01 New Song")
+        self._add("Someone Else", "Elsewhere", "01 Not Selected")
+        scanner.scan_library(self.root)
+        self.assertEqual(self._changes(), ({self._id("01 New Song")}, set()))
+
+    def test_a_file_deleted_from_disk_is_removed_from_the_device(self):
+        sync_state.create_selection(self.conn, "album", "Glass Meridian||Latitude", self.user, [self.device])
+        self._all_downloaded()
+        gone = self._id("02 Song 2")
+        (self.root / "Glass Meridian" / "Latitude" / "02 Song 2.mp3").unlink()
+        scanner.scan_library(self.root)
+        self.assertEqual(self._changes(), (set(), {gone}))
+
+    def test_a_deleted_track_a_playlist_still_points_at_stays_until_it_is_rematched(self):
+        # Removing it now would lose the track when the file only moved: the
+        # playlist keeps the old track's id until its next sync re-matches
+        # the entry, and that sync recomputes the devices that select it.
+        cur = self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, last_synced_at) "
+            "VALUES ('Mix', 'roon', datetime('now'))")
+        playlist = sync_state._new_id(cur)
+        for pos, title in enumerate(("01 Song 1", "03 Song 3")):
+            self.conn.execute(
+                "INSERT INTO playlist_tracks (playlist_id, position, matched_track_id) VALUES (?, ?, ?)",
+                (playlist, pos, self._id(title)))
+        sync_state.create_selection(self.conn, "playlist", str(playlist), self.user, [self.device])
+        self._all_downloaded()
+        (self.root / "Glass Meridian" / "Latitude" / "03 Song 3.mp3").unlink()
+        self._add("Glass Meridian", "Latitude", "04 Song 4")
+        scanner.scan_library(self.root)
+        self.assertEqual(self._changes(), (set(), set()))
+
+
+class ScanRobustnessTests(unittest.TestCase):
+    """A file that vanishes mid-walk doesn't fail the scan; files whose tags
+    fell back to folder names are counted; a retried scan runs incremental."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-scanner-db-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self._orig_data_dir, self._orig_db_path = db.DATA_DIR, db.DB_PATH
+        db.DATA_DIR = Path(self._tmp)
+        db.DB_PATH = Path(self._tmp) / "music-sync.db"
+        db.init_db()
+        self.addCleanup(self._restore_db_globals)
+        self.root = Path(self._tmp) / "music"
+        self.album = self.root / "Glass Meridian" / "Latitude"
+        self.album.mkdir(parents=True)
+        for n in (1, 2, 3):
+            _make_tagged_mp3(self.album / f"0{n} Song {n}.mp3", artist="Glass Meridian",
+                             album="Latitude", title=f"Song {n}")
+
+    def _restore_db_globals(self):
+        db.DATA_DIR, db.DB_PATH = self._orig_data_dir, self._orig_db_path
+
+    def test_a_file_deleted_between_the_walk_and_its_stat_is_counted_not_fatal(self):
+        scanner.scan_library(self.root)
+        doomed = self.album / "02 Song 2.mp3"
+        real_iter = scanner._iter_audio_files
+
+        def walk_then_delete(root, unreadable=None):
+            for path in real_iter(root, unreadable):
+                if path == doomed:
+                    path.unlink()  # listed by the walk, gone before its stat
+                yield path
+
+        with mock.patch.object(scanner, "_iter_audio_files", walk_then_delete):
+            counts = scanner.scan_library(self.root)
+        self.assertEqual((counts["vanished_files"], counts["removed"], counts["unchanged"]), (1, 1, 2))
+        conn = db.get_conn()
+        try:
+            live = [r["title"] for r in conn.execute(
+                "SELECT title FROM tracks WHERE deleted_at IS NULL ORDER BY title")]
+        finally:
+            conn.close()
+        self.assertEqual(live, ["Song 1", "Song 3"])
+
+    def test_a_file_that_is_there_but_cannot_be_read_keeps_its_track(self):
+        scanner.scan_library(self.root)
+        locked = self.album / "02 Song 2.mp3"
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == locked:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", stat):
+            counts = scanner.scan_library(self.root)
+        self.assertTrue(locked.exists())
+        self.assertEqual((counts["unreadable_files"], counts["vanished_files"], counts["removed"]), (1, 0, 0))
+        conn = db.get_conn()
+        try:
+            live = [r["title"] for r in conn.execute(
+                "SELECT title FROM tracks WHERE deleted_at IS NULL ORDER BY title")]
+        finally:
+            conn.close()
+        self.assertEqual(live, ["Song 1", "Song 2", "Song 3"])
+
+    def test_files_read_from_folder_names_are_counted(self):
+        (self.album / "04 No Tags.mp3").write_bytes(b"not really an mp3")
+        counts = scanner.scan_library(self.root)
+        self.assertEqual((counts["added"], counts["from_folder"]), (4, 1))
+        self.assertEqual(scanner.scan_library(self.root)["from_folder"], 0,
+                         "an unchanged file isn't read again, so isn't counted again")
+
+    def test_a_retried_scan_is_incremental_and_keeps_its_confirmation(self):
+        self.assertEqual(scanner.retry_payload({"force": True, "confirm_mass_removal": True}),
+                         {"force": False, "confirm_mass_removal": True})
+
+
+class AudioExtensionsTests(unittest.TestCase):
+    def test_every_lossless_extension_the_transcoder_knows_is_scanned(self):
+        # A format sync_state would transcode, but that the scan never reads,
+        # is a promise nothing can keep (AIFF was one).
+        self.assertLessEqual({"." + ext for ext in sync_state._LOSSLESS_EXTS}, scanner.AUDIO_EXTENSIONS)
+
+    def test_the_walk_picks_up_aiff_and_skips_what_isnt_audio(self):
+        root = Path(tempfile.mkdtemp(prefix="trobar-test-scanner-ext-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for name in ("a.aiff", "b.AIF", "c.flac", "d.m4a", "e.alac", "f.txt"):
+            (root / name).write_bytes(b"x")
+        found = sorted(p.name for p in scanner._iter_audio_files(root))
+        self.assertEqual(found, ["a.aiff", "b.AIF", "c.flac", "d.m4a"])
+
+
+class _FakeTag:
+    """What tinytag 2.3.0 gives for a file, as measured on files made by the
+    ffmpeg in the server image: an ALAC .m4a has a bit depth, an AAC one has
+    none."""
+
+    def __init__(self, title, bitdepth=None):
+        self.artist, self.album, self.title, self.albumartist = "Aphelion", "Event Horizon", title, None
+        self.duration, self.track, self.disc, self.year = 60.0, None, None, None
+        self.other: dict = {}
+        self.bitdepth = bitdepth
+
+
+class LosslessTests(unittest.TestCase):
+    """tracks.lossless: read by the scan, ALAC in an .m4a included, filled in
+    on a library from before the column, and an .m4a that turns out to be
+    ALAC re-delivered as .mp3 to a device set to MP3."""
+
+    TAGS = {"01 Alac.m4a": _FakeTag("Alac", bitdepth=16), "02 Aac.m4a": _FakeTag("Aac"),
+            "03 Flac.flac": _FakeTag("Flac", bitdepth=16)}
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-scanner-db-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self._orig_data_dir, self._orig_db_path = db.DATA_DIR, db.DB_PATH
+        db.DATA_DIR = Path(self._tmp)
+        db.DB_PATH = Path(self._tmp) / "music-sync.db"
+        db.init_db()
+        self.addCleanup(self._restore_db_globals)
+        self.root = Path(self._tmp) / "music"
+        album = self.root / "Aphelion" / "Event Horizon"
+        album.mkdir(parents=True)
+        for name in self.TAGS:
+            (album / name).write_bytes(b"x")
+        self.opened: list = []
+        patcher = mock.patch.object(scanner.TinyTag, "get", side_effect=self._get)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _restore_db_globals(self):
+        db.DATA_DIR, db.DB_PATH = self._orig_data_dir, self._orig_db_path
+
+    def _get(self, path, *args, **kwargs):
+        self.opened.append(Path(path).name)
+        return self.TAGS[Path(path).name]
+
+    def _lossless(self):
+        conn = db.get_conn()
+        try:
+            return {r["title"]: r["lossless"] for r in conn.execute("SELECT title, lossless FROM tracks")}
+        finally:
+            conn.close()
+
+    def test_a_scan_records_which_files_are_lossless(self):
+        scanner.scan_library(self.root)
+        self.assertEqual(self._lossless(), {"Alac": 1, "Aac": 0, "Flac": 1})
+
+    def test_an_upgraded_library_opens_only_its_m4a_files_to_find_out(self):
+        scanner.scan_library(self.root)
+        conn = db.get_conn()
+        try:
+            conn.execute("UPDATE tracks SET lossless = NULL")
+            conn.commit()
+        finally:
+            conn.close()
+        self.opened.clear()
+        scanner.scan_library(self.root)
+        self.assertEqual(self._lossless(), {"Alac": 1, "Aac": 0, "Flac": 1})
+        self.assertEqual(sorted(self.opened), ["01 Alac.m4a", "02 Aac.m4a"])
+
+    def test_an_alac_m4a_found_on_upgrade_is_redelivered_to_a_device_set_to_mp3(self):
+        scanner.scan_library(self.root)
+        conn = db.get_conn()
+        try:
+            owner = sync_state._new_id(conn.execute("INSERT INTO users (username) VALUES ('o')"))
+            mp3, _ = sync_state.create_device(conn, owner, "player", transcode_format="mp3_320")
+            original, _ = sync_state.create_device(conn, owner, "phone")
+            sync_state.create_selection(conn, "artist", "Aphelion", owner, [mp3, original])
+            conn.execute("UPDATE device_track_state SET status = 'downloaded'")
+            conn.execute("UPDATE tracks SET lossless = NULL")
+            conn.commit()
+        finally:
+            conn.close()
+        scanner.scan_library(self.root)
+        conn = db.get_conn()
+        try:
+            states = {(r["device_id"], r["title"]): r["status"] for r in conn.execute(
+                "SELECT d.device_id, t.title, d.status FROM device_track_state d JOIN tracks t ON t.id = d.track_id")}
+        finally:
+            conn.close()
+        self.assertEqual(states[(mp3, "Alac")], "pending", "re-delivered as .mp3")
+        self.assertEqual(states[(mp3, "Aac")], "downloaded")
+        self.assertEqual(states[(mp3, "Flac")], "downloaded", "a FLAC was always transcoded")
+        self.assertEqual(states[(original, "Alac")], "downloaded", "a device taking originals keeps its .m4a")
+
+    def test_retagging_an_alac_m4a_already_known_as_lossless_does_not_redeliver_it(self):
+        scanner.scan_library(self.root)
+        conn = db.get_conn()
+        try:
+            owner = sync_state._new_id(conn.execute("INSERT INTO users (username) VALUES ('o')"))
+            mp3, _ = sync_state.create_device(conn, owner, "player", transcode_format="mp3_320")
+            sync_state.create_selection(conn, "artist", "Aphelion", owner, [mp3])
+            conn.execute("UPDATE device_track_state SET status = 'downloaded'")
+            conn.commit()
+        finally:
+            conn.close()
+        alac = self.root / "Aphelion" / "Event Horizon" / "01 Alac.m4a"
+        alac.write_bytes(b"xy")  # retagged: a new size and mtime
+        os.utime(alac, (alac.stat().st_atime, alac.stat().st_mtime + 10))
+        self.assertEqual(scanner.scan_library(self.root)["updated"], 1)
+        conn = db.get_conn()
+        try:
+            status = conn.execute(
+                "SELECT d.status FROM device_track_state d JOIN tracks t ON t.id = d.track_id "
+                "WHERE t.title = 'Alac'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(status, "downloaded", "it was already sent as .mp3")
+
+
+class VanishedStampTests(unittest.TestCase):
+    """A track that vanishes is stamped with the scan's start, so a file first
+    seen during that same scan is never older than the removal."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-scanner-db-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self._orig_data_dir, self._orig_db_path = db.DATA_DIR, db.DB_PATH
+        db.DATA_DIR = Path(self._tmp)
+        db.DB_PATH = Path(self._tmp) / "music-sync.db"
+        db.init_db()
+        self.addCleanup(self._restore_db_globals)
+        self.root = Path(self._tmp) / "music"
+
+    def _restore_db_globals(self):
+        db.DATA_DIR, db.DB_PATH = self._orig_data_dir, self._orig_db_path
+
+    def test_a_file_seen_during_the_scan_is_not_older_than_what_it_removed(self):
+        album = self.root / "A" / "B"
+        album.mkdir(parents=True)
+        for n in (1, 2, 3):
+            _make_tagged_mp3(album / f"0{n}.mp3", artist="Glass Meridian", album="B", title=f"Song {n}")
+        scanner.scan_library(self.root)
+        conn = db.get_conn()  # a device holds it, so the vanished row is kept
+        try:
+            owner = sync_state._new_id(conn.execute("INSERT INTO users (username) VALUES ('o')"))
+            device, _ = sync_state.create_device(conn, owner, "phone")
+            sync_state.create_selection(conn, "artist", "Glass Meridian", owner, [device])
+        finally:
+            conn.close()
+        (album / "03.mp3").unlink()
+        _make_tagged_mp3(album / "04.mp3", artist="Glass Meridian", album="B", title="Song 4")
+        real_iter = scanner._iter_audio_files
+
+        def slow_walk(root, unreadable=None):
+            for path in real_iter(root, unreadable):
+                yield path
+                time.sleep(0.7)  # a walk long enough to cross a second
+
+        with mock.patch.object(scanner, "_iter_audio_files", slow_walk):
+            scanner.scan_library(self.root)
+        conn = db.get_conn()
+        try:
+            gone = conn.execute("SELECT deleted_at FROM tracks WHERE title = 'Song 3'").fetchone()[0]
+            seen = conn.execute("SELECT scanned_at FROM tracks WHERE title = 'Song 4'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertGreaterEqual(seen, gone)
 
 
 class FingerprintInvalidationTests(unittest.TestCase):
@@ -824,6 +1468,134 @@ class FingerprintInvalidationTests(unittest.TestCase):
         counts = scanner.scan_library(self.root)  # no force, nothing changed
         self.assertEqual(counts["unchanged"], 1)
         self.assertEqual(self._fp_row()["fingerprint"], "OLDFP")
+
+
+class MovedFileTests(unittest.TestCase):
+    """A file that moved (same size and tags, new path) keeps its track: no
+    device is told to delete and download it again."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="trobar-test-scanner-db-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self._orig_data_dir, self._orig_db_path = db.DATA_DIR, db.DB_PATH
+        db.DATA_DIR = Path(self._tmp)
+        db.DB_PATH = Path(self._tmp) / "music-sync.db"
+        db.init_db()
+        self.addCleanup(self._restore_db_globals)
+        self.root = Path(self._tmp) / "music"
+        self.old = self.root / "Incoming" / "Latitude"
+        self.old.mkdir(parents=True)
+        for n in (1, 2):
+            _make_tagged_mp3(self.old / f"0{n}.mp3", artist="Glass Meridian", album="Latitude", title=f"Song {n}")
+
+    def _restore_db_globals(self):
+        db.DATA_DIR, db.DB_PATH = self._orig_data_dir, self._orig_db_path
+
+    def _tracks(self):
+        conn = db.get_conn()
+        try:
+            return {r["title"]: (r["id"], r["relative_path"], r["deleted_at"]) for r in conn.execute(
+                "SELECT id, title, relative_path, deleted_at FROM tracks ORDER BY id")}
+        finally:
+            conn.close()
+
+    def test_a_renamed_folder_keeps_its_tracks_and_what_devices_hold(self):
+        scanner.scan_library(self.root)
+        before = self._tracks()
+        conn = db.get_conn()
+        try:
+            owner = sync_state._new_id(conn.execute("INSERT INTO users (username) VALUES ('o')"))
+            device, _ = sync_state.create_device(conn, owner, "phone")
+            sync_state.create_selection(conn, "artist", "Glass Meridian", owner, [device])
+            conn.execute("UPDATE device_track_state SET status = 'downloaded'")
+            conn.commit()
+        finally:
+            conn.close()
+        (self.root / "Glass Meridian").mkdir()
+        self.old.rename(self.root / "Glass Meridian" / "Latitude")
+        counts = scanner.scan_library(self.root)
+        after = self._tracks()
+        self.assertEqual((counts["moved"], counts["added"], counts["removed"]), (2, 0, 0))
+        self.assertEqual({t: v[0] for t, v in after.items()}, {t: v[0] for t, v in before.items()}, "same ids")
+        self.assertEqual(after["Song 1"][1:], ("Glass Meridian/Latitude/01.mp3", None))
+        conn = db.get_conn()
+        try:
+            self.assertEqual({r[0] for r in conn.execute("SELECT status FROM device_track_state")}, {"downloaded"})
+        finally:
+            conn.close()
+
+    def test_what_already_found_the_new_row_is_pointed_at_the_moved_track(self):
+        # A playlist sync beside a long scan can match the new row after a
+        # batch commit, before the move is found.
+        scanner.scan_library(self.root)
+        conn = db.get_conn()
+        try:
+            old_id = conn.execute("SELECT id FROM tracks WHERE title = 'Song 1'").fetchone()[0]
+            new_id = sync_state._new_id(conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                "VALUES ('New/01.mp3', 'Glass Meridian', 'Latitude', 'Song 1', 1, 0)"))
+            playlist = sync_state._new_id(conn.execute(
+                "INSERT INTO playlists (title, source_provider, last_synced_at) VALUES ('Mix', 'roon', datetime('now'))"))
+            conn.execute("INSERT INTO playlist_tracks (playlist_id, position, matched_track_id) VALUES (?, 0, ?)",
+                         (playlist, new_id))
+            scanner._move_track(conn, old_id, new_id)
+            self.assertEqual(conn.execute("SELECT matched_track_id FROM playlist_tracks").fetchone()[0], old_id)
+            self.assertIsNone(conn.execute("SELECT 1 FROM tracks WHERE id = ?", (new_id,)).fetchone())
+        finally:
+            conn.close()
+
+    def test_a_track_selected_under_both_ids_keeps_every_device(self):
+        # The same user selected the old row for one device and, beside the
+        # scan, the new row for another: one selection per track and user,
+        # so the new row's devices join the old row's selection.
+        scanner.scan_library(self.root)
+        conn = db.get_conn()
+        try:
+            old_id = conn.execute("SELECT id FROM tracks WHERE title = 'Song 1'").fetchone()[0]
+            new_id = sync_state._new_id(conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                "VALUES ('New/01.mp3', 'Glass Meridian', 'Latitude', 'Song 1', 1, 0)"))
+            owner = sync_state._new_id(conn.execute("INSERT INTO users (username) VALUES ('o')"))
+            phone, _ = sync_state.create_device(conn, owner, "phone")
+            player, _ = sync_state.create_device(conn, owner, "player")
+            sync_state.create_selection(conn, "track", str(old_id), owner, [phone])
+            sync_state.create_selection(conn, "track", str(new_id), owner, [player])
+            scanner._move_track(conn, old_id, new_id)
+            rows = conn.execute(
+                "SELECT s.target, sd.device_id FROM selections s JOIN selection_devices sd "
+                "ON sd.selection_id = s.id WHERE s.type = 'track' ORDER BY sd.device_id").fetchall()
+            self.assertEqual([tuple(r) for r in rows], [(str(old_id), phone), (str(old_id), player)])
+        finally:
+            conn.close()
+
+    def test_copies_that_cannot_be_told_apart_stay_a_removal_and_an_addition(self):
+        (self.root / "Copy").mkdir()
+        _make_tagged_mp3(self.root / "Copy" / "01.mp3", artist="Glass Meridian", album="Latitude", title="Song 1")
+        # Enough other tracks that two removals aren't most of the library.
+        for n in range(3, 7):
+            _make_tagged_mp3(self.old / f"0{n}.mp3", artist="Glass Meridian", album="Latitude", title=f"Song {n}")
+        scanner.scan_library(self.root)
+        dest = self.root / "Moved"
+        dest.mkdir()
+        (self.old / "01.mp3").rename(dest / "a.mp3")
+        (self.root / "Copy" / "01.mp3").rename(dest / "b.mp3")
+        counts = scanner.scan_library(self.root)
+        self.assertEqual((counts["moved"], counts["added"], counts["removed"]), (0, 2, 2))
+
+    def test_a_file_that_changed_as_it_moved_is_not_matched(self):
+        scanner.scan_library(self.root)
+        dest = self.root / "Elsewhere"
+        dest.mkdir()
+        (self.old / "01.mp3").rename(dest / "01.mp3")
+        _make_tagged_mp3(dest / "01.mp3", artist="Glass Meridian", album="Latitude", title="Song 1", isrc="USRC17607839")
+        counts = scanner.scan_library(self.root)
+        self.assertEqual((counts["moved"], counts["added"], counts["removed"]), (0, 1, 1))
+
+    def test_reorganising_the_whole_library_is_not_a_mass_removal(self):
+        scanner.scan_library(self.root)
+        self.old.rename(self.root / "Latitude")
+        counts = scanner.scan_library(self.root)  # every file "vanished": refused without the match
+        self.assertEqual(counts["moved"], 2)
 
 
 if __name__ == "__main__":

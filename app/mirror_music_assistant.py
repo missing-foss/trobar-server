@@ -41,6 +41,7 @@ import logging
 
 import db
 import matching
+import mirror_runs
 import music_assistant_client
 
 _log = logging.getLogger(__name__)
@@ -128,7 +129,7 @@ def delete_mirror(conn, playlist_id: int) -> None:
     delete, so the copy is emptied instead and stays as an empty playlist,
     still named as Trobar's. The stored id is cleared either way, as the
     other sinks do: a lost copy is the lesser problem next to a row that
-    can never write a fresh one. Does not commit."""
+    can never write a fresh one. mirror_sinks commits around it."""
     row = conn.execute(
         "SELECT music_assistant_mirror_remote_id FROM playlists WHERE id = ?", (playlist_id,)
     ).fetchone()
@@ -149,7 +150,8 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
     nothing unless the playlist has mirroring to Music Assistant on. Never
     raises: every failure is stored in music_assistant_mirror_last_error
     (code and detail) for the playlist row and the admin overview, as the
-    other sinks do. Does not commit."""
+    other sinks do. mirror_sinks commits around it, and it commits before
+    calling out again after a write."""
     row = conn.execute(
         "SELECT title, music_assistant_mirror_enabled, music_assistant_mirror_remote_id "
         "FROM playlists WHERE id = ?", (playlist_id,),
@@ -172,14 +174,20 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
     ).fetchall()
     wanted: list[dict] = []
     seen: set[str] = set()
+    lacked = []
+    placed: dict = {}  # target path -> the local track placed there, for refusals
     for track in tracks:
         found = _resolve(index, track)
-        if found is not None and found["uri"] not in seen:
+        if found is None:
+            lacked.append(track)
+        elif found["uri"] not in seen:
             seen.add(found["uri"])
             wanted.append(found)
+            placed.setdefault(found["path"], track)
     # Something matched locally but nothing on the target: a target pointed
     # at another library, not a partial mirror. Reported, not written.
     if tracks and not wanted:
+        mirror_runs.record(conn, playlist_id, "music_assistant", len(lacked), 0, lacked)
         _set_error(conn, playlist_id, "no_target_matches")
         return
 
@@ -200,6 +208,7 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
             return
         conn.execute("UPDATE playlists SET music_assistant_mirror_remote_id = NULL WHERE id = ?",
                      (playlist_id,))
+        conn.commit()
         remote_id = None
     if remote_id is None:
         remote_id = music_assistant_client.mirror_create(row["title"])
@@ -208,6 +217,7 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
             return
         conn.execute("UPDATE playlists SET music_assistant_mirror_remote_id = ? WHERE id = ?",
                      (remote_id, playlist_id))
+        conn.commit()
         current = []
 
     expected = [w["path"] for w in wanted]
@@ -217,6 +227,12 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
             return
         written = music_assistant_client.mirror_read(remote_id)
         if written != expected:
+            if written is not None:
+                held = set(written)
+                refused = [placed[p] for p in dict.fromkeys(expected) if p not in held]
+                mirror_runs.record(conn, playlist_id, "music_assistant",
+                                   len(wanted) + len(lacked), len(wanted) - len(refused),
+                                   lacked, refused)
             _set_error(conn, playlist_id, "readback_mismatch", _mismatch(expected, written))
             return
 
@@ -225,3 +241,6 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
         "music_assistant_mirror_last_error = NULL, music_assistant_mirror_last_error_code = NULL "
         "WHERE id = ?", (playlist_id,),
     )
+    # Duplicates of a placed track are mirrored once and counted once.
+    mirror_runs.record(conn, playlist_id, "music_assistant", len(wanted) + len(lacked),
+                       len(wanted), lacked)

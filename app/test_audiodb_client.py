@@ -16,6 +16,7 @@ and a picture URL that itself fails.
     python3 -m unittest test_audiodb_client -v
 """
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -240,6 +241,20 @@ class GetArtistImageTests(unittest.TestCase):
             audiodb_client.get_artist_image("Portishead", "KEY")
             timeouts = [c.kwargs.get("timeout") for c in req.get.call_args_list]
         self.assertEqual(timeouts, [audiodb_client._TIMEOUT, audiodb_client._TIMEOUT])
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

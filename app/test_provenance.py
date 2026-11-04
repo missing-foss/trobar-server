@@ -455,6 +455,34 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class DeviceFingerprintsCancelTests(_ProvenanceTestBase):
+    def _cancel_at(self, at):
+        def report(done, total):
+            if done == at:
+                raise jobs.JobCancelled(jobs.CANCEL_ADMIN)
+        return report
+
+    def test_a_cancel_stops_before_the_next_track_and_releases_the_lock(self):
+        first, second = self._add_track("a.flac"), self._add_track("b.flac")
+        self._hold(first)
+        self._hold(second)
+        with mock.patch("provenance.acoustid.fingerprint_file", return_value=(180.0, b"FP")) as fp, \
+                self.assertRaises(jobs.JobCancelled):
+            provenance.run_device_fingerprints_job({"device_id": self.device}, self._cancel_at(1))
+        fp.assert_called_once()
+        computed = [t for t in (first, second) if self._row(t)["fingerprint"] == "FP"]
+        self.assertEqual(len(computed), 1)
+        self.assertFalse(provenance._PROVENANCE_LOCK.locked())
+
+    def test_progress_counts_tracks_against_the_batch(self):
+        for path in ("a.flac", "b.flac"):
+            self._hold(self._add_track(path))
+        report = mock.Mock()
+        with mock.patch("provenance.acoustid.fingerprint_file", return_value=(180.0, b"FP")):
+            provenance.ensure_device_fingerprints(self.device, report)
+        self.assertEqual(report.call_args_list, [mock.call(0, 2), mock.call(1, 2)])
+
+
 class _RematchTestBase(_ProvenanceTestBase):
     """#239 PR 2: the client -> server half. A device pushes what it holds and
     the server rematches BY FINGERPRINT, which is what survives the tag/naming
@@ -519,6 +547,15 @@ class RematchTests(_RematchTestBase):
         row = self._prov("Totally/Different/Name.flac")
         self.assertEqual(row["state"], "matched")
         self.assertEqual(row["matched_track_id"], track)
+        # A deletion has to name the file under the name the device holds it.
+        conn = db.get_conn()
+        try:
+            delivered = conn.execute(
+                "SELECT delivered_path FROM device_track_state WHERE device_id = ? AND track_id = ?",
+                (self.device, track)).fetchone()["delivered_path"]
+        finally:
+            conn.close()
+        self.assertEqual(delivered, "Totally/Different/Name.flac")
 
     def test_a_match_retracts_the_unknown_track_row(self):
         # THE point of the feature (#161): a file Trobar itself placed, listed
@@ -615,6 +652,25 @@ class RematchTests(_RematchTestBase):
         self.assertTrue(result["already_running"])
         # still pending, so the next sync picks it up
         self.assertEqual(self._prov("Dev/x.flac")["state"], "pending")
+
+
+class RematchCancelTests(_RematchTestBase):
+    def test_a_cancel_stops_between_rows_and_leaves_the_rest_pending(self):
+        self._add_track("Artist/Album/one.flac", fingerprint="FPONE")
+        self._add_track("Artist/Album/two.flac", fingerprint="FPTWO")
+        self._push("Device/a.flac", "FPONE")
+        self._push("Device/b.flac", "FPTWO")
+
+        def report(done, total):
+            if done == 1:
+                raise jobs.JobCancelled(jobs.CANCEL_ADMIN)
+
+        with mock.patch("provenance.acoustid.fingerprint_file", return_value=(180.0, b"FPONE")), \
+                self.assertRaises(jobs.JobCancelled):
+            provenance.rematch_device({"device_id": self.device}, report)
+        self.assertEqual(self._prov("Device/a.flac")["state"], "matched")
+        self.assertEqual(self._prov("Device/b.flac")["state"], "pending")
+        self.assertFalse(provenance._PROVENANCE_LOCK.locked())
 
 
 class PushedProvenanceStoreTests(_RematchTestBase):

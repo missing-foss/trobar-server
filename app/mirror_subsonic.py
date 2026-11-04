@@ -27,6 +27,7 @@ import logging
 
 import db
 import matching
+import mirror_runs
 import subsonic_client
 
 _log = logging.getLogger(__name__)
@@ -81,9 +82,8 @@ def delete_mirror(conn, playlist_id: int) -> None:
     """Delete this playlist's remote mirror playlist, if any. Called when
     subsonic_mirror_enabled flips to 0, and from playlist_sync.py's
     stale-playlist cleanup (BEFORE the playlist row itself is deleted,
-    since this needs subsonic_mirror_remote_id first). Does not commit —
-    same convention as mirror.delete_mirror, the caller's own trailing
-    commit covers it.
+    since this needs subsonic_mirror_remote_id first). mirror_sinks commits
+    around it.
 
     Clears the stored remote_id regardless of whether the remote delete
     call itself succeeded (logging a warning on failure) — same choice
@@ -111,8 +111,7 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
     (touches nothing) if the playlist isn't subsonic_mirror_enabled or no
     mirror-target connection is configured. Never raises — every failure
     mode is instead persisted to subsonic_mirror_last_error for the admin
-    overview, same contract as mirror.write_mirror(). Does not commit —
-    runs inline in playlist_sync.py's per-playlist commit.
+    overview, same contract as mirror.write_mirror(). mirror_sinks commits around it.
 
     `tag_index_cache`: see _get_tag_index()'s docstring — pass the same
     dict across every playlist in one sync run to build the target index
@@ -152,12 +151,15 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
     # settled on: a target with a genuinely divergent library is out of
     # scope for v1, not a failure of this write.
     song_ids = []
+    lacked = []
     for e in entries:
         key = (matching.normalize(e["artist"]), matching.normalize(e["album"]),
                matching.normalize(e["title"]))
         candidates = tag_index.get(key)
         if candidates:
             song_ids.append(_select_song_id(candidates, e["track_no"]))
+        else:
+            lacked.append(e)
 
     # A review round found write_mirror() would otherwise happily report a
     # clean write over a playlist that resolved NONE of its locally-matched
@@ -169,6 +171,7 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
     # matched locally yet) is the ordinary case and still writes an empty
     # target playlist, same as mirror.py's filesystem sink would.
     if entries and not song_ids:
+        mirror_runs.record(conn, playlist_id, "subsonic", len(entries), 0, lacked)
         _set_error(conn, playlist_id, "no_target_matches")
         return
 
@@ -184,6 +187,7 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
         # takes for its own unlink failure.
         conn.execute(
             "UPDATE playlists SET subsonic_mirror_remote_id = NULL WHERE id = ?", (playlist_id,))
+        conn.commit()  # before calling out again
         result = subsonic_client.mirror_create_or_replace_playlist(row["title"], song_ids, None)
     if result["status"] != "ok":
         _set_error(conn, playlist_id, "write_failed", result.get("reason"))
@@ -202,3 +206,4 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
         "WHERE id = ?",
         (remote_id, playlist_id),
     )
+    mirror_runs.record(conn, playlist_id, "subsonic", len(entries), len(song_ids), lacked)

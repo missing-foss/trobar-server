@@ -47,6 +47,104 @@ async function assertOk(resp, label) {
   return resp;
 }
 
+// The server under test has to be running this checkout's code. A stale
+// `trobar:dev` image (built before a later UI change) runs fine but serves
+// old code, and the first tests then fail in ways that look like a broken
+// harness. In CI the server runs from the checkout itself, so this always
+// passes there; it is for local runs against a container.
+//
+// Two checks, so that a template-only change is caught too (most UI changes
+// touch a template and no static file):
+// - every file under app/static must be served byte for byte;
+// - a page's template text that every render contains must appear in the
+//   rendered page. That is the literal text between Jinja tags at nesting
+//   depth 0: text inside an if/for/macro may legitimately not render. Flask
+//   emits that text unchanged (no trim_blocks), so a template edit to it shows
+//   up as a missing chunk.
+const APP_DIR = path.join(__dirname, "..", "app");
+const STALE_HINT = "the server under test is not running this checkout's code. " +
+  "Rebuild the image (docker build -t trobar:dev .) and start it again; see e2e/README.md";
+
+function staticFiles(dir, prefix = "") {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? staticFiles(path.join(dir, e.name), `${prefix}${e.name}/`) : [`${prefix}${e.name}`]);
+}
+
+// The server may still be starting when the run begins: a container started
+// moments ago. CI waits for /login before running Playwright; a local run may
+// not. So wait here, before the first check, instead of failing it on a
+// refused connection.
+async function waitForServer(ctx, timeoutMs = 30_000, delayMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  let last = "no answer";
+  while (Date.now() < deadline) {
+    try {
+      const resp = await ctx.get("/login");
+      if (resp.ok()) return;
+      last = `HTTP ${resp.status()}`;
+    } catch (e) {
+      last = e.message.split("\n")[0];
+    }
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  throw new Error(`global-setup: the server never answered GET /login within ${timeoutMs / 1000} s (last: ${last})`);
+}
+
+async function assertStaticMatchesCheckout(ctx) {
+  const files = staticFiles(path.join(APP_DIR, "static"));
+  if (files.length === 0) throw new Error("source check: no files under app/static, so it would check nothing");
+  for (const rel of files) {
+    const resp = await ctx.get(`/static/${rel}`);
+    const local = fs.readFileSync(path.join(APP_DIR, "static", rel));
+    if (!resp.ok() || !Buffer.from(await resp.body()).equals(local)) {
+      throw new Error(`source check: /static/${rel} differs from the checkout (HTTP ${resp.status()}): ${STALE_HINT}`);
+    }
+  }
+  return files.length;
+}
+
+const BLOCK_OPEN = /^\{%\s*(if|for|macro|block|call|filter|with|raw)\b/;
+const BLOCK_SET = /^\{%\s*set\b[^=]*%\}$/;  // `{% set x %}...{% endset %}`, not `{% set x = 1 %}`
+const BLOCK_CLOSE = /^\{%\s*end\w+/;
+
+function alwaysRenderedText(template) {
+  const chunks = [];
+  let depth = 0;
+  const pieces = template.split(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\}|\{#[\s\S]*?#\})/);
+  pieces.forEach((piece, i) => {
+    if (piece.startsWith("{%")) {
+      if (BLOCK_CLOSE.test(piece.replace("{%-", "{%"))) depth -= 1;
+      else if (BLOCK_OPEN.test(piece.replace("{%-", "{%")) || BLOCK_SET.test(piece.replace("{%-", "{%"))) depth += 1;
+      return;
+    }
+    if (piece.startsWith("{{") || piece.startsWith("{#") || depth !== 0) return;
+    // Whitespace control: a `-` inside a tag's delimiter strips the
+    // whitespace on that side of it.
+    let text = piece;
+    if (i > 0 && /-(%\}|\}\}|#\})$/.test(pieces[i - 1])) text = text.trimStart();
+    if (i + 1 < pieces.length && /^(\{%|\{\{|\{#)-/.test(pieces[i + 1])) text = text.trimEnd();
+    if (text.trim().length >= 40) chunks.push(text);
+  });
+  if (depth !== 0) throw new Error(`source check: unbalanced Jinja blocks (depth ${depth} at the end)`);
+  return chunks;
+}
+
+async function assertPageMatchesTemplate(ctx, urlPath, templateName) {
+  // Jinja drops a template's single trailing newline (keep_trailing_newline
+  // is off by default).
+  const template = fs.readFileSync(path.join(APP_DIR, "templates", templateName), "utf8").replace(/\n$/, "");
+  const chunks = alwaysRenderedText(template);
+  if (chunks.length === 0) throw new Error(`source check: ${templateName} has no text to compare, so it would check nothing`);
+  const resp = await assertOk(await ctx.get(urlPath), `source check: GET ${urlPath}`);
+  const page = await resp.text();
+  const missing = chunks.find((c) => !page.includes(c));
+  if (missing !== undefined) {
+    throw new Error(`source check: ${templateName} text is missing from GET ${urlPath} ` +
+      `(${JSON.stringify(missing.trim().slice(0, 80))}...): ${STALE_HINT}`);
+  }
+  return chunks.length;
+}
+
 async function loginWithRetry(ctx, baseURL, username, password, attempts = 5, delayMs = 500) {
   let lastError;
   for (let i = 1; i <= attempts; i++) {
@@ -79,12 +177,18 @@ module.exports = async () => {
 
   const ctx = await request.newContext({ baseURL });
   try {
+    await waitForServer(ctx);
+    const staticCount = await assertStaticMatchesCheckout(ctx);
+    const loginChunks = await assertPageMatchesTemplate(ctx, "/login", "login.html");
     await loginWithRetry(ctx, baseURL, username, password);
     await assertOk(
       await ctx.post("/api/setup/music-root", { data: { path: musicRoot } }),
       "/api/setup/music-root",
     );
     await assertOk(await ctx.post("/api/setup/complete"), "/api/setup/complete");
+    const indexChunks = await assertPageMatchesTemplate(ctx, "/", "index.html");
+    console.log(`source check: ${staticCount} static files, ${loginChunks} login.html and ` +
+      `${indexChunks} index.html text chunks match the checkout`);
     await assertOk(
       await ctx.post("/api/profile/avatar", {
         multipart: { avatar: { name: "avatar.png", mimeType: "image/png", buffer: ONE_PIXEL_PNG } },

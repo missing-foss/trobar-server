@@ -9,7 +9,7 @@
 # base-image security fixes, so it has to be refreshed deliberately rather than
 # left alone — a bare digest nobody updates is worse than a tag.
 # Re-resolve with: docker inspect --format='{{index .RepoDigests 0}}' python:3.14-slim
-FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6
+FROM python:3.14-slim@sha256:930e1abba7c4e8f96ed93e8012c35d174d7732752731bbd5e8e757d7ec6f3966
 
 WORKDIR /app
 
@@ -67,9 +67,10 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 5000
 USER 10001
 
-# #91: let an orchestrator tell a wedged process from a healthy one. /login is
-# unauthenticated and always 200s once the app is serving.
+# Let an orchestrator tell a wedged process from a healthy one. /healthz is
+# unauthenticated, renders nothing, and answers 503 (which urlopen raises on)
+# when the database doesn't answer.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/login').status==200 else 1)"
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/healthz').status==200 else 1)"
 
 CMD ["python", "main.py"]

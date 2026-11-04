@@ -59,6 +59,25 @@ jobs:
             echo "::error::tag $ref implies version $tag_version but VERSION says $file_version — bump VERSION or retag"
             exit 1
           fi
+      - name: CHANGELOG.md has a section for this version
+        # A release says what changed. The section is "## [X.Y.Z]", a date
+        # after it optional, with at least one "- " entry before the next
+        # "## ", so an empty heading doesn't pass. Same environment-only
+        # treatment of the ref as the step above.
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          version="${REF#v}"
+          if awk -v h="## [$version]" '
+              index($0, h) == 1 && (length($0) == length(h) || substr($0, length(h) + 1, 1) == " ") { inside = 1; next }
+              /^## / { inside = 0 }
+              inside && /^- / { found = 1 }
+              END { exit !found }' CHANGELOG.md; then
+            echo "CHANGELOG.md has entries for $version"
+          else
+            echo "::error::CHANGELOG.md has no '## [$version]' section with an entry — add one before tagging"
+            exit 1
+          fi
 
   # The same gates a pull request runs — called, not copied, so they cannot
   # drift from what merges see.
@@ -83,6 +102,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          SUPPORT_LINE: "If Trobar is useful to you, you can support its development on Ko-fi: https://ko-fi.com/missingfoss"
         run: |
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $TAG already exists — leaving it alone"
@@ -93,6 +113,14 @@ jobs:
             else
               gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --draft --generate-notes
             fi
+            # The support line goes after the generated notes: gh's --notes
+            # beside --generate-notes would put it first. Two newlines, so it is
+            # its own paragraph whether or not the body ends in one. Only a
+            # draft this run just created gets it: a re-run never adds it twice.
+            notes="$RUNNER_TEMP/release-notes.md"
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$notes"
+            printf '\n\n%s\n' "$SUPPORT_LINE" >> "$notes"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
           fi
           cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
           ### $TAG — draft release created

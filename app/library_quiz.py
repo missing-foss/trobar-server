@@ -13,12 +13,15 @@ so the actual game logic is unit-testable without a Flask app or a
 database — main.py's api_library_quiz_pair() is just the DB read plus a
 call into pick_pair() below.
 
-Deliberately excludes "Various Artists"/compilation-style entries: the
-`tracks` table has no `album_artist` column, so a compilation's per-track
-`artist` values would otherwise assemble into a phantom mega-artist that
-wins every round on album count alone."""
+Deliberately excludes "Various Artists"/compilation-style entries: it
+counts albums by each track's own `artist`, not `album_artist`, so a
+compilation's per-track artists would otherwise assemble into a phantom
+mega-artist that wins every round on album count alone."""
 
+import logging
 import random
+
+_log = logging.getLogger(__name__)
 
 MIN_ALBUMS = 3  # an artist needs at least this many albums to be a candidate at all
 _MIN_GAP = 2  # ...and the pair's counts must differ by at least this many albums...

@@ -37,8 +37,7 @@ test.describe("device icons", () => {
     await page.goto("/#/home");
     await page.evaluate(async (id) => {
       const a = window.Alpine.$data(document.querySelector("[x-data]"));
-      a.goToTab("profile");
-      a.setSubTab("profile", "devices");
+      a.goToTab("devices");
       await a.loadDevices();
       a.startEditDevice(a.devices.find((d) => d.id === id));
     }, device.id);

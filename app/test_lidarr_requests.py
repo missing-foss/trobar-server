@@ -21,6 +21,7 @@ import unittest.mock as mock
 from pathlib import Path
 
 import db
+import jobs
 import lidarr_requests
 import matching
 
@@ -310,7 +311,8 @@ class RunBookkeepingTests(_LidarrRequestsTestBase):
         pid = self._make_playlist("Chill")
         self._add_unresolved(pid, "Artist One", "Album One")
         with mock.patch("lidarr_requests.lidarr_client") as client:
-            client.lookup_album.return_value = {"status": "error", "reason": "unreachable", "code": 500}
+            # A permanent failure: Lidarr answers, but nothing matches.
+            client.lookup_album.return_value = {"status": "ok", "candidates": []}
             lidarr_requests.run_for_playlist(self.conn, pid)
         self.assertEqual(self._row(pid)["lidarr_request_last_error_code"], "failed")
 
@@ -339,5 +341,193 @@ class RunBookkeepingTests(_LidarrRequestsTestBase):
         self.assertEqual(self._row(pid)["lidarr_request_last_count"], 2)
 
 
+
+class CancelTests(_LidarrRequestsTestBase):
+    """The job's `report` runs before each album; a cancel raised there stops
+    the run after the albums already asked for, and still records it."""
+
+    def test_a_cancel_stops_before_the_next_album_and_records_the_run(self):
+        pid = self._make_playlist("Chill")
+        self._add_unresolved(pid, "First", "Album One")
+        self._add_unresolved(pid, "Second", "Album Two")
+        seen = []
+
+        def report(done, total):
+            seen.append((done, total))
+            if done == 1:
+                raise jobs.JobCancelled(jobs.CANCEL_ADMIN)
+
+        with mock.patch.object(lidarr_requests, "_attempt_one",
+                               return_value=("requested", None, 11, 12)) as attempt, \
+                self.assertRaises(jobs.JobCancelled):
+            lidarr_requests.run_for_playlist(self.conn, pid, report)
+        self.assertEqual(seen, [(0, 2), (1, 2)])
+        attempt.assert_called_once()
+        self.assertEqual(self._requested_row("First", "Album One")["status"], "requested")
+        self.assertIsNone(self._requested_row("Second", "Album Two"))
+        row = self._row(pid)
+        self.assertIsNotNone(row["lidarr_request_last_run_at"])
+        self.assertEqual(row["lidarr_request_last_count"], 1)
+
+    def test_the_job_passes_its_report_through(self):
+        pid = self._make_playlist("Chill")
+        report = mock.Mock()
+        with mock.patch.object(lidarr_requests, "run_for_playlist") as run:
+            lidarr_requests.run_job({"playlist_id": pid}, report)
+        self.assertIs(run.call_args.args[2], report)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class WriteLockTests(_LidarrRequestsTestBase):
+    """The production failure: the write lock held across every Lidarr call
+    in a run, so other writers timed out. While a run waits on Lidarr, any
+    other connection must be able to take the write lock."""
+
+    def _lock_free(self) -> bool:
+        other = db.sqlite3.connect(str(db.DB_PATH), timeout=0.05)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.rollback()
+            return True
+        except db.sqlite3.OperationalError:
+            return False
+        finally:
+            other.close()
+
+    def test_another_connection_can_write_while_lidarr_is_being_asked(self):
+        pid = self._make_playlist("Chill")
+        for n in range(3):
+            self._add_unresolved(pid, f"Artist {n}", f"Album {n}")
+        seen = []
+
+        def slow_lidarr(artist, album):
+            seen.append(self._lock_free())
+            return "requested", None, 1, 2
+
+        with mock.patch.object(lidarr_requests, "_attempt_one", side_effect=slow_lidarr):
+            lidarr_requests.run_for_playlist(self.conn, pid)
+        # Every call, including the ones after earlier outcomes were written.
+        self.assertEqual(seen, [True, True, True])
+        self.assertEqual(self._row(pid)["lidarr_request_last_count"], 3)
+        self.assertFalse(self.conn.in_transaction)
+
+    def test_each_outcome_is_committed_before_the_next_call(self):
+        """A run cut short keeps what it already did."""
+        pid = self._make_playlist("Chill")
+        self._add_unresolved(pid, "Artist One", "Album One")
+        self._add_unresolved(pid, "Artist Two", "Album Two")
+        committed = []
+
+        def lidarr(artist, album):
+            other = db.get_conn()
+            try:
+                committed.append(other.execute(
+                    "SELECT COUNT(*) FROM lidarr_requested_albums").fetchone()[0])
+            finally:
+                other.close()
+            return "requested", None, 1, 2
+
+        with mock.patch.object(lidarr_requests, "_attempt_one", side_effect=lidarr):
+            lidarr_requests.run_for_playlist(self.conn, pid)
+        self.assertEqual(committed, [0, 1])
+
+
+class TransientFailureTests(_LidarrRequestsTestBase):
+    """Lidarr not answering says nothing about the album: no row is written,
+    so the next run asks again. A real answer, even a failing one, is still
+    recorded once and never retried."""
+
+    def _attempted(self):
+        return [(r["artist"], r["status"]) for r in self.conn.execute(
+            "SELECT artist, status FROM lidarr_requested_albums ORDER BY artist")]
+
+    def test_an_unreachable_lidarr_is_asked_again_next_run(self):
+        pid = self._make_playlist("Chill")
+        self._add_unresolved(pid, "Artist", "Album")
+        with mock.patch.object(lidarr_requests, "_attempt_one",
+                               return_value=("failed", "unreachable", None, None)):
+            lidarr_requests.run_for_playlist(self.conn, pid)
+        self.assertEqual(self._attempted(), [])
+        row = self._row(pid)
+        self.assertEqual((row["lidarr_request_last_error_code"], row["lidarr_request_last_error"]),
+                         ("failed", "unreachable"))
+
+        with mock.patch.object(lidarr_requests, "_attempt_one",
+                               return_value=("requested", None, 1, 2)) as attempt:
+            lidarr_requests.run_for_playlist(self.conn, pid)
+        attempt.assert_called_once_with("Artist", "Album")
+        self.assertEqual(self._attempted(), [("Artist", "requested")])
+
+    def test_a_permanent_failure_is_recorded_and_not_retried(self):
+        pid = self._make_playlist("Chill")
+        self._add_unresolved(pid, "Artist", "Album")
+        with mock.patch.object(lidarr_requests, "_attempt_one",
+                               return_value=("failed", "no_artist_match", None, None)):
+            lidarr_requests.run_for_playlist(self.conn, pid)
+        with mock.patch.object(lidarr_requests, "_attempt_one") as attempt:
+            lidarr_requests.run_for_playlist(self.conn, pid)
+        attempt.assert_not_called()
+        self.assertEqual(self._attempted(), [("Artist", "failed")])
+
+    def test_init_clears_old_unreachable_rows_and_keeps_the_rest(self):
+        for artist, status, error in (("A", "failed", "unreachable"),
+                                      ("B", "failed", "no_artist_match"),
+                                      ("C", "requested", None)):
+            self.conn.execute(
+                "INSERT INTO lidarr_requested_albums (normalized_artist, normalized_album, "
+                "artist, album, status, error) VALUES (?, 'x', ?, 'X', ?, ?)",
+                (artist.lower(), artist, status, error))
+        # Only a database from before schema versioning can hold such rows
+        # (nothing writes them now), so the cleanup is part of migration 1.
+        self.conn.execute("PRAGMA user_version = 0")
+        self.conn.commit()
+        db.init_db()
+        self.assertEqual(self._attempted(), [("B", "failed"), ("C", "requested")])
+
+
+class LastOutcomeTests(_LidarrRequestsTestBase):
+    def test_a_run_that_attempts_nothing_keeps_the_last_outcome(self):
+        """The production case: a retried enable found everything already
+        asked for and stored 0, hiding the real result."""
+        pid = self._make_playlist("Chill")
+        self._add_unresolved(pid, "One", "Album One")
+        self._add_unresolved(pid, "Two", "Album Two")
+        outcomes = iter([("requested", None, 1, 2), ("failed", "no_artist_match", None, None)])
+        with mock.patch.object(lidarr_requests, "_attempt_one", side_effect=lambda a, b: next(outcomes)):
+            lidarr_requests.run_for_playlist(self.conn, pid)
+        self.conn.execute("UPDATE playlists SET lidarr_request_last_run_at = '2000-01-01 00:00:00' WHERE id = ?", (pid,))
+        self.conn.commit()
+
+        with mock.patch.object(lidarr_requests, "_attempt_one") as attempt:
+            lidarr_requests.run_for_playlist(self.conn, pid)
+        attempt.assert_not_called()
+        row = self._row(pid)
+        self.assertEqual((row["lidarr_request_last_count"], row["lidarr_request_last_error_code"],
+                          row["lidarr_request_last_error"]), (1, "failed", "no_artist_match"))
+        self.assertNotEqual(row["lidarr_request_last_run_at"], "2000-01-01 00:00:00")
+
+
+class JobTests(_LidarrRequestsTestBase):
+    def _queued(self):
+        return [r["payload"] for r in self.conn.execute(
+            "SELECT payload FROM jobs WHERE type = ?", (lidarr_requests.JOB_TYPE,))]
+
+    def test_enqueue_queues_one_run_per_playlist_only_when_requests_are_on(self):
+        on, off = self._make_playlist("On"), self._make_playlist("Off", lidarr_request_enabled=False)
+        self.assertTrue(lidarr_requests.enqueue(self.conn, on))
+        self.assertTrue(lidarr_requests.enqueue(self.conn, on))  # already pending
+        self.assertFalse(lidarr_requests.enqueue(self.conn, off))
+        self.assertFalse(lidarr_requests.enqueue(self.conn, 999))
+        self.assertEqual(self._queued(), [f'{{"playlist_id": {on}}}'])
+
+    def test_the_job_runs_the_playlist_on_its_own_connection(self):
+        pid = self._make_playlist("Chill")
+        self._add_unresolved(pid, "Artist", "Album")
+        with mock.patch.object(lidarr_requests, "_attempt_one",
+                               return_value=("requested", None, 1, 2)) as attempt:
+            self.assertEqual(lidarr_requests.run_job({"playlist_id": pid}), {"playlist_id": pid})
+        attempt.assert_called_once_with("Artist", "Album")
+        self.assertEqual(self._row(pid)["lidarr_request_last_count"], 1)

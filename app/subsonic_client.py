@@ -41,20 +41,22 @@ directly.
 """
 
 import hashlib
+import logging
 import secrets
-import threading
 
 import requests
 
 import db
 import provider_config
+from artist_image_keys import ArtistImageKeys
 import matching
+
+_log = logging.getLogger(__name__)
 
 _API_VERSION = "1.16.1"
 _CLIENT_ID = "trobar"
 
-_artist_image_key_map: dict[str, str] | None = None
-_artist_image_key_map_lock = threading.Lock()
+_artist_image_key_map = ArtistImageKeys()
 
 
 def _current_config() -> tuple[str, str, str]:
@@ -198,11 +200,22 @@ def list_playlists() -> dict:
     ]}
 
 
+def _first_isrc(value) -> str | None:
+    """OpenSubsonic servers (Navidrome) give a song's ISRCs as a list; older
+    Subsonic servers give none. The first one, or None."""
+    if isinstance(value, list):
+        value = next((v for v in value if isinstance(v, str) and v.strip()), None)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def get_playlist_tracks(playlist_title: str, source_playlist_id: str | None = None) -> dict:
     """Tracks of one playlist, in order. Each item is {"position", "title",
-    "artist", "path", "album"} — the extra `path`/`album` fields (Roon never
-    has these) are what let matching.py skip straight to an exact-path match
-    instead of its Roon-Browse-API-specific fuzzy fallback.
+    "artist", "path", "album", "mbid", "isrc"} — the extra `path`/`album`
+    fields (Roon never has these) are what let matching.py skip straight to
+    an exact-path match instead of its Roon-Browse-API-specific fuzzy
+    fallback. `mbid` (the MusicBrainz recording id) and `isrc` come from
+    OpenSubsonic servers such as Navidrome, and are None elsewhere. Note that
+    Navidrome's `path` is rebuilt in its own naming pattern, not the file's.
 
     Fetched by `source_playlist_id` directly (from list_playlists above) —
     fetching by title would be ambiguous now that same-named playlists can
@@ -232,6 +245,8 @@ def get_playlist_tracks(playlist_title: str, source_playlist_id: str | None = No
             "artist": e.get("artist", ""),
             "path": e.get("path"),
             "album": e.get("album"),
+            "mbid": e.get("musicBrainzId") or None,
+            "isrc": _first_isrc(e.get("isrc")),
         }
         for i, e in enumerate(entries)
     ]
@@ -253,11 +268,7 @@ def _build_artist_image_key_map() -> dict[str, str]:
 def _get_artist_image_key_map() -> dict[str, str]:
     """Mirrors roon_client's exact caching pattern — one full artist walk
     per process lifetime, every lookup after that a plain dict get."""
-    global _artist_image_key_map
-    with _artist_image_key_map_lock:
-        if _artist_image_key_map is None:
-            _artist_image_key_map = _build_artist_image_key_map()
-        return _artist_image_key_map
+    return _artist_image_key_map.get(_build_artist_image_key_map)
 
 
 def get_artist_image(artist_name: str) -> tuple[bytes, str] | None:

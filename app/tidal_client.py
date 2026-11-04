@@ -3,8 +3,9 @@
 # SPDX-FileCopyrightText: 2026 missing-foss
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Direct (non-Roon) Tidal playlist provider (#21) — read-only, per Trobar
-user's own linked Tidal account.
+"""Direct (non-Roon) Tidal playlist provider (#21), per Trobar user's own
+linked Tidal account. Reads the user's playlists; the write calls at the end
+exist only to keep a shared playlist's copy in another member's account.
 
 Unlike roon_client.py/subsonic_client.py/jellyfin_client.py, this is NOT an
 admin-configured shared connection: a Tidal family plan is billing-only,
@@ -43,15 +44,32 @@ that still bites if changed; the endpoint shapes are settled.
 
 import logging
 import time
+import uuid
 
 import requests
 
 AUTHORIZE_URL = "https://login.tidal.com/authorize"
 TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
 API_BASE = "https://openapi.tidal.com/v2"
-# Space-separated per OAuth2 convention. Read-only — this provider never
-# writes to a user's Tidal account.
+# Space-separated per OAuth2 convention. These cover the reads; the write
+# calls at the end of this module also need WRITE_SCOPE (see scopes()).
 SCOPES = "user.read collection.read playlists.read"
+# Requested only once the admin says their registered app has it enabled:
+# Tidal refuses an authorize request asking for a scope the app lacks, so
+# requesting it unconditionally would break Connect for every install whose
+# app predates sharing.
+WRITE_SCOPE = "playlists.write"
+
+
+def scopes(write: bool) -> str:
+    """The scope string to request, with WRITE_SCOPE when `write`."""
+    return f"{SCOPES} {WRITE_SCOPE}" if write else SCOPES
+
+
+def has_write_scope(granted: str | None) -> bool:
+    """Whether a stored grant (space-separated scopes, None for a link made
+    before grants were recorded) includes WRITE_SCOPE."""
+    return WRITE_SCOPE in (granted or "").split()
 
 _TIMEOUT = 15
 # Tidal's /tracks?filter[id]= returns every requested track in one call;
@@ -122,7 +140,7 @@ def _error_reason(exc: Exception) -> str:
     than every failure looking identical."""
     if isinstance(exc, requests.HTTPError):
         status = getattr(exc.response, "status_code", None)
-        return "rate_limited" if status == 429 else "http_error"
+        return "rate_limited" if status == 429 else f"http_{status}"
     if isinstance(exc, requests.RequestException):
         return "network"
     return "parse_error"
@@ -175,7 +193,7 @@ def get_current_user(access_token: str) -> dict:
     """{"status": "ok", "user_id": ..., "display_name": ...} or
     {"status": "error"}. Called once at link time (see main.py's
     /profile/tidal/callback) to populate the "Connected as: X" label and
-    resolve the user id list_playlists() below needs."""
+    store the account id."""
     try:
         resp = requests.get(
             f"{API_BASE}/users/me",
@@ -191,7 +209,7 @@ def get_current_user(access_token: str) -> dict:
         return {"status": "error"}
 
 
-def list_playlists(access_token: str, tidal_user_id: str) -> dict:
+def list_playlists(access_token: str) -> dict:
     """{"status": "ok", "playlists": [{"id", "title"}, ...]} or an error
     dict — the common shape every provider client returns (#75). Each row's
     `id` is Tidal's real, stable playlist id, so it drives the sync's
@@ -199,7 +217,7 @@ def list_playlists(access_token: str, tidal_user_id: str) -> dict:
     get_playlist_tracks() fetches by it directly.
 
     Uses the account's whole COLLECTION, not just owned playlists (#132):
-    `/userCollections/{id}/relationships/playlists` also surfaces
+    `/userCollectionPlaylists/me/relationships/items` also surfaces
     saved/followed playlists the account didn't create (editorial, Tidal
     mixes, playlists shared by others), matching what Roon's Tidal
     integration shows — the old owned-only `/playlists?filter[r.owners.id]=`
@@ -208,42 +226,55 @@ def list_playlists(access_token: str, tidal_user_id: str) -> dict:
 
     Same JSON:API relationship shape as the items endpoint: `data` holds
     {type, id} refs, the playlist objects (with attributes.name) are
-    sideloaded into `included` via `include=playlists`, and it paginates by
+    sideloaded into `included` via `include=items`, and it paginates by
     the same opaque `links.next` cursor (#126) — so, like a playlist's items,
-    it must be walked to the end rather than trusting one page."""
-    if not tidal_user_id:
-        return {"status": "error", "reason": "no_user_id"}
+    it must be walked to the end rather than trusting one page.
+
+    Tidal retired the older `/userCollections/{id}/relationships/playlists`,
+    which now answers 404. The new path addresses the account as `me`, and
+    `collectionView=FLAT` asks for the playlists inside folders rather than
+    the folders themselves."""
     try:
         playlists = []
         seen_ids: set[str] = set()
-        params: dict | None = {"include": "playlists", "page[size]": "100"}
-        next_url = f"/userCollections/{tidal_user_id}/relationships/playlists"
+        params: dict | None = {"include": "items", "collectionView": "FLAT"}
+        next_url = "/userCollectionPlaylists/me/relationships/items"
         for _ in range(_MAX_PAGES):
             body = _auth_get(access_token, next_url, params)
             included = {(i.get("type"), i.get("id")): i
                         for i in body.get("included", [])}
-            for ref in body.get("data", []):
+            refs = body.get("data", [])
+            named = 0
+            for ref in refs:
                 if ref.get("type") != "playlists" or not ref.get("id"):
                     continue
                 pid = ref["id"]
-                if pid in seen_ids:
-                    continue
                 pl = included.get(("playlists", pid))
                 name = pl.get("attributes", {}).get("name") if pl else None
                 if not name:
                     continue
+                named += 1
+                if pid in seen_ids:
+                    continue
                 seen_ids.add(pid)
                 playlists.append({"id": pid, "title": name})
+            if refs and not named:
+                # A page of refs none of which reads as a named playlist means
+                # the answer's shape isn't the one expected. An empty "ok"
+                # would tell the sync the account stopped listing every
+                # playlist, and it would delete them.
+                return {"status": "error", "reason": "unexpected_shape"}
             nxt = body.get("links", {}).get("next")
             if not nxt:
                 break
             next_url = nxt
-            params = None  # links.next already carries page[cursor]/page[size]
+            params = None  # links.next already carries page[cursor] and the rest
         else:
-            # #127: exhausted the valve without a final page — a >50k-playlist
-            # collection would be silently truncated, so make it visible.
-            _log.warning("Tidal collection for user %s: hit _MAX_PAGES=%d, "
-                         "playlist list may be truncated", tidal_user_id, _MAX_PAGES)
+            # #127: exhausted the valve without a final page — at Tidal's
+            # default page size, which isn't known, the collection would be
+            # silently truncated, so make it visible.
+            _log.warning("Tidal collection: hit _MAX_PAGES=%d, "
+                         "playlist list may be truncated", _MAX_PAGES)
         return {"status": "ok", "playlists": playlists}
     except (requests.RequestException, KeyError, ValueError) as e:
         return {"status": "error", "reason": _error_reason(e)}
@@ -282,6 +313,9 @@ def get_playlist_tracks(title: str, source_playlist_id: str | None = None,
         #    title fallback from the items' own sideloaded track objects.
         ordered_ids: list[str] = []
         title_fallback: dict[str, str] = {}
+        # The ISRC the same sideloaded track objects carry (captured shape:
+        # attributes.isrc), for identity's ISRC tiers.
+        isrc_by_id: dict[str, str] = {}
         params: dict | None = {"include": "items", "page[size]": "500"}
         next_url = f"/playlists/{source_playlist_id}/relationships/items"
         for _ in range(_MAX_PAGES):
@@ -296,6 +330,9 @@ def get_playlist_tracks(title: str, source_playlist_id: str | None = None,
                 inc = included.get(("tracks", tid))
                 if inc:
                     title_fallback[tid] = inc.get("attributes", {}).get("title", "")
+                    isrc = inc.get("attributes", {}).get("isrc")
+                    if isinstance(isrc, str) and isrc:
+                        isrc_by_id[tid] = isrc
             nxt = body.get("links", {}).get("next")
             if not nxt:
                 break
@@ -343,7 +380,208 @@ def get_playlist_tracks(title: str, source_playlist_id: str | None = None,
                 "artist": artist,
                 "title": track_title,
                 "album": None,
+                "isrc": isrc_by_id.get(tid),
             })
         return {"status": "ok", "tracks": tracks}
     except (requests.RequestException, KeyError, ValueError) as e:
+        return {"status": "error", "reason": _error_reason(e)}
+
+
+# --- Writes ---------------------------------------------------------------
+#
+# Used only to keep a copy of one member's playlist in another member's
+# account. Each needs the playlists.write scope. Built against Tidal's
+# published OpenAPI document, not yet against a live account.
+
+_JSONAPI = "application/vnd.api+json"
+# Per-request caps from the published schema.
+_ADD_BATCH = 50
+_REMOVE_BATCH = 50
+_MOVE_BATCH = 20
+
+
+def _auth_send(access_token: str, method: str, path: str, body: dict | None = None) -> dict:
+    """Authenticated write returning parsed JSON ({} for an empty body),
+    raising on HTTP error. Retries exactly as _auth_get does. Every attempt
+    carries the same Idempotency-Key, so a retry after a lost response or a
+    5xx replays the first outcome instead of adding the same items twice."""
+    url = API_BASE + path
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": _JSONAPI,
+        "Accept": _JSONAPI,
+        "Idempotency-Key": str(uuid.uuid4()),
+    }
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        last = attempt == _RETRY_ATTEMPTS
+        try:
+            resp = requests.request(method, url, json=body, headers=headers, timeout=_TIMEOUT)
+        except requests.RequestException:
+            if last:
+                raise
+            time.sleep(_retry_delay(attempt, None))
+            continue
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if last:
+                resp.raise_for_status()
+            _log.info("Tidal %s %s -> %s, retry %d/%d",
+                      method, path, resp.status_code, attempt, _RETRY_ATTEMPTS)
+            time.sleep(_retry_delay(attempt, resp.headers.get("Retry-After")))
+            continue
+        resp.raise_for_status()
+        if not resp.content:
+            return {}
+        return resp.json()
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
+def get_playlist_items(access_token: str, playlist_id: str) -> dict:
+    """{"status": "ok", "items": [{"track_id", "item_id"}, ...]} in playlist
+    order, or an error dict. `item_id` names one occurrence, which is what a
+    removal or a move needs: the same track can appear twice."""
+    if not playlist_id:
+        return {"status": "error", "reason": "not_found"}
+    try:
+        items = []
+        params: dict | None = {"page[size]": "500"}
+        next_url = f"/playlists/{playlist_id}/relationships/items"
+        for _ in range(_MAX_PAGES):
+            body = _auth_get(access_token, next_url, params)
+            for ref in body.get("data", []):
+                item_id = (ref.get("meta") or {}).get("itemId")
+                if ref.get("type") != "tracks" or not ref.get("id") or not item_id:
+                    continue
+                items.append({"track_id": ref["id"], "item_id": item_id})
+            nxt = body.get("links", {}).get("next")
+            if not nxt:
+                break
+            next_url = nxt
+            params = None
+        else:
+            # A truncated read would make a sync remove what it never saw.
+            return {"status": "error", "reason": "truncated"}
+        return {"status": "ok", "items": items}
+    except (requests.RequestException, KeyError, ValueError) as e:
+        return {"status": "error", "reason": _write_side_reason(e)}
+
+
+def _write_side_reason(exc: Exception) -> str:
+    """_error_reason, plus "not_found" for a 404: a share sync must tell a
+    playlist that no longer exists from one it couldn't reach."""
+    if isinstance(exc, requests.HTTPError) and getattr(exc.response, "status_code", None) == 404:
+        return "not_found"
+    return _error_reason(exc)
+
+
+def get_playlist(access_token: str, playlist_id: str) -> dict:
+    """{"status": "ok", "name": ..., "owner_ids": [Tidal user ids]} or an
+    error dict ("not_found" when the playlist is gone). A playlist in a
+    collection may be one the account only follows, which it can't edit."""
+    try:
+        body = _auth_get(access_token, f"/playlists/{playlist_id}", {"include": "owners"})
+        name = body["data"]["attributes"]["name"]
+        if not isinstance(name, str):
+            raise ValueError("no playlist name")
+        owners = (((body["data"].get("relationships") or {}).get("owners") or {}).get("data") or [])
+        owner_ids = [o["id"] for o in owners if isinstance(o, dict) and o.get("id")]
+        return {"status": "ok", "name": name, "owner_ids": owner_ids}
+    except (requests.RequestException, KeyError, TypeError, ValueError) as e:
+        return {"status": "error", "reason": _write_side_reason(e)}
+
+
+def create_playlist(access_token: str, name: str) -> dict:
+    """{"status": "ok", "id": ...} or an error dict. Created UNLISTED, so the
+    copy is not published on the recipient's profile."""
+    try:
+        body = _auth_send(access_token, "POST", "/playlists", {"data": {
+            "type": "playlists",
+            "attributes": {"name": name[:250], "accessType": "UNLISTED"},
+        }})
+        pid = body["data"]["id"]
+        if not pid:
+            raise ValueError("empty playlist id")
+        return {"status": "ok", "id": pid}
+    except (requests.RequestException, KeyError, TypeError, ValueError) as e:
+        return {"status": "error", "reason": _error_reason(e)}
+
+
+def rename_playlist(access_token: str, playlist_id: str, name: str) -> dict:
+    try:
+        _auth_send(access_token, "PATCH", f"/playlists/{playlist_id}", {"data": {
+            "type": "playlists", "id": playlist_id,
+            "attributes": {"name": name[:250]},
+        }})
+        return {"status": "ok"}
+    except (requests.RequestException, ValueError) as e:
+        return {"status": "error", "reason": _error_reason(e)}
+
+
+def delete_playlist(access_token: str, playlist_id: str) -> dict:
+    try:
+        _auth_send(access_token, "DELETE", f"/playlists/{playlist_id}")
+        return {"status": "ok"}
+    except (requests.RequestException, ValueError) as e:
+        return {"status": "error", "reason": _error_reason(e)}
+
+
+def add_tracks(access_token: str, playlist_id: str, track_ids: list[str],
+               before_item_id: str | None = None) -> dict:
+    """Inserts `track_ids` in order, at the end or before the occurrence
+    `before_item_id`. {"status": "ok", "not_found": [track ids Tidal refused
+    as unavailable]} or an error dict. Duplicates are added, not skipped: a
+    copy repeats a track as often as its source does.
+
+    A failure part-way leaves the earlier batches added; the caller re-reads
+    the playlist rather than assuming either outcome."""
+    not_found: list[str] = []
+    try:
+        for start in range(0, len(track_ids), _ADD_BATCH):
+            chunk = track_ids[start:start + _ADD_BATCH]
+            meta: dict = {"onDuplicates": "ADD"}
+            if before_item_id:
+                meta["positionBefore"] = before_item_id
+            body = _auth_send(access_token, "POST", f"/playlists/{playlist_id}/relationships/items", {
+                "data": [{"type": "tracks", "id": t} for t in chunk],
+                "meta": meta,
+            })
+            for skipped in (body.get("meta") or {}).get("skipped") or []:
+                if skipped.get("reason") == "NOT_FOUND" and skipped.get("id"):
+                    not_found.append(skipped["id"])
+        return {"status": "ok", "not_found": not_found}
+    except (requests.RequestException, ValueError) as e:
+        return {"status": "error", "reason": _error_reason(e)}
+
+
+def remove_items(access_token: str, playlist_id: str, items: list[dict]) -> dict:
+    """Removes the given occurrences ({"track_id", "item_id"} as
+    get_playlist_items returns them)."""
+    try:
+        for start in range(0, len(items), _REMOVE_BATCH):
+            chunk = items[start:start + _REMOVE_BATCH]
+            _auth_send(access_token, "DELETE", f"/playlists/{playlist_id}/relationships/items", {
+                "data": [{"type": "tracks", "id": i["track_id"], "meta": {"itemId": i["item_id"]}}
+                         for i in chunk],
+            })
+        return {"status": "ok"}
+    except (requests.RequestException, ValueError) as e:
+        return {"status": "error", "reason": _error_reason(e)}
+
+
+def move_items(access_token: str, playlist_id: str, items: list[dict],
+               before_item_id: str) -> dict:
+    """Moves the given occurrences, keeping their order, to just before the
+    occurrence `before_item_id`. Batches are sent last-first, each before
+    the previous batch's first item, so the moved run stays contiguous."""
+    try:
+        anchor = before_item_id
+        batches = [items[i:i + _MOVE_BATCH] for i in range(0, len(items), _MOVE_BATCH)]
+        for chunk in reversed(batches):
+            _auth_send(access_token, "PATCH", f"/playlists/{playlist_id}/relationships/items", {
+                "data": [{"type": "tracks", "id": i["track_id"], "meta": {"itemId": i["item_id"]}}
+                         for i in chunk],
+                "meta": {"positionBefore": anchor},
+            })
+            anchor = chunk[0]["item_id"]
+        return {"status": "ok"}
+    except (requests.RequestException, ValueError) as e:
         return {"status": "error", "reason": _error_reason(e)}

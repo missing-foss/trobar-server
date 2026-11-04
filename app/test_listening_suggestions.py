@@ -22,6 +22,7 @@ reads is the one the app uses.
     python3 -m unittest test_listening_suggestions -v
 """
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -35,11 +36,19 @@ os.environ["DATA_DIR"] = _TMP
 import db  # noqa: E402
 db.DATA_DIR = Path(_TMP)
 
+import history_cache  # noqa: E402
 import lastfm  # noqa: E402
 import listenbrainz  # noqa: E402
 import suggestions  # noqa: E402
 
 _PLACEHOLDER = f"https://lastfm.freetls.fastly.net/i/u/300x300/{lastfm._LASTFM_PLACEHOLDER_HASH}.png"
+
+
+def _answered(result):
+    """The result of a history call that's expected to have answered; narrows
+    `list | None` for the type checker and fails loudly on None."""
+    assert result is not None, "the service was expected to answer"
+    return result
 
 
 def _resp(json_body=None, status_code=200, http_error=False):
@@ -208,12 +217,23 @@ class LastfmFailureTests(unittest.TestCase):
         with mock.patch("requests.get", return_value=_resp({"user": {"name": "alice"}})):
             self.assertTrue(lastfm.check_connection("alice", api_key="k"))
 
-    def test_every_list_call_is_empty_on_an_http_error_or_a_body_that_is_not_json(self):
+    def test_a_history_call_that_fails_is_none_not_empty(self):
+        # None is "Last.fm didn't answer", which a caller must be able to tell
+        # from [] ("nothing played"). similar_artists isn't a history call and
+        # keeps [] on failure.
         for failing in (_resp(http_error=True, status_code=500), _resp(ValueError("not json"))):
             with mock.patch("requests.get", return_value=failing), mock.patch("builtins.print"):
-                self.assertEqual(lastfm.top_albums("alice", api_key="k"), [])
-                self.assertEqual(lastfm.recent_tracks("alice", api_key="k"), [])
+                self.assertIsNone(lastfm.top_albums("alice", api_key="k"))
+                self.assertIsNone(lastfm.recent_tracks("alice", api_key="k"))
+                self.assertIsNone(lastfm.suggestions(None, "alice", api_key="k"))
+                self.assertIsNone(lastfm.most_played("alice", api_key="k"))
+                self.assertIsNone(lastfm.recently_played_suggestions(None, "alice", api_key="k"))
                 self.assertEqual(lastfm.similar_artists("Autechre", api_key="k"), [])
+
+    def test_an_empty_answer_is_empty_not_none(self):
+        with mock.patch("requests.get", return_value=_resp({"topalbums": {"album": []}})):
+            self.assertEqual(lastfm.top_albums("alice", api_key="k"), [])
+            self.assertEqual(lastfm.most_played("alice", api_key="k"), [])
 
     def test_similar_artists_keeps_the_order_and_skips_nameless_entries(self):
         body = {"similarartists": {"artist": [{"name": "Autechre"}, {"name": ""}, {}, {"name": "Plaid"}]}}
@@ -227,7 +247,7 @@ class LastfmFailureTests(unittest.TestCase):
             {"artist": {"name": "Plaid"}, "name": "Polymer", "playcount": "12"},
         ]
         with mock.patch("requests.get", return_value=_resp({"topalbums": {"album": albums}})):
-            out = lastfm.most_played("alice", api_key="k")
+            out = _answered(lastfm.most_played("alice", api_key="k"))
         self.assertEqual([(o["album"], o["playcount"]) for o in out], [("Syro", 40), ("Polymer", 12)])
 
 
@@ -243,7 +263,7 @@ class LastfmSuggestionTests(_LibraryBase):
         self._cover("album", "Aphex Twin||Syro", self.phone)                      # on one of two: still suggested
         body = self._top(("boards of canada", "geogaddi"), ("aphex twin", "syro"), ("Not In", "The Library"))
         with mock.patch("requests.get", return_value=_resp(body)):
-            out = lastfm.suggestions(self.conn, "alice", api_key="k", user_device_ids={self.phone, self.dap})
+            out = _answered(lastfm.suggestions(self.conn, "alice", api_key="k", user_device_ids={self.phone, self.dap}))
         self.assertEqual(len(out), 1)
         s = out[0]
         # The provider's casing is kept for display; the library's is what a selection must target.
@@ -267,7 +287,7 @@ class LastfmSuggestionTests(_LibraryBase):
             "not a dict",
         ]
         with mock.patch("requests.get", return_value=_resp({"recenttracks": {"track": tracks}})):
-            out = lastfm.recently_played_suggestions(self.conn, "alice", api_key="k")
+            out = _answered(lastfm.recently_played_suggestions(self.conn, "alice", api_key="k"))
         self.assertEqual([(o["artist"], o["album"], o["source"]) for o in out], [("Boards of Canada", "Geogaddi", "lastfm-recent")])
 
     def test_recently_played_drops_what_every_device_already_has(self):
@@ -303,11 +323,14 @@ class ListenBrainzParsingAndFailureTests(unittest.TestCase):
         with mock.patch("requests.get", side_effect=requests.Timeout("slow")):
             self.assertFalse(listenbrainz.check_connection("alice"))
 
-    def test_every_list_call_is_empty_on_an_http_error_or_a_body_that_is_not_json(self):
+    def test_a_history_call_that_fails_is_none_not_empty(self):
         for failing in (_resp(http_error=True, status_code=500), _resp(ValueError("not json"))):
             with mock.patch("requests.get", return_value=failing), mock.patch("builtins.print"):
-                self.assertEqual(listenbrainz.top_release_groups("alice"), [])
-                self.assertEqual(listenbrainz.recent_listens("alice"), [])
+                self.assertIsNone(listenbrainz.top_release_groups("alice"))
+                self.assertIsNone(listenbrainz.recent_listens("alice"))
+                self.assertIsNone(listenbrainz.suggestions(None, "alice"))
+                self.assertIsNone(listenbrainz.most_played("alice"))
+                self.assertIsNone(listenbrainz.recently_played_suggestions(None, "alice"))
 
     def test_recent_listens_asks_for_at_most_a_hundred(self):
         with mock.patch("requests.get", return_value=_resp({"payload": {"listens": []}})) as get:
@@ -321,7 +344,7 @@ class ListenBrainzParsingAndFailureTests(unittest.TestCase):
             {"artist_name": "Plaid", "release_group_name": "Polymer", "listen_count": 12},
         ]
         with mock.patch("requests.get", return_value=_resp({"payload": {"release_groups": groups}})):
-            out = listenbrainz.most_played("alice")
+            out = _answered(listenbrainz.most_played("alice"))
         self.assertEqual([(o["album"], o["playcount"]) for o in out], [("Syro", 40), ("Polymer", 12)])
         self.assertEqual(out[0]["image_url"], "https://coverartarchive.org/release/m/1-250.jpg")
         self.assertIsNone(out[1]["image_url"])
@@ -336,7 +359,7 @@ class ListenBrainzSuggestionTests(_LibraryBase):
             {"artist_name": "Not In", "release_group_name": "The Library", "listen_count": 99},
         ]
         with mock.patch("requests.get", return_value=_resp({"payload": {"release_groups": groups}})):
-            out = listenbrainz.suggestions(self.conn, "alice", user_device_ids={self.phone, self.dap})
+            out = _answered(listenbrainz.suggestions(self.conn, "alice", user_device_ids={self.phone, self.dap}))
         self.assertEqual([(o["library_artist"], o["library_album"], o["playcount"], o["source"]) for o in out],
                          [("Aphex Twin", "Syro", 5, "listenbrainz")])
 
@@ -349,7 +372,7 @@ class ListenBrainzSuggestionTests(_LibraryBase):
             {"track_metadata": None},
         ]
         with mock.patch("requests.get", return_value=_resp({"payload": {"listens": listens}})):
-            out = listenbrainz.recently_played_suggestions(self.conn, "alice")
+            out = _answered(listenbrainz.recently_played_suggestions(self.conn, "alice"))
         self.assertEqual([(o["artist"], o["album"], o["source"]) for o in out], [("Boards of Canada", "Geogaddi", "listenbrainz-recent")])
 
     def test_recently_played_drops_what_every_device_already_has(self):
@@ -363,6 +386,27 @@ class ListenBrainzSuggestionTests(_LibraryBase):
             self.assertEqual(listenbrainz.recently_played_suggestions(self.conn, "alice"), [])
         with mock.patch("requests.get", return_value=_resp({"payload": {"release_groups": []}})):
             self.assertEqual(listenbrainz.suggestions(self.conn, "alice"), [])
+
+
+_NO_HISTORY_CACHE = mock.patch.object(history_cache, "TTL_SECONDS", 0)
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    # Every test answers for the services itself: a cached answer from an
+    # earlier test must not stand in for its mock (history_cache).
+    _NO_HISTORY_CACHE.start()
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    _NO_HISTORY_CACHE.stop()
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

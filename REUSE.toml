@@ -10,6 +10,7 @@ path = [
     "LICENSE",
     "package.json",
     "package-lock.json",
+    "renovate.json",
     "dev/testlib.json",
     "dev/testlib-showcase.json",
     "VERSION",
@@ -96,15 +97,9 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2024 Tailwind Labs Inc."
 SPDX-License-Identifier = "MIT"
 
-# --- Third-party: badges / donate marks --------------------------------------
+# --- Third-party: badges ------------------------------------------------------
 [[annotations]]
 path = "app/static/img/badge_obtainium.png"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2023 Obtainium contributors"
 SPDX-License-Identifier = "GPL-3.0-or-later"
-
-[[annotations]]
-path = "app/static/img/liberapay-donate.svg"
-precedence = "aggregate"
-SPDX-FileCopyrightText = "Liberapay"
-SPDX-License-Identifier = "CC0-1.0"

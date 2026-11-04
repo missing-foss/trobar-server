@@ -28,6 +28,7 @@ Two checks, both needed:
 """
 
 import ipaddress
+import logging
 import socket
 from urllib.parse import urlsplit
 
@@ -35,6 +36,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+
+_log = logging.getLogger(__name__)
 
 # What blocked_reason() can return, for callers that word a message per kind.
 KINDS = ("loopback", "link-local", "unspecified", "multicast")
@@ -59,7 +62,7 @@ def blocked_reason(address) -> str | None:
     ip = ipaddress.ip_address(address)
     # Python 3.13+ already answers is_* for the IPv4 address a mapped one
     # carries; unwrapping says so here instead of relying on it.
-    if ip.version == 6 and ip.ipv4_mapped:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
     if ip.is_loopback:
         return "loopback"

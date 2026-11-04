@@ -7,8 +7,12 @@
 placeholders don't match the English msgids — so a newly-added `_()` string
 can't silently ship English-only. Same "visible every run" gate as reuse/gitleaks.
 
-Four independent things are checked:
+Each of these is checked independently:
 
+- **Parsing**: every catalog and the .pot are read with `abort_invalid`, so a
+  line Babel can't parse fails the check. Without it Babel only warns and
+  reads on, so a catalog still carrying merge-conflict markers passed every
+  check below.
 - **Completeness (#345)**: a fresh `pybabel extract` (to memory, never touching
   the committed .pot) is diffed against each catalog's msgids. This is the
   half the check is actually named for — a string can only be untranslated/
@@ -86,7 +90,7 @@ from pathlib import Path
 
 from babel.messages import frontend
 from babel.messages.extract import extract_from_dir
-from babel.messages.pofile import read_po
+from babel.messages.pofile import PoFileError, read_po
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = ROOT / "app"
@@ -171,9 +175,21 @@ def extract_source_msgids():
     }
 
 
-def check_catalog(path, source_msgids, locale):
+def read_catalog(path):
+    """read_po, but a line it can't parse is a failure, not a warning that
+    scrolls past: a catalog still carrying merge-conflict markers parses
+    "fine" otherwise, minus the entries the markers broke."""
     with path.open("rb") as fh:
-        cat = read_po(fh)
+        return read_po(fh, abort_invalid=True)
+
+
+def unparsable(err):
+    """Babel numbers lines from 0; an editor numbers them from 1."""
+    return ("", f"unparsable line {err.lineno + 1}: {err.line.strip()!r}")
+
+
+def check_catalog(path, source_msgids, locale):
+    cat = read_catalog(path)
 
     problems = []
     catalog_msgids = set()
@@ -232,9 +248,7 @@ def check_pot_drift(source_msgids):
     every regeneration, so a literal diff would be noisy on every commit
     regardless of whether the actual msgids drifted. Read-only — never
     regenerates or overwrites the committed file."""
-    pot_path = APP / "translations/messages.pot"
-    with pot_path.open("rb") as fh:
-        pot = read_po(fh)
+    pot = read_catalog(APP / "translations/messages.pot")
     pot_msgids = {singular(m.id) for m in pot if m.id}
 
     problems = []
@@ -254,7 +268,10 @@ def main():
 
     fail = False
 
-    pot_problems = check_pot_drift(source_msgids)
+    try:
+        pot_problems = check_pot_drift(source_msgids)
+    except PoFileError as err:
+        pot_problems = [unparsable(err)]
     if pot_problems:
         fail = True
         print(f"messages.pot: {len(pot_problems)} problem(s) — regenerate it (pybabel extract):")
@@ -265,7 +282,10 @@ def main():
 
     for path in CATALOGS:
         locale = path.relative_to(APP / "translations").parts[0]
-        problems, warnings, total = check_catalog(path, source_msgids, locale)
+        try:
+            problems, warnings, total = check_catalog(path, source_msgids, locale)
+        except PoFileError as err:
+            problems, warnings, total = [unparsable(err)], [], 0
         if problems:
             fail = True
             print(f"{locale} catalog: {len(problems)} problem(s) — fill/fix these:")

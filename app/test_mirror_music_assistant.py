@@ -14,6 +14,7 @@ ones.
     python3 -m unittest test_mirror_music_assistant -v      # from app/
 """
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -26,6 +27,7 @@ import db  # noqa: E402
 db.DATA_DIR = Path(_TMP)
 
 import mirror_music_assistant  # noqa: E402
+import mirror_runs  # noqa: E402
 import music_assistant_client as ma  # noqa: E402
 import playlist_sync  # noqa: E402
 import sync_state  # noqa: E402
@@ -372,6 +374,61 @@ class LoopGuardTests(_Base):
         remote = self._write(pid)["music_assistant_mirror_remote_id"]
         self.fake.playlists[remote]["name"] = "Party Mix"
         self.assertEqual(ma.list_playlists()["playlists"], [])
+
+
+
+class CoverageRunTests(_Base):
+    """Each write that gets as far as matching records a mirror_runs row,
+    including what Music Assistant refused after accepting it."""
+
+    def _run(self, pid):
+        return mirror_runs.missing(self.conn, pid, "music_assistant")
+
+    def test_a_refused_track_is_recorded_as_refused(self):
+        ids = self._tracks(LIBRARY[:3])
+        pid = self._playlist("Party Mix", ids)
+        self.fake.refuse.add("library://track/2")
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["total"], run["on_target"], run["lacked"], run["refused"]), (3, 2, 0, 1))
+        _path, artist, _album, title, _no = LIBRARY[1]
+        self.assertEqual(run["missing"], [{"artist": artist, "title": title, "reason": "refused"}])
+
+    def test_a_track_the_target_lacks_is_recorded_as_not_on_target(self):
+        ids = self._tracks([LIBRARY[0], ("Nobody/None/01 Nothing.flac", "Nobody", "None", "Nothing", 1)])
+        pid = self._playlist("Party Mix", ids)
+        row = self._write(pid)
+        self.assertIsNone(row["music_assistant_mirror_last_error_code"])
+        run = self._run(pid)
+        self.assertEqual((run["total"], run["on_target"], run["lacked"], run["refused"]), (2, 1, 1, 0))
+        self.assertEqual(run["missing"], [{"artist": "Nobody", "title": "Nothing", "reason": "not_on_target"}])
+
+    def test_a_repeated_track_is_counted_once(self):
+        ids = self._tracks(LIBRARY[:2])
+        pid = self._playlist("Loop", [ids[0], ids[1], ids[0]])
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["total"], run["on_target"], run["lacked"]), (2, 2, 0))
+
+    def test_a_rerun_that_writes_nothing_still_records_a_run(self):
+        pid = self._playlist("Party Mix", self._tracks(LIBRARY[:2]))
+        self._write(pid)
+        self._write(pid)
+        self.assertEqual(mirror_runs.latest(self.conn, [pid])[(pid, "music_assistant")]["history"], [2, 2])
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

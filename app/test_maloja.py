@@ -17,10 +17,9 @@ real temp-file SQLite database built by db.init_db().
 
     python3 -m unittest test_maloja -v      # from app/
 """
-import contextlib
-import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -35,6 +34,7 @@ os.environ["DATA_DIR"] = _TMP
 import db  # noqa: E402
 db.DATA_DIR = Path(_TMP)
 
+import history_cache  # noqa: E402
 import maloja  # noqa: E402
 import sync_state  # noqa: E402
 import url_guard  # noqa: E402
@@ -52,6 +52,13 @@ CHART = [
      "album_id": 3, "rank": 4},
     {"scrobbles": 16, "album": {"artists": ["Paper Cartographer"], "albumtitle": "Foldlines"}, "album_id": 6, "rank": 6},
 ]
+
+
+def _answered(result):
+    """The result of a history call that's expected to have answered; narrows
+    `list | None` for the type checker and fails loudly on None."""
+    assert result is not None, "the service was expected to answer"
+    return result
 
 
 def _scrobble(time, artists, title, album_artists=None, album=None):
@@ -128,8 +135,8 @@ class PeriodTests(unittest.TestCase):
                 "3month": "2026/07/05", "6month": "2026/04/05", "12month": "2025/10/04"})
 
     def test_every_period_the_routes_accept_is_mapped(self):
-        import main  # noqa: PLC0415 - main is heavy; only this test needs it
-        self.assertEqual(set(maloja._PERIOD_DAYS), set(main._LASTFM_PERIODS))
+        import web_common  # noqa: PLC0415 - heavy to import; only this test needs it
+        self.assertEqual(set(maloja._PERIOD_DAYS), set(web_common._LASTFM_PERIODS))
 
     def test_the_chart_is_asked_for_with_a_from_never_without_one(self):
         # Without a range Maloja answers for today only.
@@ -169,7 +176,7 @@ class SuggestionTests(_Library):
 
     def test_recently_played_skips_scrobbles_without_an_album_and_dedups(self):
         with mock.patch.object(url_guard.GuardedSession, "get", return_value=_resp({"status": "ok", "list": SCROBBLES})) as get:
-            out = maloja.recently_played_suggestions(self.conn, BASE, limit=50)
+            out = _answered(maloja.recently_played_suggestions(self.conn, BASE, limit=50))
         self.assertEqual([(o["artist"], o["album"], o["source"]) for o in out], [
             ("Paper Cartographer", "Foldlines", "maloja-recent"), ("Cinder & Ash", "Emberwake", "maloja-recent")])
         self.assertEqual(get.call_args.kwargs["params"], {"from": "1970", "page": 0, "perpage": 50})
@@ -178,7 +185,7 @@ class SuggestionTests(_Library):
 class MostPlayedTests(_Library):
     def test_ranked_with_library_names_and_maloja_credits_for_the_rest(self):
         with mock.patch.object(url_guard.GuardedSession, "get", return_value=_resp({"status": "ok", "list": CHART})):
-            out = maloja.most_played(self.conn, BASE, "overall", limit=10)
+            out = _answered(maloja.most_played(self.conn, BASE, "overall", limit=10))
         self.assertEqual([(o["artist"], o["album"], o["playcount"]) for o in out], [
             ("Aphelion", "Event Horizon", 63), ("Glass Meridian", "Latitude", 63), ("Aphelion", "Parallax", 60),
             ("Cinder & Ash", "Emberwake", 57), ("Glass Meridian & Nebula Drift", "Shared Orbit", 57),
@@ -186,22 +193,23 @@ class MostPlayedTests(_Library):
 
     def test_limit_cuts_the_chart(self):
         with mock.patch.object(url_guard.GuardedSession, "get", return_value=_resp({"status": "ok", "list": CHART})):
-            self.assertEqual(len(maloja.most_played(self.conn, BASE, "overall", limit=2)), 2)
+            self.assertEqual(len(_answered(maloja.most_played(self.conn, BASE, "overall", limit=2))), 2)
 
 
 class FailureTests(_Library):
-    def test_unreachable_is_empty_everywhere(self):
+    def test_unreachable_is_none_everywhere(self):
+        # None is "Maloja didn't answer", not [] ("nothing played").
         with mock.patch.object(url_guard.GuardedSession, "get", side_effect=requests.ConnectionError("down")):
             self.assertFalse(maloja.check_connection(BASE))
-            self.assertEqual(maloja.suggestions(self.conn, BASE), [])
-            self.assertEqual(maloja.most_played(self.conn, BASE), [])
-            self.assertEqual(maloja.recently_played_suggestions(self.conn, BASE), [])
+            self.assertIsNone(maloja.suggestions(self.conn, BASE))
+            self.assertIsNone(maloja.most_played(self.conn, BASE))
+            self.assertIsNone(maloja.recently_played_suggestions(self.conn, BASE))
 
-    def test_a_server_error_is_empty(self):
+    def test_a_server_error_is_none(self):
         # An unparseable range, for one, answers 500.
         with mock.patch.object(url_guard.GuardedSession, "get", return_value=_resp({"status": "failure"}, status=500)):
-            self.assertEqual(maloja.album_charts(BASE), [])
-            self.assertEqual(maloja.recent_scrobbles(BASE), [])
+            self.assertIsNone(maloja.album_charts(BASE))
+            self.assertIsNone(maloja.recent_scrobbles(BASE))
 
     def test_no_url_makes_no_request(self):
         with mock.patch.object(url_guard.GuardedSession, "get") as get:
@@ -229,24 +237,23 @@ class RequestGuardTests(_Library):
         self.addCleanup(self.maloja.close)
 
     def _quietly(self, call):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with self.assertLogs("maloja", level="WARNING") as logs:
             result = call()
-        return result, out.getvalue()
+        return result, "\n".join(logs.output)
 
     def test_a_hostname_now_resolving_to_loopback_is_unreachable(self):
         base = f"http://maloja.example.invalid:{self.maloja.port}"
         with resolving("maloja.example.invalid", "127.0.0.1"):
             ok, log = self._quietly(lambda: maloja.check_connection(base))
             charted, log2 = self._quietly(lambda: maloja.most_played(self.conn, base, "overall"))
-            self.assertEqual((ok, charted, self.maloja.hits), (False, [], []))
+            self.assertEqual((ok, charted, self.maloja.hits), (False, None, []))
             for line in (log, log2):
                 self.assertIn("loopback", line)
                 self.assertNotIn("maloja.example.invalid", line)
                 self.assertNotIn(str(self.maloja.port), line)
             with relaxed():  # control: the same calls reach it unguarded
                 self.assertTrue(maloja.check_connection(base))
-                self.assertEqual(len(maloja.most_played(self.conn, base, "overall")), len(CHART))
+                self.assertEqual(len(_answered(maloja.most_played(self.conn, base, "overall"))), len(CHART))
 
     def test_a_redirect_is_not_followed(self):
         bouncer = _Server({"/apis/mlj_1/serverinfo": (
@@ -257,6 +264,27 @@ class RequestGuardTests(_Library):
         with relaxed():
             self.assertFalse(maloja.check_connection(bouncer.url))
         self.assertEqual((bouncer.hits, self.maloja.hits), (["/apis/mlj_1/serverinfo"], []))
+
+
+_NO_HISTORY_CACHE = mock.patch.object(history_cache, "TTL_SECONDS", 0)
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    # Every test answers for the services itself: a cached answer from an
+    # earlier test must not stand in for its mock (history_cache).
+    _NO_HISTORY_CACHE.start()
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    _NO_HISTORY_CACHE.stop()
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

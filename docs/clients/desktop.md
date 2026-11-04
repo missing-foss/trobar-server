@@ -25,9 +25,9 @@ releases: [trobar-desktop](https://github.com/missing-foss/trobar-desktop).
 
 ## Pair a target
 
-1. In the web UI, **Profile → Devices → Add device**, choose **Removable
+1. In the web UI, **Devices → Add device**, choose **Removable
    storage** (or **Local folder**), enter a name, and **Create device**. The
-   dialog shows the server URL and an 8-character code, valid for an hour.
+   dialog shows the server URL and an 8-character code, valid for 20 minutes.
    For a device that already exists, **Re-pair in app** shows the same.
 2. In the app: **Open folder…** → pick the mounted card → enter the server
    URL and the code → **Pair**.
@@ -55,8 +55,9 @@ read off the card and sent to Trobar:
 ## Transcoding
 
 If the device's format (web UI → device → Modify) is MP3 320/256/192/128 kbit/s,
-the **server** transcodes lossless sources (FLAC/WAV/AIFF) to MP3, to a
-temporary file server-side, then streams it and deletes it — the desktop app
+the **server** transcodes lossless sources (FLAC, WAV, AIFF, or ALAC in an
+`.m4a`; see [Supported formats](../using/library-selections.md#supported-formats))
+to MP3, to a temporary file server-side, then streams it and deletes it — the desktop app
 just downloads whatever it's served, exactly as it does an original file. It
 does **no** transcoding of its own; the release build ships no ffmpeg. Tags
 and embedded cover art carry over

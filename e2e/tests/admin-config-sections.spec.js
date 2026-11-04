@@ -58,6 +58,18 @@ test.describe("Configuration sections", () => {
     await expect(body(page, "library")).toBeHidden();
   });
 
+  test("the Devices header names the transcode cache, and follows an edit", async ({ page }) => {
+    await gotoConfig(page);
+    const summary = header(page, "devices").locator("span.text-xs").first();
+    await expect(summary).toContainText("2 GB cache");
+    await header(page, "devices").click();
+    // Not saved: the edit only has to reach the summary, and the server's
+    // setting stays as every other spec expects it.
+    await page.locator("#cfg-transcode-cache").fill("0");
+    await expect(summary).toContainText("no cache");
+    await expect(summary).not.toContainText("GB cache");
+  });
+
   test("a warning shows on its collapsed section's header", async ({ page }) => {
     await gotoConfig(page);
     await page.evaluate(() => {

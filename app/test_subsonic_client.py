@@ -21,6 +21,7 @@ functions and the _request_as() split at the bottom of the module).
     python3 -m unittest test_subsonic_client -v      # from app/
 """
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -233,9 +234,21 @@ class ActiveGetPlaylistTracksTests(_ActiveSubsonicClientTestBase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["tracks"], [{
             "position": 0, "title": "Track One", "artist": "Artist A",
-            "path": "a/1.flac", "album": "Album A",
+            "path": "a/1.flac", "album": "Album A", "mbid": None, "isrc": None,
         }])
         self.assertEqual(get.call_args.kwargs["params"]["id"], "p1")
+
+    def test_passes_navidromes_recording_id_and_first_isrc(self):
+        with mock.patch("requests.get", return_value=_resp(subsonic_body={
+            "status": "ok", "playlist": {"entry": [
+                {"title": "T", "artist": "A", "musicBrainzId": "8f3471b5-7e6a-48da-86a9-c1c07a0f47ae", "isrc": ["", "USRC17607839", "GBUM71029604"]},
+                {"title": "U", "artist": "A", "musicBrainzId": "", "isrc": []},
+                {"title": "V", "artist": "A", "isrc": "GBUM71029604"},
+            ]},
+        })):
+            result = subsonic_client.get_playlist_tracks("X", source_playlist_id="p1")
+        self.assertEqual([(t["mbid"], t["isrc"]) for t in result["tracks"]],
+                         [("8f3471b5-7e6a-48da-86a9-c1c07a0f47ae", "USRC17607839"), (None, None), (None, "GBUM71029604")])
 
     def test_falls_back_to_title_lookup_when_no_id_given(self):
         list_resp = _resp(subsonic_body={
@@ -261,7 +274,7 @@ class ActiveGetPlaylistTracksTests(_ActiveSubsonicClientTestBase):
 class ActiveGetArtistImageTests(_ActiveSubsonicClientTestBase):
     def setUp(self):
         super().setUp()
-        subsonic_client._artist_image_key_map = None
+        subsonic_client._artist_image_key_map.clear()
         self._set_config(url="http://nav.local", username="trobar", password="secret")
 
     def test_returns_none_when_artist_unknown(self):
@@ -558,6 +571,20 @@ class MirrorDeletePlaylistTests(_SubsonicClientTestBase):
         self._configure()
         with mock.patch("requests.get", return_value=_resp(status_code=500)):
             self.assertFalse(subsonic_client.mirror_delete_playlist("42"))
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

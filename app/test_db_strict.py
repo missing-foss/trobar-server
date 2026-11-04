@@ -177,7 +177,7 @@ class RebuildTests(unittest.TestCase):
     def test_converts_an_existing_table_to_strict(self):
         conn = _legacy_conn()
         _insert_track(conn)
-        db._migrate_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_tracks_strict)
         sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE name='tracks'").fetchone()["sql"]
         self.assertIn("STRICT", sql.upper())
@@ -185,7 +185,7 @@ class RebuildTests(unittest.TestCase):
     def test_preserves_every_column(self):
         conn = _legacy_conn()
         before = [r["name"] for r in conn.execute("PRAGMA table_info(tracks)")]
-        db._migrate_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_tracks_strict)
         after = [r["name"] for r in conn.execute("PRAGMA table_info(tracks)")]
         # Ordering too: sqlite3.Row lookups are by name, but a SELECT * consumer
         # positionally unpacking would break on a reorder.
@@ -197,7 +197,7 @@ class RebuildTests(unittest.TestCase):
         ids = [_insert_track(conn, f"d/{n}.flac", title=f"T{n}") for n in range(5)]
         conn.execute("DELETE FROM tracks WHERE relative_path = 'd/2.flac'")
         expected = [i for i in ids if i != ids[2]]
-        db._migrate_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_tracks_strict)
         self.assertEqual(
             [r["id"] for r in conn.execute("SELECT id FROM tracks ORDER BY id")],
             expected)
@@ -205,7 +205,7 @@ class RebuildTests(unittest.TestCase):
     def test_preserves_values_including_real_and_integer(self):
         conn = _legacy_conn()
         _insert_track(conn, "x.flac", track_no=7, year=1969, mtime=12.5, duration=210.25)
-        db._migrate_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_tracks_strict)
         row = conn.execute(
             "SELECT track_no, year, mtime, duration FROM tracks").fetchone()
         self.assertEqual((row["track_no"], row["year"]), (7, 1969))
@@ -225,7 +225,7 @@ class RebuildTests(unittest.TestCase):
         self.assertIsNone(conn.execute(
             "SELECT id FROM tracks WHERE fingerprint = ?", ("AQAAAA",)).fetchone())
 
-        db._migrate_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_tracks_strict)
 
         self.assertEqual(
             conn.execute("SELECT typeof(fingerprint) FROM tracks").fetchone()[0], "text")
@@ -239,7 +239,7 @@ class RebuildTests(unittest.TestCase):
         _insert_track(conn, "blob.flac")
         conn.execute("UPDATE tracks SET fingerprint = ? WHERE id = 1", (b"AQAAAA",))
         with self.assertLogs("db", level=logging.WARNING) as caught:
-            db._migrate_tracks_strict(conn)
+            db._run_migration_step(conn, db._migrate_tracks_strict)
         self.assertTrue(any("tracks.fingerprint" in m for m in caught.output),
                         f"the warning should name the column: {caught.output}")
 
@@ -252,7 +252,7 @@ class RebuildTests(unittest.TestCase):
         self.assertEqual(
             conn.execute("SELECT typeof(track_no) FROM tracks").fetchone()[0], "text")
         with self.assertRaises(sqlite3.IntegrityError):
-            db._migrate_tracks_strict(conn)
+            db._run_migration_step(conn, db._migrate_tracks_strict)
 
     def test_a_failed_rebuild_leaves_the_original_table_intact(self):
         # The rollback path: startup may fail, but it must not lose the library.
@@ -260,18 +260,28 @@ class RebuildTests(unittest.TestCase):
         _insert_track(conn, "bad.flac", title="Keep me")
         conn.execute("UPDATE tracks SET track_no = ? WHERE id = 1", ("abc",))
         with self.assertRaises(sqlite3.IntegrityError):
-            db._migrate_tracks_strict(conn)
+            db._run_migration_step(conn, db._migrate_tracks_strict)
         self.assertEqual(
             conn.execute("SELECT title FROM tracks").fetchone()["title"], "Keep me")
         self.assertIsNone(conn.execute(
             "SELECT name FROM sqlite_master WHERE name='tracks_new'").fetchone())
+
+    def test_a_tracks_new_left_by_an_older_build_does_not_stop_the_rebuild(self):
+        conn = _legacy_conn()
+        _insert_track(conn, "kept.flac")
+        conn.execute("CREATE TABLE tracks_new (leftover TEXT)")
+        db._run_migration_step(conn, db._migrate_tracks_strict)
+        self.assertIn("STRICT", conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='tracks'").fetchone()[0].upper())
+        self.assertEqual(conn.execute("SELECT relative_path FROM tracks").fetchone()[0],
+                         "kept.flac")
 
     def test_recreates_both_indexes(self):
         # DROP TABLE takes them with it, and neither creator runs again. Losing
         # idx_tracks_fingerprint wouldn't error — it would quietly make #239's
         # rematch a full scan per pushed entry.
         conn = _legacy_conn()
-        db._migrate_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_tracks_strict)
         names = {r["name"] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='tracks' "
             "AND sql IS NOT NULL")}
@@ -280,7 +290,7 @@ class RebuildTests(unittest.TestCase):
 
     def test_the_fingerprint_index_is_actually_used_by_the_rematch_query(self):
         conn = _legacy_conn()
-        db._migrate_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_tracks_strict)
         plan = " ".join(r[3] for r in conn.execute(
             "EXPLAIN QUERY PLAN SELECT id, relative_path, fingerprint FROM tracks "
             "WHERE fingerprint = ? AND deleted_at IS NULL ORDER BY id LIMIT 1",
@@ -300,7 +310,7 @@ class RebuildTests(unittest.TestCase):
             "INSERT INTO device_track_state (device_id, track_id, status) VALUES (1, ?, 'downloaded')",
             (track_id,))
         conn.commit()
-        db._migrate_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_tracks_strict)
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM device_track_state").fetchone()[0], 1)
         self.assertEqual(conn.execute(
@@ -309,14 +319,14 @@ class RebuildTests(unittest.TestCase):
 
     def test_foreign_keys_are_back_on_afterwards(self):
         conn = _legacy_conn()
-        db._migrate_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_tracks_strict)
         self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
 
     def test_is_idempotent(self):
         conn = _legacy_conn()
         _insert_track(conn)
-        db._migrate_tracks_strict(conn)
-        db._migrate_tracks_strict(conn)  # the every-startup path
+        db._run_migration_step(conn, db._migrate_tracks_strict)
+        db._run_migration_step(conn, db._migrate_tracks_strict)  # the every-startup path
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0], 1)
 
     def test_is_a_no_op_on_an_already_strict_table(self):
@@ -324,7 +334,7 @@ class RebuildTests(unittest.TestCase):
         conn = _fresh_conn()
         _insert_track(conn)
         with self.assertNoLogs("db", level=logging.WARNING):
-            db._migrate_tracks_strict(conn)
+            db._run_migration_step(conn, db._migrate_tracks_strict)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0], 1)
 
 
@@ -365,7 +375,7 @@ class UnresolvedPlaylistTracksRebuildTests(unittest.TestCase):
             "SELECT sql FROM sqlite_master WHERE name='unresolved_playlist_tracks'"
         ).fetchone()["sql"]
         self.assertNotIn("STRICT", sql.upper())  # precondition
-        db._migrate_unresolved_playlist_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
         sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE name='unresolved_playlist_tracks'"
         ).fetchone()["sql"]
@@ -375,7 +385,7 @@ class UnresolvedPlaylistTracksRebuildTests(unittest.TestCase):
         conn = _legacy_unresolved_conn()
         before = [r["name"] for r in conn.execute(
             "PRAGMA table_info(unresolved_playlist_tracks)")]
-        db._migrate_unresolved_playlist_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
         after = [r["name"] for r in conn.execute(
             "PRAGMA table_info(unresolved_playlist_tracks)")]
         self.assertEqual(before, after)
@@ -386,7 +396,7 @@ class UnresolvedPlaylistTracksRebuildTests(unittest.TestCase):
         ids = [_insert_unresolved(conn, 1, position=n, title=f"T{n}") for n in range(5)]
         conn.execute("DELETE FROM unresolved_playlist_tracks WHERE title = 'T2'")
         expected = [i for i in ids if i != ids[2]]
-        db._migrate_unresolved_playlist_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
         self.assertEqual(
             [r["id"] for r in conn.execute(
                 "SELECT id FROM unresolved_playlist_tracks ORDER BY id")],
@@ -406,7 +416,7 @@ class UnresolvedPlaylistTracksRebuildTests(unittest.TestCase):
             "SELECT id FROM unresolved_playlist_tracks WHERE isrc = ?",
             ("GBAYE0000001",)).fetchone())
 
-        db._migrate_unresolved_playlist_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
 
         self.assertEqual(
             conn.execute("SELECT typeof(isrc) FROM unresolved_playlist_tracks"
@@ -425,7 +435,7 @@ class UnresolvedPlaylistTracksRebuildTests(unittest.TestCase):
             "UPDATE unresolved_playlist_tracks SET position = ? WHERE id = ?",
             ("abc", row_id))
         with self.assertRaises(sqlite3.IntegrityError):
-            db._migrate_unresolved_playlist_tracks_strict(conn)
+            db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
         self.assertEqual(
             conn.execute("SELECT title FROM unresolved_playlist_tracks"
                          ).fetchone()["title"], "Keep me")
@@ -435,7 +445,7 @@ class UnresolvedPlaylistTracksRebuildTests(unittest.TestCase):
 
     def test_recreates_both_indexes(self):
         conn = _legacy_unresolved_conn()
-        db._migrate_unresolved_playlist_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
         names = {r["name"] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' "
             "AND tbl_name='unresolved_playlist_tracks' AND sql IS NOT NULL")}
@@ -445,7 +455,7 @@ class UnresolvedPlaylistTracksRebuildTests(unittest.TestCase):
     def test_the_identity_index_still_enforces_uniqueness_after_rebuild(self):
         conn = _legacy_unresolved_conn()
         conn.execute("INSERT INTO playlists (id, title) VALUES (1, 'P')")
-        db._migrate_unresolved_playlist_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
         _insert_unresolved(conn, 1, artist="A", title="T", album="B")
         with self.assertRaises(sqlite3.IntegrityError):
             _insert_unresolved(conn, 1, artist="A", title="T", album="B")
@@ -457,22 +467,22 @@ class UnresolvedPlaylistTracksRebuildTests(unittest.TestCase):
         conn = _legacy_unresolved_conn()
         conn.execute("INSERT INTO playlists (id, title) VALUES (1, 'P')")
         _insert_unresolved(conn, 1)
-        db._migrate_unresolved_playlist_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
         conn.execute("DELETE FROM playlists WHERE id = 1")
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM unresolved_playlist_tracks").fetchone()[0], 0)
 
     def test_foreign_keys_are_back_on_afterwards(self):
         conn = _legacy_unresolved_conn()
-        db._migrate_unresolved_playlist_tracks_strict(conn)
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
         self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
 
     def test_is_idempotent(self):
         conn = _legacy_unresolved_conn()
         conn.execute("INSERT INTO playlists (id, title) VALUES (1, 'P')")
         _insert_unresolved(conn, 1)
-        db._migrate_unresolved_playlist_tracks_strict(conn)
-        db._migrate_unresolved_playlist_tracks_strict(conn)  # the every-startup path
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
+        db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)  # the every-startup path
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM unresolved_playlist_tracks").fetchone()[0], 1)
 
@@ -481,7 +491,7 @@ class UnresolvedPlaylistTracksRebuildTests(unittest.TestCase):
         conn.execute("INSERT INTO playlists (id, title) VALUES (1, 'P')")
         _insert_unresolved(conn, 1)
         with self.assertNoLogs("db", level=logging.WARNING):
-            db._migrate_unresolved_playlist_tracks_strict(conn)
+            db._run_migration_step(conn, db._migrate_unresolved_playlist_tracks_strict)
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM unresolved_playlist_tracks").fetchone()[0], 1)
 

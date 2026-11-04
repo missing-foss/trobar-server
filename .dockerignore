@@ -21,3 +21,13 @@ SECURITY.md
 **/__pycache__
 *.pyc
 *.pyo
+# app/ also holds the unit tests and the build-only inputs (dev requirements,
+# the Tailwind source and config, the Babel extraction config). Nothing reads
+# them at runtime, so they stay out of the image. requirements.txt stays: the
+# Dockerfile installs from it.
+app/test_*.py
+app/requirements-dev.txt
+app/requirements.in
+app/tailwind-input.css
+app/tailwind.config.js
+app/babel.cfg

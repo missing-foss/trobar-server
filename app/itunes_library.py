@@ -38,9 +38,12 @@ snapshot Apple resolved at export time regardless of whether the
 playlist is smart or static, so no rule evaluation is needed here.
 """
 
+import logging
 import plistlib
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+
+_log = logging.getLogger(__name__)
 
 
 def _location_to_path(location: str) -> str | None:

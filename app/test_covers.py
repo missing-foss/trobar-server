@@ -31,6 +31,7 @@ import shutil
 import struct
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _TMP = tempfile.mkdtemp(prefix="trobar-test-covers-")
@@ -241,6 +242,119 @@ class GetCoverCacheTests(_TempDirTestCase):
         self.assertEqual(_cover(covers.get_cover("ab", "c", second))[1], "image/jpeg")
 
 
+class FolderCoverTests(_TempDirTestCase):
+    """A picture beside the track when the file has none embedded. The music
+    root is pointed at the scratch dir, so "the root is never searched" can be
+    tested and nothing else is."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp / "music"
+        self.root.mkdir()
+        patcher = mock.patch.object(covers.db, "get_music_root", return_value=self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _album(self, *parts):
+        folder = self.root.joinpath(*parts)
+        folder.mkdir(parents=True)
+        return _make_mp3(folder / "01.mp3", _text_frame(b"TPE1", "Test Artist"))
+
+    def test_a_folder_picture_serves_when_nothing_is_embedded(self):
+        track = self._album("Artist", "Album")
+        (track.parent / "folder.jpg").write_bytes(b"FOLDERJPG")
+        self.assertEqual(_cover(covers.get_cover("Artist", "Album", track)), (b"FOLDERJPG", "image/jpeg"))
+        # Cached like embedded art: served again with the folder picture gone.
+        (track.parent / "folder.jpg").unlink()
+        self.assertEqual(_cover(covers.get_cover("Artist", "Album", track))[0], b"FOLDERJPG")
+
+    def test_an_embedded_picture_wins_over_the_folder(self):
+        folder = self.root / "Artist" / "Album"
+        folder.mkdir(parents=True)
+        track = _make_mp3(folder / "01.mp3", _apic_frame())
+        (folder / "cover.jpg").write_bytes(b"COVERJPG")
+        self.assertEqual(_cover(covers.get_cover("Artist", "Album", track))[0], _PNG)
+
+    def test_names_match_without_regard_to_case_in_preference_order(self):
+        track = self._album("Artist", "Album")
+        (track.parent / "Folder.JPG").write_bytes(b"FOLDER")
+        (track.parent / "COVER.png").write_bytes(b"COVER")
+        self.assertEqual(_cover(covers.folder_cover(track)), (b"COVER", "image/png"))
+
+    def test_a_disc_folder_finds_the_album_picture_above_it(self):
+        track = self._album("Artist", "Album", "CD 2")
+        (track.parent.parent / "cover.jpg").write_bytes(b"ALBUMJPG")
+        self.assertEqual(_cover(covers.folder_cover(track))[0], b"ALBUMJPG")
+
+    def test_an_ordinary_folder_does_not_look_above_itself(self):
+        # Artist/Album/01.mp3 must not take Artist/folder.jpg, the artist's
+        # picture, as the album's cover.
+        track = self._album("Artist", "Album")
+        (self.root / "Artist" / "folder.jpg").write_bytes(b"ARTISTJPG")
+        self.assertIsNone(covers.folder_cover(track))
+
+    def test_the_music_root_itself_is_never_searched(self):
+        track = _make_mp3(self.root / "01.mp3", _text_frame(b"TPE1", "Test Artist"))
+        (self.root / "cover.jpg").write_bytes(b"ROOTJPG")
+        self.assertIsNone(covers.folder_cover(track))
+
+    def test_an_empty_picture_file_is_no_picture(self):
+        track = self._album("Artist", "Album")
+        (track.parent / "cover.jpg").write_bytes(b"")
+        self.assertIsNone(covers.folder_cover(track))
+
+    def test_no_picture_anywhere_is_still_negative_cached(self):
+        track = self._album("Artist", "Album")
+        self.assertIsNone(covers.get_cover("Artist", "Album", track))
+        self.assertEqual([p.suffix for p in covers.CACHE_DIR.iterdir()], [".none"])
+
+
+class SmallCoverTests(_TempDirTestCase):
+    """The thumbnail variant: at most SMALL_MAX_PX on its longer side, made
+    from the full cover and cached beside it."""
+
+    def _big_png(self, size=(1200, 900)) -> bytes:
+        from PIL import Image
+        import io
+        out = io.BytesIO()
+        Image.new("RGB", size, (10, 20, 30)).save(out, format="PNG")
+        return out.getvalue()
+
+    def _size(self, data: bytes) -> tuple[int, int]:
+        from PIL import Image
+        import io
+        return Image.open(io.BytesIO(data)).size
+
+    def test_a_large_cover_is_downscaled(self):
+        source = _make_mp3(self.tmp / "track.mp3", _apic_frame(self._big_png()))
+        data, content_type = _cover(covers.get_small_cover("Artist", "Album", source))
+        self.assertEqual(content_type, "image/jpeg")
+        self.assertEqual(max(self._size(data)), covers.artist_images.SMALL_MAX_PX)
+
+    def test_it_is_cached_and_a_hit_reads_nothing(self):
+        source = _make_mp3(self.tmp / "track.mp3", _apic_frame(self._big_png()))
+        first = _cover(covers.get_small_cover("Artist", "Album", source))
+        source.unlink()
+        for p in covers.CACHE_DIR.iterdir():
+            if p.suffix in (".img", ".type"):
+                p.unlink()  # if the hit read the full cover, it could not succeed
+        self.assertEqual(_cover(covers.get_small_cover("Artist", "Album", source)), first)
+
+    def test_a_small_cover_passes_through_unchanged(self):
+        source = _make_mp3(self.tmp / "track.mp3", _apic_frame())
+        self.assertEqual(_cover(covers.get_small_cover("Artist", "Album", source)), (_PNG, "image/png"))
+
+    def test_no_cover_is_none(self):
+        source = _make_mp3(self.tmp / "track.mp3", _text_frame(b"TPE1", "Test Artist"))
+        self.assertIsNone(covers.get_small_cover("Artist", "Album", source))
+
+    def test_invalidate_drops_the_small_variant_too(self):
+        source = _make_mp3(self.tmp / "track.mp3", _apic_frame(self._big_png()))
+        covers.get_small_cover("Artist", "Album", source)
+        covers.invalidate("Artist", "Album")
+        self.assertEqual(list(covers.CACHE_DIR.iterdir()), [])
+
+
 class InvalidateTests(_TempDirTestCase):
     """Called by the scanner when an album's tracks change, so replaced art
     actually propagates instead of serving the old picture forever."""
@@ -286,6 +400,20 @@ class ClearAllTests(_TempDirTestCase):
     def test_clear_all_is_a_no_op_when_nothing_was_cached(self):
         covers.clear_all()  # must not raise even though CACHE_DIR never existed
         self.assertFalse(covers.CACHE_DIR.exists())
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

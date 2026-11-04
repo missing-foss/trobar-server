@@ -61,12 +61,15 @@ Persistent ID is 16 hex digits, not a path — but the prefix makes that
 guaranteed rather than assumed).
 """
 
+import logging
 import os
 from pathlib import Path
 
 import db
 import itunes_library
 import sync_state
+
+_log = logging.getLogger(__name__)
 
 _ITUNES_ID_PREFIX = "itunes:"
 _EXTRA_ID_PREFIX = "extra:"
@@ -110,7 +113,7 @@ def reconnect() -> dict:
 
 
 def _is_trobar_managed(path: Path) -> bool:
-    """True if the file's second line is sync_state.M3U_MARKER: a copy
+    """True if the file's second line is device_store.M3U_MARKER: a copy
     Trobar wrote itself (a mirror, or a device playlist), which must never
     come back as a source playlist. The same line mirror._is_marker_safe()
     checks before it overwrites or deletes anything. An unreadable file is
@@ -251,8 +254,11 @@ def _parse_m3u(path: Path) -> list[dict]:
         raw = path.read_bytes()
     except OSError:
         return []
-    text = _decode_playlist(raw, path.suffix.lower() == ".m3u8")
+    return _parse_m3u_text(_decode_playlist(raw, path.suffix.lower() == ".m3u8"))
 
+
+def _parse_m3u_text(text: str) -> list[dict]:
+    """The lines of an .m3u, decoded: see _parse_m3u."""
     entries = []
     pending_artist = pending_title = None
     for raw_line in text.splitlines():
@@ -336,6 +342,23 @@ def _m3u_playlist(root: Path, path: Path, playlist_title: str,
             "album": None,
         })
     return {"status": "ok", "playlist": playlist_title, "tracks": tracks}
+
+
+def uploaded_playlist_tracks(raw: bytes, filename: str) -> list[dict]:
+    """An .m3u/.m3u8 someone uploaded, as get_playlist_tracks() items. Read
+    exactly as a playlist file in the library is (_decode_playlist's
+    cp1252 fallback included), except that a relative entry is relative to
+    the music root: an uploaded file has no folder of its own, which is
+    the extra playlist folder's case (_resolve_entry_path)."""
+    root = db.get_music_root()
+    text = _decode_playlist(raw, filename.lower().endswith(".m3u8"))
+    return [{
+        "position": i,
+        "title": entry["title"] or Path(entry["path"]).stem,
+        "artist": entry["artist"] or "",
+        "path": _resolve_entry_path(root, root, entry["path"]),
+        "album": None,
+    } for i, entry in enumerate(_parse_m3u_text(text))]
 
 
 def get_playlist_tracks(playlist_title: str, source_playlist_id: str | None = None) -> dict:

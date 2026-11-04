@@ -35,6 +35,7 @@ means something once its own server is the configured source."""
 import json
 import logging
 import posixpath
+import uuid
 
 import album_lookup
 import db
@@ -44,18 +45,23 @@ import identity
 import jellyfin_client
 import jobs
 import lidarr_requests
-import mirror
-import mirror_emby
-import mirror_jellyfin
-import mirror_music_assistant
-import mirror_plex
-import mirror_subsonic
+# The sink modules are reached through mirror_sinks; tests still patch them
+# as playlist_sync.mirror_x, the same module objects.
+import mirror  # noqa: F401
+import mirror_emby  # noqa: F401
+import mirror_jellyfin  # noqa: F401
+import mirror_music_assistant  # noqa: F401
+import mirror_plex  # noqa: F401
+import mirror_sinks
+import mirror_subsonic  # noqa: F401
 import music_assistant_client
 import roon_client
+import rule_playlists
 import spotify_client
 import spotify_public_client
 import sync_state
 import tidal_client
+import tidal_shares
 import ytmusic_client
 
 _log = logging.getLogger(__name__)
@@ -90,7 +96,7 @@ def sync_status() -> dict:
             "LIMIT 1", (JOB_TYPE,)).fetchone()
         finished = conn.execute(
             "SELECT state, result, last_error FROM jobs WHERE type = ? "
-            "AND state IN ('done', 'failed') ORDER BY id DESC LIMIT 1",
+            "AND state IN ('done', 'failed', 'cancelled') ORDER BY id DESC LIMIT 1",
             (JOB_TYPE,)).fetchone()
     finally:
         conn.close()
@@ -99,11 +105,79 @@ def sync_status() -> dict:
     if pending is not None:
         finished = None
     if finished is not None:
-        if finished["state"] == "failed":
+        if finished["state"] == "cancelled":
+            last_result = {"status": "error", "reason": "cancelled"}
+        elif finished["state"] == "failed":
             last_result = {"status": "error", "reason": finished["last_error"] or "error"}
         elif finished["result"]:
             last_result = json.loads(finished["result"])
     return {"running": pending is not None, "last_result": last_result}
+
+
+def _config_hours(conn) -> int:
+    raw = db.get_config(conn, "playlist_sync_interval_hours")
+    try:
+        return int(raw) if raw else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _last_finished_at(conn) -> str | None:
+    """When the last sync ended, successfully or not. A failed sync counts,
+    unlike scanner's last *done* scan: a provider that is down would
+    otherwise make the schedule due again on every idle poll (30 s), and
+    retry it that often for as long as it stays down. A cancelled one counts
+    too, or the schedule would start again the sync an admin just stopped. jobs._prune_finished
+    keeps the newest row per (type, state), so this survives retention."""
+    row = conn.execute(
+        "SELECT finished_at FROM jobs WHERE type = ? AND state IN ('done', 'failed', 'cancelled') "
+        "ORDER BY finished_at DESC LIMIT 1", (JOB_TYPE,),
+    ).fetchone()
+    return row["finished_at"] if row is not None else None
+
+
+def next_scheduled_sync_at(conn) -> str | None:
+    """When the next scheduled sync becomes due, as a UTC datetime string
+    (same shape as jobs.finished_at), or None when scheduling is off
+    (playlist_sync_interval_hours <= 0) or nothing has synced yet (due now,
+    so there is no future timestamp to show). The twin of
+    scanner.next_scheduled_scan_at."""
+    hours = _config_hours(conn)
+    if hours <= 0:
+        return None
+    last = _last_finished_at(conn)
+    if last is None:
+        return None
+    return conn.execute(
+        "SELECT datetime(?, ?)", (last, f"+{hours} hours"),
+    ).fetchone()[0]
+
+
+def sync_job_state(conn) -> str | None:
+    """'running' or 'queued' when a sync job is in either state (running
+    wins), None otherwise."""
+    row = conn.execute(
+        "SELECT state FROM jobs WHERE type = ? AND state IN ('queued', 'running') "
+        "ORDER BY state = 'running' DESC LIMIT 1", (JOB_TYPE,),
+    ).fetchone()
+    return row["state"] if row is not None else None
+
+
+def sync_due(conn) -> bool:
+    """Whether the schedule wants a sync now: enabled, and either nothing
+    has synced yet or the interval has passed since the last one ended.
+    Measured from the end, not a wall-clock cadence, as for the rescan. A
+    sync already queued or running is not this function's concern:
+    start_sync's dedupe_key turns a second one into a no-op."""
+    hours = _config_hours(conn)
+    if hours <= 0:
+        return False
+    last = _last_finished_at(conn)
+    if last is None:
+        return True
+    return bool(conn.execute(
+        "SELECT ? <= datetime('now', ?)", (last, f"-{hours} hours"),
+    ).fetchone()[0])
 
 
 def start_sync(provider, provider_id: str) -> dict:
@@ -150,11 +224,7 @@ def subscription_playlist_key(sub_id: int) -> str:
     return str(sub_id)
 
 
-def sync_one_subscription(conn, sub, *, subsonic_mirror_cache: dict | None = None,
-                          jellyfin_mirror_cache: dict | None = None,
-                          emby_mirror_cache: dict | None = None,
-                          music_assistant_mirror_cache: dict | None = None,
-                          plex_mirror_cache: dict | None = None) -> dict:
+def sync_one_subscription(conn, sub, *, mirror_caches: dict[str, dict] | None = None) -> dict:
     """Fetches one URL subscription and syncs it, recording the outcome on
     the subscription row either way.
 
@@ -192,10 +262,7 @@ def sync_one_subscription(conn, sub, *, subsonic_mirror_cache: dict | None = Non
         conn, client, sub["provider"], title,
         source_playlist_id=subscription_playlist_key(sub["id"]),
         owner_user_id=sub["owner_user_id"], prefetched=fetched,
-        subsonic_mirror_cache=subsonic_mirror_cache,
-        jellyfin_mirror_cache=jellyfin_mirror_cache,
-        emby_mirror_cache=emby_mirror_cache,
-        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
+        mirror_caches=mirror_caches,
     )
     tracks, matched = outcome if outcome is not None else (0, 0)
     conn.execute(
@@ -245,17 +312,19 @@ def _remove_playlist_row(conn, playlist_id: int) -> None:
     it". They had drifted apart in every previous provider addition; the
     subscription case is the first where a user, not a source, triggers the
     removal."""
-    for sel in conn.execute(
-        "SELECT id FROM selections WHERE type = 'playlist' AND target = ?", (str(playlist_id),)
-    ).fetchall():
-        sync_state.delete_selection(conn, sel["id"])
-    mirror.delete_mirror(conn, playlist_id)
-    mirror_subsonic.delete_mirror(conn, playlist_id)
-    mirror_jellyfin.delete_mirror(conn, playlist_id)
-    mirror_emby.delete_mirror(conn, playlist_id)
-    mirror_music_assistant.delete_mirror(conn, playlist_id)
-    mirror_plex.delete_mirror(conn, playlist_id)
-    conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+    conn.commit()
+    with mirror_sinks.playlist_lock(playlist_id):
+        # First, because it commits: the selections and the row then go
+        # together, and a crash after it leaves a playlist that is still whole.
+        mirror_sinks.delete_all(conn, playlist_id)
+        for sel in conn.execute(
+            "SELECT id FROM selections WHERE type = 'playlist' AND target = ?", (str(playlist_id),)
+        ).fetchall():
+            sync_state.delete_selection(conn, sel["id"])
+        conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+        # Inside the lock: a write waiting for it must find the row gone, or
+        # it would make a copy nothing could ever delete.
+        conn.commit()
 
 
 _MIRROR_COPY_COLUMNS = {"jellyfin": "jellyfin_mirror_remote_id", "emby": "emby_mirror_remote_id"}
@@ -312,9 +381,7 @@ def _carry_selections_from_mirror_copy(conn, row) -> None:
 # them, so a switch away from one of these must leave its playlists alone.
 ALWAYS_MERGED_SOURCES = frozenset({"filesystem", "music_assistant"})
 
-_MIRROR_FLAGS = ("mirror_enabled", "subsonic_mirror_enabled",
-                 "jellyfin_mirror_enabled", "emby_mirror_enabled", "music_assistant_mirror_enabled",
-                 "plex_mirror_enabled")
+_MIRROR_FLAGS = tuple(s.enabled_column for s in mirror_sinks.SINKS)
 
 
 def _switch_removal_ids(conn, old_provider: str) -> list[int]:
@@ -431,7 +498,8 @@ def plan_carry_over(conn, old_provider: str, target_id: str, client) -> dict:
         new_tracks = set()
         for t in result["tracks"]:
             track_id = identity.resolve_playlist_track(
-                conn, artist=t["artist"], title=t["title"], path=t.get("path"), isrc=t.get("isrc"))
+                conn, artist=t["artist"], title=t["title"], path=t.get("path"), isrc=t.get("isrc"),
+                album=t.get("album"), mbid=t.get("mbid"))
             if track_id is not None:
                 new_tracks.add(track_id)
         if _overlap_confirms(old_tracks, new_tracks):
@@ -514,11 +582,15 @@ def remove_provider_playlists(conn, old_provider: str) -> int:
     return len(ids)
 
 
+def _matched_track_ids(conn, playlist_id: int) -> set[int]:
+    return {r["matched_track_id"] for r in conn.execute(
+        "SELECT matched_track_id FROM playlist_tracks WHERE playlist_id = ? AND matched_track_id IS NOT NULL",
+        (playlist_id,))}
+
+
 def _sync_one_playlist(
     conn, provider, provider_id: str, title: str, source_playlist_id: str | None = None,
-    owner_user_id: int | None = None, subsonic_mirror_cache: dict | None = None,
-    jellyfin_mirror_cache: dict | None = None, emby_mirror_cache: dict | None = None,
-    music_assistant_mirror_cache: dict | None = None, plex_mirror_cache: dict | None = None,
+    owner_user_id: int | None = None, mirror_caches: dict[str, dict] | None = None,
     prefetched: dict | None = None, **provider_kwargs
 ) -> tuple[int, int] | None:
     """Syncs a single playlist's tracks from `provider` into
@@ -546,11 +618,10 @@ def _sync_one_playlist(
     (user_id=...). `owner_user_id` (#28) is written to the playlists row
     itself, not passed to get_playlist_tracks().
 
-    `subsonic_mirror_cache`/`jellyfin_mirror_cache`/`emby_mirror_cache`/
-    `music_assistant_mirror_cache`: forwarded to each server sink's
-    write_mirror() — a dict PER SINK sync_playlists()
-    creates ONCE per run and passes to every one of its
-    _sync_one_playlist() calls, so N mirrored playlists share one target
+    `mirror_caches`: mirror_sinks.new_caches(), a dict PER SINK that
+    sync_playlists() creates ONCE per run and passes to every one of its
+    _sync_one_playlist() calls; write_all() forwards each to its server
+    sink's write_mirror(), so N mirrored playlists share one target
     tag-index build per sink instead of each triggering their own full
     library walk against that sink's mirror target.
 
@@ -566,6 +637,9 @@ def _sync_one_playlist(
     result = prefetched if prefetched is not None else \
         provider.get_playlist_tracks(title, source_playlist_id, **provider_kwargs)
     if result["status"] != "ok":
+        # Otherwise silent: a whole source can fail this way, sync after sync.
+        _log.warning("playlist sync: %s %s not read: %s", provider_id, source_playlist_id or title,
+                     result.get("reason") or result.get("error") or "no reason given")
         return None
 
     if source_playlist_id is not None:
@@ -650,32 +724,45 @@ def _sync_one_playlist(
             (title, provider_id, source_playlist_id, owner_user_id, playlist_id),
         )
 
+    matched_before = _matched_track_ids(conn, playlist_id)
     conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))
     track_count = matched_count = 0
     # #200: entries the resolver couldn't match, collected for the review
-    # surface (sync_state.record_unresolved_playlist_tracks below) — a
+    # surface (unresolved_store.record_unresolved_playlist_tracks below) — a
     # provider-only track (streamed, never downloaded) is expected to show
     # up here and isn't itself a bug; it's what the review list lets an
     # owner acknowledge.
     unresolved: list[dict] = []
     for t in result["tracks"]:
-        # identity.py's tiered resolver — path/fuzzy matching (matching.py,
-        # unchanged) is still tiers 3 here; see its own docstring for the
-        # full cascade. `t.get("isrc")` is None for every provider today
-        # (#200 planning: checked all nine clients) — passed through anyway
-        # so tiers 1/2 activate automatically once a future PR starts
-        # supplying one, with no change needed at this call site.
+        # identity.py's tiered resolver: the provider's ISRC first (Tidal,
+        # Spotify and Navidrome give one), then its MusicBrainz recording id
+        # (Jellyfin and Navidrome), then path and artist/title matching, where the
+        # entry's album breaks ties. See its docstring for the full cascade.
         path = t.get("path")
-        matched_id = identity.resolve_playlist_track(
-            conn, artist=t["artist"], title=t["title"], path=path, isrc=t.get("isrc"),
-        )
-        if matched_id is not None:
-            matched_count += 1
-        else:
+        if "suggested_track_id" in t:
+            # A guess (from a device playlist's file name): matched only once
+            # accepted, and kept in the review list either way, so the
+            # acceptance survives the next upload.
+            guess = t["suggested_track_id"]
+            matched_id = guess if guess is not None and sync_state.accepted_suggestion(
+                conn, playlist_id, t["artist"], t["title"], t.get("album"), guess) else None
             unresolved.append({
                 "position": t["position"], "artist": t["artist"], "title": t["title"],
-                "album": t.get("album"), "isrc": t.get("isrc"),
+                "album": t.get("album"), "isrc": None,
+                "suggested_track_id": guess, "source_path": t.get("source_path"),
             })
+        else:
+            matched_id = identity.resolve_playlist_track(
+                conn, artist=t["artist"], title=t["title"], path=path, isrc=t.get("isrc"),
+                album=t.get("album"), mbid=t.get("mbid"),
+            )
+            if matched_id is None:
+                unresolved.append({
+                    "position": t["position"], "artist": t["artist"], "title": t["title"],
+                    "album": t.get("album"), "isrc": t.get("isrc"),
+                })
+        if matched_id is not None:
+            matched_count += 1
         track_count += 1
         conn.execute(
             "INSERT INTO playlist_tracks "
@@ -684,36 +771,34 @@ def _sync_one_playlist(
             (playlist_id, t["position"], t["artist"], t["title"], t.get("album"), matched_id),
         )
     sync_state.record_unresolved_playlist_tracks(conn, playlist_id, unresolved)
+    # A device selecting this playlist hears of a track it gained or lost now,
+    # not at the next selection change or scan.
+    if _matched_track_ids(conn, playlist_id) != matched_before:
+        sync_state.recompute_playlist_devices(conn, playlist_id)
     # #285/#189: rewrite this playlist's mirror(s) -- each a no-op unless
     # its own *_mirror_enabled flag is set -- now that matched_track_id is
     # fresh for every track. Same "resolve, then act on the result"
-    # placement as the unresolved-tracks recording just above. Four
-    # independent sinks, four independent failure surfaces (see each
+    # placement as the unresolved-tracks recording just above. Six
+    # independent sinks, six independent failure surfaces (see each
     # module's own never-raises contract) -- one failing never blocks
-    # any other or this playlist's own sync.
-    mirror.write_mirror(conn, playlist_id)
-    mirror_subsonic.write_mirror(conn, playlist_id, tag_index_cache=subsonic_mirror_cache)
-    mirror_jellyfin.write_mirror(conn, playlist_id, tag_index_cache=jellyfin_mirror_cache)
-    mirror_emby.write_mirror(conn, playlist_id, tag_index_cache=emby_mirror_cache)
-    mirror_music_assistant.write_mirror(conn, playlist_id, index_cache=music_assistant_mirror_cache)
-    mirror_plex.write_mirror(conn, playlist_id, index_cache=plex_mirror_cache)
-    # #494: same "resolve, then act" placement as the four mirror sinks
-    # above, and the same never-raises contract -- but a different verb
-    # (requests missing ALBUMS from Lidarr, doesn't copy the playlist
-    # anywhere) so it lives in its own module rather than being a fifth
-    # mirror sink. See lidarr_requests.py's own module docstring.
-    lidarr_requests.run_for_playlist(conn, playlist_id)
+    # any other or this playlist's own sync. This commits the playlist first:
+    # the sinks' network calls must not run with the write lock held.
+    mirror_sinks.write_all(conn, playlist_id, mirror_caches, with_caches=True)
+    # Requests this playlist's missing ALBUMS from Lidarr. Queued rather than
+    # run here: each album is a Lidarr round trip. See lidarr_requests.py.
+    lidarr_requests.enqueue(conn, playlist_id)
     # #133: commit this playlist's writes now, before the caller fetches the
     # NEXT playlist over the network. Otherwise a whole sync holds one open
     # write transaction across every provider round-trip — and since #136's
     # retry/backoff those fetches can sleep for many seconds — keeping the
     # SQLite write lock the entire time and colliding with a concurrent
     # library scan or device/selection write past the 30s busy_timeout. This
-    # mirrors the scanner's own _COMMIT_EVERY periodic commits. Each playlist
+    # mirrors the scanner's own commit per file. Each playlist
     # is still written atomically (its old tracks are deleted + re-inserted in
-    # this one transaction); the only thing given up is whole-run atomicity,
-    # which is fine — a sync is re-runnable and the stale-cleanup at the end
-    # only runs if the whole pass completes.
+    # one transaction, which write_all commits before the first sink); what is
+    # given up is whole-run atomicity, and a mirror's matching the playlist
+    # after a crash, which is fine — a sync is re-runnable and the
+    # stale-cleanup at the end only runs if the whole pass completes.
     conn.commit()
     # Gaps without an album get one looked up in the background (after the
     # commit: queueing a job commits the connection).
@@ -744,10 +829,10 @@ def sync_device_playlists(conn, device_id: int, playlists: list[dict]) -> dict:
     told and its mirrors go with it.
 
     Loop guard, device side: a path Trobar itself writes to this device
-    (sync_state.device_playlist_filenames) is ignored, whatever the client
+    (device_store.device_playlist_filenames) is ignored, whatever the client
     sent, so a Trobar playlist that went out to the card never comes back
     as one of the device's own. The clients also skip any file carrying
-    sync_state.M3U_MARKER.
+    device_store.M3U_MARKER.
 
     Entries resolve through sync_state.resolve_card_entry(); one that names
     no library track is added to the device's unknown tracks. Returns counts."""
@@ -771,10 +856,19 @@ def sync_device_playlists(conn, device_id: int, playlists: list[dict]) -> dict:
                 tracks.append({"position": position, "artist": row["artist"], "title": row["title"],
                                "album": row["album"], "path": row["relative_path"]})
             else:
+                # No file Trobar put on the card. The artist and title its
+                # name gives (the Artist/Album/NN - Title.ext pattern Trobar
+                # writes) may still name a library track, but only as a
+                # guess: it's offered for review, and matched only once its
+                # owner accepts it (_sync_one_playlist).
                 card_path = entry.strip().replace("\\", "/")
-                artist, album, title = sync_state._parse_device_path(card_path)
+                artist, album, title = sync_state._parse_device_path(
+                    "/".join([p for p in card_path.split("/") if p][-3:]))
+                guess = identity.resolve_playlist_track(
+                    conn, artist=artist or "", title=title or card_path, album=album) if artist and title else None
                 tracks.append({"position": position, "artist": artist or "", "title": title or card_path,
-                               "album": album, "path": None})
+                               "album": album, "path": None,
+                               "suggested_track_id": guess, "source_path": card_path})
                 unknown.append(card_path)
         source_id = device_playlist_id(device_id, path)
         title = posixpath.splitext(posixpath.basename(path))[0] or path
@@ -799,9 +893,173 @@ def sync_device_playlists(conn, device_id: int, playlists: list[dict]) -> dict:
     return counts
 
 
+# A playlist made in Trobar itself: created empty, filled from the library,
+# reordered, renamed and deleted here, never re-read from anywhere. Owned
+# by whoever made it, private to start with, and mirrored and selected like
+# any other row. Provider syncs and switches leave these rows alone: each
+# only cleans its own sources.
+TROBAR_SOURCE = "trobar"
+TROBAR_TRACKS_MAX = 20000
+
+
+def write_playlist_mirrors(conn, playlist_id: int) -> None:
+    """Rewrite every mirror of one playlist after an edit made here; each
+    sink is a no-op unless its own flag is on, and never raises. The same
+    calls _sync_one_playlist makes after a sync. Commits what the caller has
+    written first, so the edit stands whatever a sink does."""
+    mirror_sinks.write_all(conn, playlist_id)
+
+
+def create_trobar_playlist(conn, user_id: int, title: str) -> int:
+    """A new, empty playlist owned by `user_id`, private. Commits."""
+    cur = conn.execute(
+        "INSERT INTO playlists (title, source_provider, source_playlist_id, owner_user_id, shared, "
+        "last_synced_at) VALUES (?, ?, ?, ?, 0, datetime('now'))",
+        (title, TROBAR_SOURCE, uuid.uuid4().hex, user_id))
+    conn.commit()
+    return sync_state._new_id(cur)
+
+
+def set_trobar_playlist_tracks(conn, playlist_id: int, items: list) -> int:
+    """Replace the playlist's entries with `items`, in that order: adding,
+    removing and reordering are all this one write. An item is a library
+    track id (an int; the same track may appear more than once), or
+    {"entry_id": n} for an entry of this playlist kept exactly as it is, so
+    a track since removed from the library stays in its place with its own
+    artist and title instead of blocking the write or vanishing. The caller
+    checks both kinds first (unknown_track_ids, foreign_entry_ids). Recomputes
+    the devices that select it and rewrites the mirrors. Commits. Returns the
+    entry count."""
+    track_ids = {i for i in items if isinstance(i, int)}
+    tracks = {r["id"]: r for r in conn.execute(
+        f"SELECT id, artist, title, album FROM tracks WHERE id IN ({','.join('?' * len(track_ids))})",
+        tuple(track_ids))} if track_ids else {}
+    entries = {r["id"]: r for r in conn.execute(
+        "SELECT id, artist, title, album, matched_track_id FROM playlist_tracks WHERE playlist_id = ?",
+        (playlist_id,))}
+    values = []
+    for pos, item in enumerate(items):
+        if isinstance(item, int):
+            t = tracks[item]
+            values.append((playlist_id, pos, t["artist"], t["title"], t["album"], item))
+        else:
+            e = entries[item["entry_id"]]
+            values.append((playlist_id, pos, e["artist"], e["title"], e["album"], e["matched_track_id"]))
+    conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))
+    conn.executemany(
+        "INSERT INTO playlist_tracks (playlist_id, position, artist, title, album, matched_track_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)", values)
+    conn.execute("UPDATE playlists SET last_synced_at = datetime('now') WHERE id = ?", (playlist_id,))
+    sync_state.record_unresolved_playlist_tracks(conn, playlist_id, [])
+    sync_state.recompute_playlist_devices(conn, playlist_id)
+    write_playlist_mirrors(conn, playlist_id)
+    conn.commit()
+    return len(values)
+
+
+def foreign_entry_ids(conn, playlist_id: int, entry_ids: list[int]) -> list[int]:
+    """The ids among `entry_ids` that aren't entries of this playlist."""
+    if not entry_ids:
+        return []
+    own = {r["id"] for r in conn.execute(
+        "SELECT id FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))}
+    return sorted({i for i in entry_ids if i not in own})
+
+
+def unknown_track_ids(conn, track_ids: list[int]) -> list[int]:
+    """The ids among `track_ids` that name no library track, or one since
+    removed from the library."""
+    if not track_ids:
+        return []
+    found = {r["id"] for r in conn.execute(
+        f"SELECT id FROM tracks WHERE deleted_at IS NULL AND id IN ({','.join('?' * len(set(track_ids)))})",
+        tuple(set(track_ids)))}
+    return sorted(set(track_ids) - found)
+
+
+def rename_trobar_playlist(conn, playlist_id: int, title: str) -> None:
+    """Rename, and rewrite the mirrors so their copies follow. Commits."""
+    conn.execute("UPDATE playlists SET title = ? WHERE id = ?", (title, playlist_id))
+    write_playlist_mirrors(conn, playlist_id)
+    conn.commit()
+
+
+def delete_trobar_playlist(conn, playlist_id: int) -> None:
+    """Delete, telling devices and removing mirrors with it
+    (_remove_playlist_row). Commits."""
+    _remove_playlist_row(conn, playlist_id)
+    conn.commit()
+
+
+# A playlist someone uploaded as an .m3u/.m3u8 file. The file is the source,
+# as for a playlist made on a device: uploading a file of the same name
+# again replaces that playlist's entries, so it is keyed on the uploader
+# and the file name, not on the content.
+UPLOAD_SOURCE = "upload"
+
+
+def upload_playlist_id(user_id: int, filename: str) -> str:
+    return f"{user_id}:{filename}"
+
+
+def import_uploaded_playlist(conn, user_id: int, filename: str, tracks: list[dict]) -> dict:
+    """Records an uploaded playlist file as a playlist of `user_id`, private
+    to start with like any owned playlist, through _sync_one_playlist like
+    a provider's, so its entries are matched, its unmatched ones go to the
+    unresolved review, and its mirrors are written the same way. `tracks`
+    are filesystem_client.uploaded_playlist_tracks() items. Matched once,
+    here: nothing re-reads the file later, so uploading it again is how a
+    track added to the library since joins it.
+
+    Returns {"playlist_id", "title", "replaced", "tracks", "matched"};
+    commits."""
+    source_id = upload_playlist_id(user_id, filename)
+    existing = conn.execute(
+        "SELECT id FROM playlists WHERE source_provider = ? AND source_playlist_id = ?",
+        (UPLOAD_SOURCE, source_id)).fetchone()
+    title = posixpath.splitext(filename)[0] or filename
+    result = _sync_one_playlist(conn, None, UPLOAD_SOURCE, title, source_playlist_id=source_id,
+                                owner_user_id=user_id, prefetched={"status": "ok", "tracks": tracks})
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM playlists WHERE source_provider = ? AND source_playlist_id = ?",
+        (UPLOAD_SOURCE, source_id)).fetchone()
+    track_count, matched = result if result is not None else (len(tracks), 0)
+    return {"playlist_id": row["id"] if row else None, "title": title, "replaced": existing is not None,
+            "tracks": track_count, "matched": matched}
+
+
+def export_m3u8(conn, playlist_id: int, include_unresolved: bool = False) -> str:
+    """The playlist as an .m3u8 to take elsewhere: UTF-8, in order, an
+    #EXTINF line per track and its path relative to the music root, so it
+    works for any player that sees the same library. Only matched tracks,
+    unless `include_unresolved`: then an entry that matched nothing (or a
+    track since removed from the library) is kept in its place as a
+    comment, "# Artist - Title", which players skip. A tag with a line
+    break in it is put on one line, so it can't start a line of its own."""
+    def one_line(text):
+        return " ".join((text or "").splitlines())
+
+    lines = ["#EXTM3U"]
+    for r in conn.execute(
+            "SELECT pt.artist AS entry_artist, pt.title AS entry_title, "
+            "t.relative_path, t.artist, t.title, t.duration "
+            "FROM playlist_tracks pt LEFT JOIN tracks t "
+            "ON t.id = pt.matched_track_id AND t.deleted_at IS NULL "
+            "WHERE pt.playlist_id = ? ORDER BY pt.position", (playlist_id,)):
+        if r["relative_path"] is not None:
+            duration = int(r["duration"]) if r["duration"] else -1
+            lines.append(f"#EXTINF:{duration},{one_line(r['artist'])} - {one_line(r['title'])}")
+            lines.append(r["relative_path"])
+        elif include_unresolved:
+            lines.append(f"# {one_line(r['entry_artist'])} - {one_line(r['entry_title'])}")
+    return "\n".join(lines) + "\n"
+
+
 def remove_device_playlists(conn, device_id: int) -> int:
     """Removes the playlists made on `device_id`, through _remove_playlist_row,
-    when the device itself is deleted. Does not commit. Returns how many."""
+    when the device itself is deleted. Commits, as mirror_sinks does.
+    Returns how many."""
     prefix = device_playlist_id(device_id, "")
     ids = [r["id"] for r in conn.execute(
         "SELECT id FROM playlists WHERE source_provider = ? AND substr(source_playlist_id, 1, ?) = ?",
@@ -827,8 +1085,50 @@ _ORIGIN_MIN_OVERLAP_RATIO = 0.6
 _DIRECT_PROVIDERS = ("tidal", "spotify")
 
 
-def _infer_roon_playlist_origins(conn) -> None:
-    """#26/#81/#147: Roon's Browse API exposes no source signal for a playlist —
+def _ma_sources(listing: dict) -> dict[str, list[tuple[str, str]]] | None:
+    """Each Music Assistant playlist's source ids from this run's listing, or
+    None if there was no listing to go by."""
+    if listing.get("status") != "ok":
+        return None
+    return {pl["id"]: pl.get("source_ids", []) for pl in listing["playlists"]}
+
+
+def _link_music_assistant_copies(conn, ma_sources: dict[str, list[tuple[str, str]]]) -> None:
+    """Sets the golden link of each Music Assistant row whose source is a
+    playlist synced directly. Several rows may share one: a playlist can show
+    under two linked accounts."""
+    direct = {(r["source_provider"], r["source_playlist_id"]): r["id"] for r in conn.execute(
+        f"SELECT id, source_provider, source_playlist_id FROM playlists "
+        f"WHERE source_provider IN ({','.join('?' * len(_DIRECT_PROVIDERS))})", _DIRECT_PROVIDERS)}
+    for row in conn.execute("SELECT id, source_playlist_id FROM playlists WHERE source_provider = 'music_assistant'"):
+        for domain, source_id in ma_sources.get(row["source_playlist_id"], ()):
+            golden = direct.get((domain, source_id))
+            if golden is not None:
+                conn.execute("UPDATE playlists SET inferred_origin_provider = ?, golden_source_id = ? WHERE id = ?",
+                             (domain, golden, row["id"]))
+                break
+
+
+def _source_failed(failures: list[dict], provider_id: str, user_row, reason) -> None:
+    """Records that one linked account's source failed this run, for the job's
+    result and the log. A linked account that fails every sync must not look
+    healthy: its playlists stay, ageing, with nothing else to show for it."""
+    reason = str(reason) if reason else "no reason given"
+    _log.warning("playlist sync: %s failed for user %s: %s", provider_id, user_row["id"], reason)
+    failures.append({"provider": provider_id, "user_id": user_row["id"], "reason": reason})
+
+
+def _infer_playlist_origins(conn, ma_sources: dict[str, list[tuple[str, str]]] | None = None) -> None:
+    """Links a library provider's copy of a streaming playlist to the row
+    synced directly from that service, its golden source.
+
+    Music Assistant says where each playlist came from, so its rows match by
+    the service's own playlist id and nothing else: `ma_sources` is each row's
+    source_ids from this run's listing, and a row with none has no origin. None
+    means no listing this run, so those rows keep the links they have, rather
+    than every copy reappearing because Music Assistant didn't answer.
+
+    #26/#81/#147: Roon's Browse API exposes no source signal for a playlist —
     a Roon-native playlist and one imported from a streaming service are
     indistinguishable there (confirmed in #23's research). When the household
     has a directly-linked streaming account (Tidal #21, Spotify #10, future
@@ -864,9 +1164,13 @@ def _infer_roon_playlist_origins(conn) -> None:
     never survives a provider being disconnected or a playlist diverging. A
     direct-provider-only playlist (no Roon counterpart) is never touched here.
     Does not touch owner_user_id/shared."""
+    keep = " AND source_provider != 'music_assistant'" if ma_sources is None else ""
     conn.execute(
         "UPDATE playlists SET inferred_origin_provider = NULL, golden_source_id = NULL "
-        "WHERE inferred_origin_provider IS NOT NULL OR golden_source_id IS NOT NULL")
+        f"WHERE (inferred_origin_provider IS NOT NULL OR golden_source_id IS NOT NULL){keep}")
+    if ma_sources:
+        _link_music_assistant_copies(conn, ma_sources)
+    # Nothing below is about Music Assistant: its rows matched by id or not at all.
 
     def _track_sets(providers: tuple[str, ...]) -> dict[int, set[int]]:
         ph = ",".join("?" for _ in providers)
@@ -980,7 +1284,21 @@ def _cleanup_ghost_playlists(conn) -> int:
     return removed
 
 
-def sync_playlists(provider, provider_id: str) -> dict:
+def sync_status_for(conn, user_id: int, is_admin: bool) -> dict:
+    """sync_status() for one viewer: an admin sees every failed account, anyone
+    else only their own. Whose link failed, and why, is that person's."""
+    status = sync_status()
+    result = status["last_result"]
+    if isinstance(result, dict) and "source_failures" in result:
+        kept = [f for f in result["source_failures"] if is_admin or f["user_id"] == user_id]
+        for failure in kept:
+            row = conn.execute("SELECT username FROM users WHERE id = ?", (failure["user_id"],)).fetchone()
+            failure["username"] = row["username"] if row else None
+        status["last_result"] = {**result, "source_failures": kept}
+    return status
+
+
+def sync_playlists(provider, provider_id: str, report=None) -> dict:
     """Returns {"status": "ok", "playlists": n, "tracks": n, "matched": n,
     "removed": n}.
 
@@ -1005,6 +1323,16 @@ def sync_playlists(provider, provider_id: str) -> dict:
     primary_ok = listing["status"] == "ok"
 
     conn = db.get_conn()
+
+    def checkpoint() -> None:
+        # The job's `report`, called before each playlist: the one before has
+        # committed (see _sync_one_playlist), so a cancel here leaves every
+        # synced playlist whole. Skipped while a write is still open, which
+        # only delays the stop to the next playlist. A cancelled sync never
+        # reaches the stale cleanup below, so nothing is removed because it
+        # wasn't listed yet.
+        if report is not None and not conn.in_transaction:
+            report(playlist_count)
     playlist_count = track_count = matched_count = removed_count = 0
     # Composite keys (#75), not bare titles: two same-titled playlists from
     # different providers are distinct and both sync; a Roon playlist seen
@@ -1017,7 +1345,11 @@ def sync_playlists(provider, provider_id: str) -> dict:
     # #71: linked Tidal users whose fetch failed this run — the stale-cleanup
     # pass skips their owner_user_id-tagged rows so one user's failure never
     # deletes their still-valid playlists (see the Tidal block below).
+    source_failures: list[dict] = []
     tidal_failed_user_ids: set[int] = set()
+    # This pass's Tidal access token per linked user, reused by the share
+    # sync below rather than refreshed a second time.
+    tidal_tokens: dict[int, str] = {}
     # #10 Part B: same per-owner protection for Spotify (see the Spotify block).
     spotify_failed_user_ids: set[int] = set()
     # Same protection for URL subscriptions, keyed on the subscription
@@ -1031,11 +1363,7 @@ def sync_playlists(provider, provider_id: str) -> dict:
     # One target tag-index build per sink, shared by every playlist this
     # run mirrors to it (see mirror_subsonic._get_tag_index()'s docstring)
     # — created once here rather than once per _sync_one_playlist() call.
-    subsonic_mirror_cache: dict = {}
-    jellyfin_mirror_cache: dict = {}
-    emby_mirror_cache: dict = {}
-    music_assistant_mirror_cache: dict = {}
-    plex_mirror_cache: dict = {}
+    mirror_caches = mirror_sinks.new_caches()
     try:
         if primary_ok:
             provider_ids.add(provider_id)
@@ -1043,11 +1371,10 @@ def sync_playlists(provider, provider_id: str) -> dict:
                 src_id, title = pl["id"], pl["title"]
                 key = _playlist_key(provider_id, src_id, title)
                 listed_keys.add(key)
+                checkpoint()
                 outcome = _sync_one_playlist(
                     conn, provider, provider_id, title, source_playlist_id=src_id,
-                    subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                    emby_mirror_cache=emby_mirror_cache,
-                    music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache)
+                    mirror_caches=mirror_caches)
                 if outcome is None:
                     continue
                 seen_keys.add(key)
@@ -1065,11 +1392,10 @@ def sync_playlists(provider, provider_id: str) -> dict:
                     listed_keys.add(key)
                     if key in seen_keys:
                         continue
+                    checkpoint()
                     outcome = _sync_one_playlist(
                         conn, filesystem_client, "filesystem", title, source_playlist_id=src_id,
-                        subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                        emby_mirror_cache=emby_mirror_cache,
-                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache)
+                        mirror_caches=mirror_caches)
                     if outcome is None:
                         continue
                     seen_keys.add(key)
@@ -1095,11 +1421,10 @@ def sync_playlists(provider, provider_id: str) -> dict:
                 listed_keys.add(key)
                 if key in seen_keys:
                     continue
+                checkpoint()
                 outcome = _sync_one_playlist(
                     conn, music_assistant_client, "music_assistant", title, source_playlist_id=src_id,
-                    subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                    emby_mirror_cache=emby_mirror_cache,
-                    music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache)
+                    mirror_caches=mirror_caches)
                 if outcome is None:
                     continue
                 seen_keys.add(key)
@@ -1133,12 +1458,11 @@ def sync_playlists(provider, provider_id: str) -> dict:
                         continue
                     # owner_user_id (#28): this playlist is genuinely
                     # traceable to this one Trobar user's own Roon profile.
+                    checkpoint()
                     outcome = _sync_one_playlist(
                         conn, roon_client, "roon", title, source_playlist_id=src_id,
                         owner_user_id=user_row["id"], roon_profile=profile,
-                        subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                        emby_mirror_cache=emby_mirror_cache,
-                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
+                        mirror_caches=mirror_caches,
                     )
                     if outcome is None:
                         continue
@@ -1179,12 +1503,11 @@ def sync_playlists(provider, provider_id: str) -> dict:
                         continue
                     # owner_user_id (#28): this playlist is genuinely
                     # traceable to this one Trobar user's own Jellyfin account.
+                    checkpoint()
                     outcome = _sync_one_playlist(
                         conn, jellyfin_client, "jellyfin", title, source_playlist_id=src_id,
                         owner_user_id=user_row["id"], user_id=mapped_user_id,
-                        subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                        emby_mirror_cache=emby_mirror_cache,
-                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
+                        mirror_caches=mirror_caches,
                     )
                     if outcome is None:
                         continue
@@ -1210,12 +1533,11 @@ def sync_playlists(provider, provider_id: str) -> dict:
                         continue
                     # owner_user_id (#28): this playlist is genuinely
                     # traceable to this one Trobar user's own Emby account.
+                    checkpoint()
                     outcome = _sync_one_playlist(
                         conn, emby_client, "emby", title, source_playlist_id=src_id,
                         owner_user_id=user_row["id"], user_id=mapped_user_id,
-                        subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                        emby_mirror_cache=emby_mirror_cache,
-                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
+                        mirror_caches=mirror_caches,
                     )
                     if outcome is None:
                         continue
@@ -1270,17 +1592,19 @@ def sync_playlists(provider, provider_id: str) -> dict:
                     # synced is deleted on the strength of a revoked token.
                     conn.execute(
                         "UPDATE users SET tidal_refresh_token = NULL, tidal_user_id = NULL, "
-                        "tidal_display_name = NULL WHERE id = ?",
+                        "tidal_display_name = NULL, tidal_scopes = NULL WHERE id = ?",
                         (user_row["id"],),
                     )
                     conn.commit()
                     tidal_failed_user_ids.add(user_row["id"])
+                    _source_failed(source_failures, "tidal", user_row, "token_rejected")
                     continue
-                except tidal_client.TidalTransientError:
+                except tidal_client.TidalTransientError as e:
                     # Network/5xx/timeout — nothing wrong with the stored
                     # token, retry next sync (same as every other
                     # provider's transient-failure handling here).
                     tidal_failed_user_ids.add(user_row["id"])
+                    _source_failed(source_failures, "tidal", user_row, e)
                     continue
                 if new_refresh_token != user_row["tidal_refresh_token"]:
                     conn.execute(
@@ -1288,12 +1612,15 @@ def sync_playlists(provider, provider_id: str) -> dict:
                         (new_refresh_token, user_row["id"]),
                     )
                     conn.commit()
+                tidal_tokens[user_row["id"]] = access_token
 
                 tidal_user_id = user_row["tidal_user_id"]
-                tidal_listing = tidal_client.list_playlists(access_token, tidal_user_id)
+                tidal_listing = tidal_client.list_playlists(access_token)
                 if tidal_listing["status"] != "ok":
                     tidal_failed_user_ids.add(user_row["id"])
+                    _source_failed(source_failures, "tidal", user_row, tidal_listing.get("reason"))
                     continue  # transient error — retry next sync
+                unread = 0
                 for pl in tidal_listing["playlists"]:
                     src_id, title = pl["id"], pl["title"]
                     key = _playlist_key("tidal", src_id, title)
@@ -1305,21 +1632,29 @@ def sync_playlists(provider, provider_id: str) -> dict:
                     # per-profile case above, not covered by #28 as
                     # originally filed (written before #21 existed) but
                     # the same exposure applies.
+                    checkpoint()
                     outcome = _sync_one_playlist(
                         conn, tidal_client, "tidal", title, source_playlist_id=src_id,
                         owner_user_id=user_row["id"], access_token=access_token, tidal_user_id=tidal_user_id,
-                        subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                        emby_mirror_cache=emby_mirror_cache,
-                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
+                        mirror_caches=mirror_caches,
                     )
                     if outcome is None:
+                        unread += 1
                         continue
                     seen_keys.add(key)
                     playlist_count += 1
                     track_count += outcome[0]
                     matched_count += outcome[1]
+                if unread:
+                    _source_failed(source_failures, "tidal", user_row,
+                                   f"{unread} of {len(tidal_listing['playlists'])} playlists not read")
             if linked:
                 provider_ids.add("tidal")
+            # Shares run after every linked account is read, on this pass's
+            # tokens. Their changes reach Trobar's own copy of each playlist
+            # on the next pass.
+            if tidal_tokens:
+                tidal_shares.sync_all(conn, tidal_tokens)
 
         # #10 Part B: direct per-user Spotify accounts, merged in exactly like
         # the Tidal block above — a separate parallel playlist source, one
@@ -1355,9 +1690,11 @@ def sync_playlists(provider, provider_id: str) -> dict:
                     )
                     conn.commit()
                     spotify_failed_user_ids.add(user_row["id"])
+                    _source_failed(source_failures, "spotify", user_row, "token_rejected")
                     continue
-                except spotify_client.SpotifyTransientError:
+                except spotify_client.SpotifyTransientError as e:
                     spotify_failed_user_ids.add(user_row["id"])
+                    _source_failed(source_failures, "spotify", user_row, e)
                     continue
                 if new_refresh_token != user_row["spotify_refresh_token"]:
                     conn.execute(
@@ -1370,26 +1707,31 @@ def sync_playlists(provider, provider_id: str) -> dict:
                 sp_listing = spotify_client.list_playlists(access_token)
                 if sp_listing["status"] != "ok":
                     spotify_failed_user_ids.add(user_row["id"])
+                    _source_failed(source_failures, "spotify", user_row, sp_listing.get("reason"))
                     continue  # transient error — retry next sync
+                unread = 0
                 for pl in sp_listing["playlists"]:
                     src_id, title = pl["id"], pl["title"]
                     key = _playlist_key("spotify", src_id, title)
                     listed_keys.add(key)
                     if key in seen_keys:
                         continue
+                    checkpoint()
                     outcome = _sync_one_playlist(
                         conn, spotify_client, "spotify", title, source_playlist_id=src_id,
                         owner_user_id=user_row["id"], access_token=access_token,
-                        subsonic_mirror_cache=subsonic_mirror_cache, jellyfin_mirror_cache=jellyfin_mirror_cache,
-                        emby_mirror_cache=emby_mirror_cache,
-                        music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache,
+                        mirror_caches=mirror_caches,
                     )
                     if outcome is None:
+                        unread += 1
                         continue
                     seen_keys.add(key)
                     playlist_count += 1
                     track_count += outcome[0]
                     matched_count += outcome[1]
+                if unread:
+                    _source_failed(source_failures, "spotify", user_row,
+                                   f"{unread} of {len(sp_listing['playlists'])} playlists not read")
             if linked:
                 provider_ids.add("spotify")
 
@@ -1414,14 +1756,12 @@ def sync_playlists(provider, provider_id: str) -> dict:
                 continue  # a row from a newer version, or a removed source
             provider_ids.add(sub["provider"])
             src_id = subscription_playlist_key(sub["id"])
+            checkpoint()
             # Named apart from the `outcome` the provider blocks above use:
             # that one is a (tracks, matched) tuple-or-None, this one is a
             # summary dict, and they are in the same function scope.
             sub_outcome = sync_one_subscription(
-                conn, sub, subsonic_mirror_cache=subsonic_mirror_cache,
-                jellyfin_mirror_cache=jellyfin_mirror_cache,
-                emby_mirror_cache=emby_mirror_cache,
-                music_assistant_mirror_cache=music_assistant_mirror_cache, plex_mirror_cache=plex_mirror_cache)
+                conn, sub, mirror_caches=mirror_caches)
             if sub_outcome["status"] != "ok":
                 # #71's lesson, and the one this source is most exposed to:
                 # an unofficial endpoint refusing us today must not read as
@@ -1436,12 +1776,17 @@ def sync_playlists(provider, provider_id: str) -> dict:
             matched_count += sub_outcome["matched"]
 
         # #26: only meaningful once this run has actually populated both
-        # sides — a Roon sync (this pass, or the per-profile merge above)
-        # and at least one linked Tidal account's playlists (the block
-        # just above). No-ops cleanly (see the function's own docstring)
-        # if either side is empty.
-        if provider is roon_client:
-            _infer_roon_playlist_origins(conn)
+        # sides — a library sync (this pass, or a merge above) and at least
+        # one linked account's playlists (the block just above). No-ops
+        # cleanly (see the function's own docstring) if either side is empty.
+        ma_sources = _ma_sources(listing if provider is music_assistant_client else ma_listing)
+        if provider is roon_client or ma_sources is not None:
+            _infer_playlist_origins(conn, ma_sources)
+
+        # Rule playlists are computed from the library, not listed by any
+        # source, so "rule" never joins provider_ids and the cleanup below
+        # leaves them alone.
+        rule_playlists.refresh_all(conn)
 
         conn.commit()
 
@@ -1486,6 +1831,8 @@ def sync_playlists(provider, provider_id: str) -> dict:
 
     result: dict = {"status": "ok", "playlists": playlist_count, "tracks": track_count,
                     "matched": matched_count, "removed": removed_count}
+    if source_failures:
+        result["source_failures"] = source_failures
     if not primary_ok:
         # Partial result (#128): the secondary merges ran, but the active
         # provider's own listing failed this run — surface it rather than

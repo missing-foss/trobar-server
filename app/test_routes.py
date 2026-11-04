@@ -19,14 +19,19 @@ cookie (AUTH_MODE defaults to local), set through the test client's
 session_transaction — the same session key get_current_user_id() reads.
 """
 import contextlib
+import io
 import json
+from datetime import timedelta
 import os
+import re
 import shutil
 import socket
 import sqlite3
 import tempfile
 import time
+import threading
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -44,19 +49,51 @@ import db          # noqa: E402
 db.DATA_DIR = Path(_TMP)
 db.DB_PATH = Path(_TMP) / "music-sync.db"
 
+import admin            # noqa: E402
+import app_api          # noqa: E402
+import auth             # noqa: E402
+import credential_store  # noqa: E402
+import play_forward     # noqa: E402
+import tidal_client     # noqa: E402
+import device_api       # noqa: E402
+import devices          # noqa: E402
 import filesystem_client  # noqa: E402
+import history_cache    # noqa: E402
+import integrations     # noqa: E402
 import jobs             # noqa: E402
 import library_quiz     # noqa: E402
+import ops               # noqa: E402
+import lidarr_requests  # noqa: E402
 import main             # noqa: E402
+import mirror_sinks     # noqa: E402
 import playlist_sync    # noqa: E402
+import playlists        # noqa: E402
 import scanner          # noqa: E402
+import settings         # noqa: E402
 import sync_state       # noqa: E402
+import user_profile     # noqa: E402
+import web_common       # noqa: E402
+
+
+_NO_HISTORY_CACHE = mock.patch.object(history_cache, "TTL_SECONDS", 0)
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    # Every test answers for the services itself: a cached answer from an
+    # earlier test must not stand in for its mock (history_cache).
+    _NO_HISTORY_CACHE.start()
+    os.makedirs(_TMP, exist_ok=True)
 
 
 def tearDownModule():
     # Remove the whole throwaway dir, not just per-test .db files —
     # tearDown unlinks the .db but WAL-mode leaves .db-wal/.db-shm
     # sidecars, and the module-level flask_secret_key lives here too.
+    _NO_HISTORY_CACHE.stop()
     shutil.rmtree(_TMP, ignore_errors=True)
 
 
@@ -99,6 +136,111 @@ class _RouteTestBase(unittest.TestCase):
             (title, owner_user_id, shared))
         self.conn.commit()
         return sync_state._new_id(cur)
+
+
+class RulePlaylistRouteTests(_RouteTestBase):
+    """The rule playlist routes: live count, create, read, edit, and who may."""
+
+    RULE = {"match": "all", "conditions": [{"field": "artist", "op": "contains", "value": "air"}]}
+
+    def setUp(self):
+        super().setUp()
+        for path, artist in (("a/1.flac", "Air"), ("a/2.flac", "Air"), ("b/1.flac", "Beck")):
+            self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                "VALUES (?, ?, 'x', ?, 1, 0)", (path, artist, path))
+        self.conn.commit()
+        _login(self.client, self.owner)
+
+    def _create(self, title="Air", rule=None):
+        return self.client.post("/api/provider/playlists/rule", json={"title": title, "rule": rule or self.RULE})
+
+    def _entries(self, playlist_id):
+        return self.conn.execute("SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?",
+                                 (playlist_id,)).fetchone()[0]
+
+    def test_routes_need_a_session(self):
+        anonymous = main.app.test_client()
+        for resp in (anonymous.post("/api/provider/playlists/rule/count", json={"rule": self.RULE}),
+                     anonymous.post("/api/provider/playlists/rule", json={"title": "x", "rule": self.RULE}),
+                     anonymous.get("/api/provider/playlists/1/rule")):
+            self.assertEqual(resp.status_code, 401)
+
+    def test_count_says_what_matches_and_what_the_limit_keeps(self):
+        resp = self.client.post("/api/provider/playlists/rule/count", json={"rule": {**self.RULE, "limit": 1}})
+        self.assertEqual(resp.get_json(), {"matches": 2, "tracks": 1})
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM playlists").fetchone()[0], 0)
+
+    def test_create_fills_a_private_playlist_of_the_caller(self):
+        resp = self._create()
+        self.assertEqual(resp.status_code, 201)
+        row = self.conn.execute("SELECT * FROM playlists WHERE id = ?", (resp.get_json()["id"],)).fetchone()
+        self.assertEqual((row["source_provider"], row["owner_user_id"], row["shared"]), ("rule", self.owner, 0))
+        self.assertEqual(self._entries(row["id"]), 2)
+
+    def test_a_field_or_test_that_is_not_text_is_a_400(self):
+        for condition in ({"field": [], "op": "is", "value": 1}, {"field": {}, "op": "is", "value": 1},
+                          {"field": "year", "op": [], "value": 1}, {"field": "duration", "op": {}, "value": 1}):
+            resp = self.client.post("/api/provider/playlists/rule/count",
+                                    json={"rule": {"match": "all", "conditions": [condition]}})
+            self.assertEqual(resp.status_code, 400, condition)
+
+    def test_two_rule_playlists_can_share_a_name(self):
+        self.assertEqual(self._create().status_code, 201)
+        _login(self.client, self.other)
+        self.assertEqual(self._create().status_code, 201)
+
+    def test_a_bad_rule_or_title_creates_nothing(self):
+        for body in ({"title": "x"}, {"title": "x", "rule": {"match": "all", "conditions": []}},
+                     {"title": "", "rule": self.RULE}):
+            self.assertEqual(self.client.post("/api/provider/playlists/rule", json=body).status_code, 400)
+        self.assertEqual(self.client.post("/api/provider/playlists/rule", json=[1]).status_code, 400)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM playlists").fetchone()[0], 0)
+
+    def test_get_returns_the_rule_for_editing(self):
+        playlist_id = self._create().get_json()["id"]
+        got = self.client.get(f"/api/provider/playlists/{playlist_id}/rule").get_json()
+        self.assertEqual(got["title"], "Air")
+        self.assertEqual(got["rule"]["conditions"], self.RULE["conditions"])
+
+    def test_put_replaces_title_and_rule_and_refills(self):
+        playlist_id = self._create().get_json()["id"]
+        rule = {"match": "all", "conditions": [{"field": "artist", "op": "is", "value": "Beck"}]}
+        resp = self.client.put(f"/api/provider/playlists/{playlist_id}/rule", json={"title": "Beck", "rule": rule})
+        self.assertEqual(resp.get_json(), {"status": "ok", "tracks": 1})
+        self.assertEqual(self._entries(playlist_id), 1)
+        got = self.client.get(f"/api/provider/playlists/{playlist_id}/rule").get_json()
+        self.assertEqual((got["title"], got["rule"]["conditions"]), ("Beck", rule["conditions"]))
+
+    def test_a_bad_put_changes_nothing(self):
+        playlist_id = self._create().get_json()["id"]
+        resp = self.client.put(f"/api/provider/playlists/{playlist_id}/rule", json={"title": "x", "rule": {}})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.client.get(f"/api/provider/playlists/{playlist_id}/rule").get_json()["title"], "Air")
+        self.assertEqual(self._entries(playlist_id), 2)
+
+    def test_only_the_owner_or_an_admin_reads_or_edits_a_rule(self):
+        playlist_id = self._create().get_json()["id"]
+        url = f"/api/provider/playlists/{playlist_id}/rule"
+        _login(self.client, self.other)
+        self.assertEqual(self.client.get(url).status_code, 403)
+        self.assertEqual(self.client.put(url, json={"title": "x", "rule": self.RULE}).status_code, 403)
+        self.assertEqual(self.client.delete(f"/api/provider/playlists/{playlist_id}").status_code, 403)
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.get(url).status_code, 200)
+
+    def test_rule_routes_refuse_a_playlist_without_a_rule(self):
+        playlist_id = self._make_playlist("Other", self.owner)
+        self.assertEqual(self.client.get(f"/api/provider/playlists/{playlist_id}/rule").status_code, 400)
+        self.assertEqual(self.client.get("/api/provider/playlists/99999/rule").status_code, 404)
+
+    def test_tracks_are_not_written_by_hand_but_the_playlist_can_be_deleted(self):
+        playlist_id = self._create().get_json()["id"]
+        resp = self.client.put(f"/api/provider/playlists/{playlist_id}/tracks", json={"track_ids": []})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self._entries(playlist_id), 2)
+        self.assertEqual(self.client.delete(f"/api/provider/playlists/{playlist_id}").status_code, 200)
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM playlists WHERE id = ?", (playlist_id,)).fetchone())
 
 
 class ProviderPlaylistVisibilityTests(_RouteTestBase):
@@ -499,6 +641,35 @@ class PlaylistMirrorToggleTests(_RouteTestBase):
             f"/api/provider/playlists/{playlist_id}/mirror", json={"enabled": enabled}
         )
 
+    def test_a_toggle_commits_before_the_sink_runs(self):
+        other = sqlite3.connect(db.DB_PATH, timeout=0)
+        self.addCleanup(other.close)
+
+        def write_elsewhere(_conn, _playlist_id):
+            other.execute("INSERT OR REPLACE INTO app_config (key, value) VALUES ('w', '1')")
+            other.commit()
+        for enabled, name in ((True, "write_mirror"), (False, "delete_mirror")):
+            with self.subTest(enabled=enabled), \
+                    mock.patch(f"mirror.{name}", side_effect=write_elsewhere) as sink:
+                self.assertEqual(self._toggle(self.owner, self.owned, enabled).status_code, 200)
+                sink.assert_called_once()
+
+    def test_a_toggle_waits_for_a_write_in_progress(self):
+        lock = mirror_sinks.playlist_lock(self.owned)
+        lock.acquire()
+        self.addCleanup(lambda: lock.release() if held else None)
+        held = True
+        responses = []
+        thread = threading.Thread(target=lambda: responses.append(
+            self._toggle(self.owner, self.owned, True)))
+        thread.start()
+        thread.join(0.2)
+        self.assertTrue(thread.is_alive(), "the toggle did not wait for the lock")
+        held = False
+        lock.release()
+        thread.join(10)
+        self.assertEqual(responses[0].status_code, 200)
+
     def test_any_user_can_enable_mirroring_on_a_shared_playlist(self):
         resp = self._toggle(self.other, self.owned, True)
         self.assertEqual(resp.status_code, 200)
@@ -534,6 +705,45 @@ class PlaylistMirrorToggleTests(_RouteTestBase):
         _login(self.client, self.owner)
         resp = self.client.post(f"/api/provider/playlists/{self.owned}/mirror", json={})
         self.assertEqual(resp.status_code, 400)
+
+    def test_an_unknown_or_non_string_sink_gets_400(self):
+        _login(self.client, self.owner)
+        for sink in ("dropbox", "mirror", ["plex"], {"plex": 1}, 7):
+            with self.subTest(sink=sink):
+                resp = self.client.post(f"/api/provider/playlists/{self.owned}/mirror",
+                                        json={"enabled": True, "sink": sink})
+                self.assertEqual(resp.status_code, 400)
+
+    def test_each_sink_flips_its_own_column_and_calls_its_own_module(self):
+        # Written out here, not read from mirror_sinks: the registry is what
+        # this checks.
+        expected = {
+            "filesystem": (main.mirror, "mirror_enabled"),
+            "subsonic": (main.mirror_subsonic, "subsonic_mirror_enabled"),
+            "jellyfin": (main.mirror_jellyfin, "jellyfin_mirror_enabled"),
+            "emby": (main.mirror_emby, "emby_mirror_enabled"),
+            "music_assistant": (main.mirror_music_assistant, "music_assistant_mirror_enabled"),
+            "plex": (main.mirror_plex, "plex_mirror_enabled"),
+        }
+        flags = [col for _module, col in expected.values()]
+        _login(self.client, self.owner)
+        for sink, (module, column) in expected.items():
+            for enabled in (True, False):
+                with self.subTest(sink=sink, enabled=enabled), \
+                        mock.patch.object(module, "write_mirror") as write, \
+                        mock.patch.object(module, "delete_mirror") as delete:
+                    resp = self.client.post(f"/api/provider/playlists/{self.owned}/mirror",
+                                            json={"enabled": enabled, "sink": sink})
+                    self.assertEqual(resp.status_code, 200)
+                    self.assertIs(resp.get_json()[column], enabled)
+                    called, idle = (write, delete) if enabled else (delete, write)
+                    self.assertEqual(called.call_count, 1)
+                    self.assertEqual(called.call_args.args[1], self.owned)
+                    idle.assert_not_called()
+                    row = self.conn.execute(
+                        f"SELECT {', '.join(flags)} FROM playlists WHERE id = ?", (self.owned,)).fetchone()
+                    on = {col for col in flags if row[col]}
+                    self.assertEqual(on, {column} if enabled else set())
 
     def test_a_real_write_failure_surfaces_its_code_through_the_route(self):
         # #428: the toggle response is the client's own live source for
@@ -597,11 +807,10 @@ class PlaylistLidarrRequestsToggleTests(_RouteTestBase):
         resp = self.client.post(f"/api/provider/playlists/{self.owned}/lidarr-requests", json={})
         self.assertEqual(resp.status_code, 400)
 
-    def test_enabling_runs_a_real_mocked_client_round_trip(self):
-        # #494's own "instant feedback, don't wait for the next sync"
-        # contract — enabling calls run_for_playlist() immediately, whose
-        # outcome is already visible in THIS response, not just after a
-        # later reload.
+    def test_enabling_queues_the_requests_and_answers_at_once(self):
+        """The response doesn't wait on Lidarr: a run is one round trip per
+        missing album. It says the run is queued; the queued job does the
+        round trip, and its outcome shows on the playlist afterwards."""
         self.conn.execute(
             "INSERT INTO unresolved_playlist_tracks (playlist_id, position, artist, title, album) "
             "VALUES (?, 0, 'Artist', 'Track', 'Album')", (self.owned,))
@@ -614,9 +823,18 @@ class PlaylistLidarrRequestsToggleTests(_RouteTestBase):
             }
             client.add_and_monitor_album.return_value = {"status": "ok", "artist_id": 1, "album_id": 2}
             resp = self._toggle(self.owner, self.owned, True)
-        data = resp.get_json()
-        self.assertEqual(data["lidarr_request_last_count"], 1)
-        self.assertIsNotNone(data["lidarr_request_last_run_at"])
+            data = resp.get_json()
+            client.lookup_album.assert_not_called()
+            self.assertTrue(data["lidarr_request_queued"])
+            self.assertIsNone(data["lidarr_request_last_run_at"])
+            job = self.conn.execute(
+                "SELECT payload FROM jobs WHERE type = ?", (lidarr_requests.JOB_TYPE,)).fetchone()
+            lidarr_requests.run_job(json.loads(job["payload"]))
+        row = self.conn.execute(
+            "SELECT lidarr_request_last_count, lidarr_request_last_run_at FROM playlists WHERE id = ?",
+            (self.owned,)).fetchone()
+        self.assertEqual(row["lidarr_request_last_count"], 1)
+        self.assertIsNotNone(row["lidarr_request_last_run_at"])
 
     def test_disabling_does_not_call_the_client(self):
         with mock.patch("lidarr_requests.lidarr_client") as client:
@@ -625,6 +843,7 @@ class PlaylistLidarrRequestsToggleTests(_RouteTestBase):
             resp = self._toggle(self.owner, self.owned, False)
         client.lookup_album.assert_not_called()
         self.assertFalse(resp.get_json()["lidarr_request_enabled"])
+        self.assertFalse(resp.get_json()["lidarr_request_queued"])
 
 
 class AdminConfigLidarrTests(_RouteTestBase):
@@ -943,6 +1162,68 @@ class AdminMirrorTargetsTests(_RouteTestBase):
         self.assertEqual((t["state"], t["detail_code"]), ("error", "unreachable"))
 
 
+class RateLimitForgetsAddressesTests(unittest.TestCase):
+    """The limiter holds an address no longer than its window: checking
+    creates nothing, and a bucket whose failures have all aged out goes,
+    whether or not that address is ever checked again."""
+
+    def setUp(self):
+        main._rl_failures.clear()
+        self.addCleanup(main._rl_failures.clear)
+        for name, value in (("_rl_max_window_s", 0), ("_rl_last_sweep", 0.0)):
+            # create=True: these tests also run against a limiter without
+            # the sweep, and fail there on behaviour, not on setUp. The
+            # limiter and the state it rebinds live in web_common (#253).
+            state = mock.patch.object(web_common, name, value, create=True)
+            state.start()
+            self.addCleanup(state.stop)
+        self.now = 1_000_000.0
+        patcher = mock.patch.object(main.time, "time", side_effect=lambda: self.now)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_checking_an_address_that_failed_nothing_keeps_nothing(self):
+        self.assertFalse(main._rate_limited("device:192.0.2.1", 30, 300))
+        self.assertNotIn("device:192.0.2.1", main._rl_failures)
+
+    def test_a_checked_bucket_goes_once_its_failures_age_out(self):
+        main._rate_limited("login:192.0.2.2", 10, 300)
+        main._record_failure("login:192.0.2.2")
+        self.now += 301
+        web_common._rl_last_sweep = self.now  # the bucket's own check, not the sweep
+        self.assertFalse(main._rate_limited("login:192.0.2.2", 10, 300))
+        self.assertNotIn("login:192.0.2.2", main._rl_failures)
+
+    def test_a_bucket_never_checked_again_is_swept(self):
+        main._rate_limited("login:192.0.2.3", 10, 300)
+        main._record_failure("login:192.0.2.3")
+        self.now += 301
+        main._rate_limited("login:192.0.2.4", 10, 300)
+        self.assertNotIn("login:192.0.2.3", main._rl_failures)
+
+    def test_failures_inside_the_window_still_count(self):
+        for _ in range(10):
+            main._rate_limited("login:192.0.2.5", 10, 300)
+            main._record_failure("login:192.0.2.5")
+        self.now += 299
+        main._rate_limited("login:192.0.2.6", 10, 300)
+        self.assertTrue(main._rate_limited("login:192.0.2.5", 10, 300))
+
+    def test_the_sweep_keeps_a_bucket_whose_newest_failure_is_live(self):
+        # One failure aged out, one still inside the window; the sweep runs on
+        # another address's check. Judging the bucket by its oldest failure
+        # would drop it and reset a live count.
+        main._rate_limited("login:192.0.2.7", 10, 300)
+        main._record_failure("login:192.0.2.7")
+        self.now += 290
+        main._record_failure("login:192.0.2.7")
+        self.now += 11
+        main._rate_limited("login:192.0.2.8", 10, 300)
+        self.assertEqual(len(main._rl_failures.get("login:192.0.2.7", ())), 2)
+        main._rate_limited("login:192.0.2.7", 10, 300)
+        self.assertEqual(len(main._rl_failures["login:192.0.2.7"]), 1)
+
+
 class RateLimitTrustedProxyTests(_RouteTestBase):
     """#382: the brute-force backoff must key on the
     trusted, proxy-appended hop of X-Forwarded-For — the RIGHT-most
@@ -1041,30 +1322,30 @@ class ExposureWarningTests(unittest.TestCase):
     def test_none_below_threshold(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TROBAR_TRUSTED_PROXY", None)
-            self._seed(main._EXPOSURE_WARN_THRESHOLD)
-            self.assertIsNone(main._exposure_warning())
+            self._seed(admin._EXPOSURE_WARN_THRESHOLD)
+            self.assertIsNone(admin._exposure_warning())
 
     def test_warns_above_threshold(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TROBAR_TRUSTED_PROXY", None)
-            self._seed(main._EXPOSURE_WARN_THRESHOLD + 1)
-            self.assertEqual(main._exposure_warning(), main._EXPOSURE_WARN_THRESHOLD + 1)
+            self._seed(admin._EXPOSURE_WARN_THRESHOLD + 1)
+            self.assertEqual(admin._exposure_warning(), admin._EXPOSURE_WARN_THRESHOLD + 1)
 
     def test_none_when_trusted_proxy_is_pinned_even_with_many_peers(self):
         # The pin itself is the acknowledgement — a directly-exposed port
         # can't exploit "*" trust that was never granted in the first place.
         with mock.patch.dict(os.environ, {"TROBAR_TRUSTED_PROXY": "172.20.0.5"}):
-            self._seed(main._EXPOSURE_WARN_THRESHOLD + 10)
-            self.assertIsNone(main._exposure_warning())
+            self._seed(admin._EXPOSURE_WARN_THRESHOLD + 10)
+            self.assertIsNone(admin._exposure_warning())
 
     def test_none_in_forward_mode_even_with_many_peers(self):
         # forward mode's real boundary is the ForwardAuth gate; a reachable
         # port is a separate question this signal isn't measuring.
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TROBAR_TRUSTED_PROXY", None)
-            self._seed(main._EXPOSURE_WARN_THRESHOLD + 10)
-            with mock.patch.object(main, "AUTH_MODE", "forward"):
-                self.assertIsNone(main._exposure_warning())
+            self._seed(admin._EXPOSURE_WARN_THRESHOLD + 10)
+            with mock.patch.object(settings, "AUTH_MODE", "forward"):
+                self.assertIsNone(admin._exposure_warning())
 
     def test_stale_peers_outside_the_window_are_not_counted(self):
         # A long-running instance's one real proxy can still get a new
@@ -1074,8 +1355,8 @@ class ExposureWarningTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TROBAR_TRUSTED_PROXY", None)
             long_ago = time.time() - main._EXPOSURE_WINDOW_S - 3600
-            self._seed(main._EXPOSURE_WARN_THRESHOLD + 5, seen=long_ago)
-            self.assertIsNone(main._exposure_warning())
+            self._seed(admin._EXPOSURE_WARN_THRESHOLD + 5, seen=long_ago)
+            self.assertIsNone(admin._exposure_warning())
 
     def test_status_shows_the_count_below_threshold(self):
         # Review feedback on #389: unlike _exposure_warning, this always
@@ -1085,17 +1366,17 @@ class ExposureWarningTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TROBAR_TRUSTED_PROXY", None)
             self._seed(2)
-            self.assertEqual(main._exposure_status(), 2)
+            self.assertEqual(admin._exposure_status(), 2)
 
     def test_status_is_none_not_zero_when_trusted_proxy_is_pinned(self):
         with mock.patch.dict(os.environ, {"TROBAR_TRUSTED_PROXY": "172.20.0.5"}):
-            self.assertIsNone(main._exposure_status())
+            self.assertIsNone(admin._exposure_status())
 
     def test_status_is_none_not_zero_in_forward_mode(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TROBAR_TRUSTED_PROXY", None)
-            with mock.patch.object(main, "AUTH_MODE", "forward"):
-                self.assertIsNone(main._exposure_status())
+            with mock.patch.object(settings, "AUTH_MODE", "forward"):
+                self.assertIsNone(admin._exposure_status())
 
 
 class RecordExposureSampleTests(_RouteTestBase):
@@ -1121,14 +1402,14 @@ class RecordExposureSampleTests(_RouteTestBase):
             os.environ.pop("TROBAR_TRUSTED_PROXY", None)
             for _ in range(5):
                 self.client.get("/login", environ_overrides={"REMOTE_ADDR": "198.51.100.42"})
-        self.assertEqual(main._exposure_peer_count(), 1)
+        self.assertEqual(web_common._exposure_peer_count(), 1)
 
     def test_different_peers_each_count(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TROBAR_TRUSTED_PROXY", None)
             for i in range(3):
                 self.client.get("/login", environ_overrides={"REMOTE_ADDR": f"198.51.100.{i}"})
-        self.assertEqual(main._exposure_peer_count(), 3)
+        self.assertEqual(web_common._exposure_peer_count(), 3)
 
     def test_a_spoofed_x_forwarded_for_does_not_change_the_raw_peer_recorded(self):
         # The whole point: the header is attacker-controlled, the raw socket
@@ -1141,19 +1422,19 @@ class RecordExposureSampleTests(_RouteTestBase):
                 self.client.get(
                     "/login", environ_overrides={"REMOTE_ADDR": "198.51.100.42"},
                     headers={"X-Forwarded-For": f"203.0.113.{i}"})
-        self.assertEqual(main._exposure_peer_count(), 1)
+        self.assertEqual(web_common._exposure_peer_count(), 1)
 
     def test_nothing_recorded_when_trusted_proxy_is_pinned(self):
         with mock.patch.dict(os.environ, {"TROBAR_TRUSTED_PROXY": "172.20.0.5"}):
             self.client.get("/login", environ_overrides={"REMOTE_ADDR": "198.51.100.42"})
-        self.assertEqual(main._exposure_peer_count(), 0)
+        self.assertEqual(web_common._exposure_peer_count(), 0)
 
     def test_nothing_recorded_in_forward_mode(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TROBAR_TRUSTED_PROXY", None)
-            with mock.patch.object(main, "AUTH_MODE", "forward"):
+            with mock.patch.object(settings, "AUTH_MODE", "forward"):
                 self.client.get("/login", environ_overrides={"REMOTE_ADDR": "198.51.100.42"})
-        self.assertEqual(main._exposure_peer_count(), 0)
+        self.assertEqual(web_common._exposure_peer_count(), 0)
 
 
 class AdminHealthRouteTests(_RouteTestBase):
@@ -1250,7 +1531,7 @@ class AdminHealthRouteTests(_RouteTestBase):
     def test_exposure_warning_is_surfaced_past_the_threshold(self):
         main._exposure_peers.clear()
         self.addCleanup(main._exposure_peers.clear)
-        for i in range(main._EXPOSURE_WARN_THRESHOLD + 1):
+        for i in range(admin._EXPOSURE_WARN_THRESHOLD + 1):
             main._exposure_peers[f"203.0.113.{i}"] = time.time()
         _login(self.client, self.admin)
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -1258,7 +1539,7 @@ class AdminHealthRouteTests(_RouteTestBase):
             resp = self.client.get("/api/admin/health")
         # +1 for the admin's own request the assertion above didn't seed.
         self.assertEqual(
-            resp.get_json()["exposure_warning"], main._EXPOSURE_WARN_THRESHOLD + 2)
+            resp.get_json()["exposure_warning"], admin._EXPOSURE_WARN_THRESHOLD + 2)
 
     def test_exposure_peer_count_is_shown_even_below_threshold(self):
         # Review feedback on #389: a signal that only ever speaks up past
@@ -1302,6 +1583,24 @@ class AdminHealthRouteTests(_RouteTestBase):
         _login(self.client, self.admin)
         resp = self.client.get("/api/admin/health")
         self.assertEqual(resp.get_json()["last_scan_finished_at"], "2026-06-15 12:00:00")
+
+    def _last_scan_from_folder(self, result):
+        self.conn.execute(
+            "INSERT INTO jobs (type, state, finished_at, result) VALUES (?, 'done', '2026-06-15 12:00:00', ?)",
+            (scanner.JOB_TYPE, result))
+        self.conn.commit()
+        _login(self.client, self.admin)
+        return self.client.get("/api/admin/health").get_json()["last_scan_from_folder"]
+
+    def test_last_scan_from_folder_is_the_last_scans_count(self):
+        self.assertEqual(self._last_scan_from_folder('{"added": 3, "from_folder": 2}'), 2)
+
+    def test_last_scan_from_folder_is_none_for_a_result_without_it(self):
+        # A scan from before the count, or one whose result isn't a dict.
+        for result in (None, '{"added": 3}', '"text"', "not json"):
+            with self.subTest(result=result):
+                self.conn.execute("DELETE FROM jobs")
+                self.assertIsNone(self._last_scan_from_folder(result))
 
 
 class AdminConfigMirrorShareLocationTests(_RouteTestBase):
@@ -1587,6 +1886,444 @@ class AdminConfigExtraPlaylistFolderValidationTests(_RouteTestBase):
         self._put(extra_playlist_folder=str(separate))
         data = self.client.get("/api/admin/config").get_json()
         self.assertEqual(data["extra_playlist_folder"], str(separate))
+
+
+class DevicePlaysRouteTests(_RouteTestBase):
+    """POST /api/device/plays and the person's own switch for keeping them."""
+
+    def setUp(self):
+        super().setUp()
+        self.device_id, self.token = sync_state.create_device(self.conn, self.owner, "watch")
+        self.track = self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+            "VALUES ('a/1.flac', 'Air', 'x', 'y', 1, 0)").lastrowid
+        self.conn.commit()
+        self.when = int(time.time()) - 60
+        _login(self.client, self.owner)
+
+    def _report(self, body=None, token=None):
+        body = {"plays": [{"track_id": self.track, "played_at": self.when}]} if body is None else body
+        return self.client.post("/api/device/plays", json=body,
+                                headers={"Authorization": f"Bearer {token or self.token}"})
+
+    def _enable(self, on=True):
+        return self.client.put("/api/profile/device-plays", json={"enabled": on})
+
+    def test_stored_plays_are_used_only_while_the_switch_is_on(self):
+        url = "/api/suggestions/most-played?with_sources=1"
+        self.assertEqual(self.client.get(url).get_json()["sources"]["device_plays"], "unconfigured")
+        self._enable()
+        self._report()
+        body = self.client.get(url).get_json()
+        self.assertEqual(body["sources"]["device_plays"], "ok")
+        self.assertEqual([(i["artist"], i["album"], i["playcount"]) for i in body["items"]], [("Air", "x", 1)])
+        # One copy per album, and "recently added" comes first: out of the way
+        # here, as each source is what is being looked at.
+        with mock.patch("web_common.suggestions.recently_added", return_value=[]):
+            self.assertEqual([i["source"] for i in self.client.get("/api/suggestions").get_json()], ["device_plays"])
+        self._enable(False)
+        body = self.client.get(url).get_json()
+        self.assertEqual((body["items"], body["sources"]["device_plays"]), ([], "unconfigured"))
+        with mock.patch("web_common.suggestions.recently_added", return_value=[]):
+            self.assertEqual(self.client.get("/api/suggestions").get_json(), [])
+        profile = self.client.get("/api/profile").get_json()
+        self.assertEqual(profile["device_plays_count"], 1, "off keeps what is stored")
+        self._enable()
+        self.assertEqual(len(self.client.get(url).get_json()["items"]), 1)
+
+    def test_a_play_outside_the_period_is_still_a_recent_one(self):
+        self._enable()
+        old = self.when - 40 * 86400
+        self.assertEqual(self._report({"plays": [{"track_id": self.track, "played_at": old}]}).get_json()["stored"], 1)
+        with mock.patch("web_common.suggestions.recently_added", return_value=[]):
+            got = self.client.get("/api/suggestions?period=7day").get_json()
+        self.assertEqual([i["source"] for i in got], ["device_plays-recent"])
+
+    def test_an_album_on_every_device_is_not_suggested(self):
+        self._enable()
+        self._report()
+        sync_state.create_selection(self.conn, "album", "Air||x", self.owner, [self.device_id])
+        self.conn.commit()
+        with mock.patch("web_common.suggestions.recently_added", return_value=[]):
+            self.assertEqual(self.client.get("/api/suggestions").get_json(), [])
+
+    def test_plays_count_as_configured_on_the_app_api(self):
+        with db.connection() as conn:
+            self.assertFalse(app_api._scrobble_configured(conn, self.owner))
+        self._enable()
+        with db.connection() as conn:
+            self.assertTrue(app_api._scrobble_configured(conn, self.owner))
+        self._report()
+        self._enable(False)
+        with db.connection() as conn:
+            self.assertFalse(app_api._scrobble_configured(conn, self.owner), "off: stored plays aren't a source")
+
+    def test_a_device_needs_its_token(self):
+        self.assertEqual(self._report(token="nope").status_code, 401)
+        self.assertEqual(self.client.post("/api/device/plays", json={"plays": []}).status_code, 401)
+
+    def test_nothing_is_stored_until_its_owner_turns_it_on(self):
+        self.assertFalse(self.client.get("/api/profile").get_json()["device_plays_enabled"])
+        self.assertEqual(self._report().get_json()["enabled"], False)
+        self.assertEqual(self.client.get("/api/profile").get_json()["device_plays_count"], 0)
+
+    def test_on_stores_a_play_for_the_devices_owner(self):
+        self.assertTrue(self._enable().get_json()["device_plays_enabled"])
+        self.assertEqual(self._report().get_json()["stored"], 1)
+        self.assertEqual(self.client.get("/api/profile").get_json()["device_plays_count"], 1)
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.get("/api/profile").get_json()["device_plays_count"], 0)
+
+    def test_the_switch_is_the_callers_own(self):
+        _login(self.client, self.admin)
+        self._enable()
+        self.assertEqual(self._report().get_json()["enabled"], False)
+
+    def test_a_malformed_body_is_a_400(self):
+        self._enable()
+        bodies: list[object] = [[], {}, {"plays": "x"}, {"plays": [{"track_id": 1}]},
+                                {"plays": [{"track_id": 10 ** 30, "played_at": self.when}]}]
+        for body in bodies:
+            self.assertEqual(self._report(body).status_code, 400, body)
+        self.assertEqual(self.client.put("/api/profile/device-plays", json={"enabled": 1}).status_code, 400)
+        self.assertEqual(self.client.put("/api/profile/device-plays", json=[]).status_code, 400)
+
+    def test_delete_clears_the_plays_and_keeps_the_switch(self):
+        self._enable()
+        self._report()
+        profile = self.client.delete("/api/profile/device-plays").get_json()
+        self.assertEqual((profile["device_plays_count"], profile["device_plays_enabled"]), (0, True))
+
+    def test_removing_a_device_keeps_its_plays(self):
+        self._enable()
+        self._report()
+        self.assertEqual(self.conn.execute("SELECT device_id FROM device_plays").fetchone()[0], self.device_id)
+        self.assertLess(self.client.delete(f"/api/devices/{self.device_id}").status_code, 300)
+        self.assertIsNone(self.conn.execute("SELECT device_id FROM device_plays").fetchone()[0])
+
+
+class SendCredentialRouteTests(_RouteTestBase):
+    """PUT /api/profile/send-credentials: stored encrypted, never returned."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.key_file = Path(tmp.name) / "key"
+        env = mock.patch.dict(os.environ, {"TROBAR_CREDENTIAL_KEY_FILE": str(self.key_file)})
+        env.start()
+        self.addCleanup(env.stop)
+        _login(self.client, self.owner)
+
+    def _put(self, **body):
+        return self.client.put("/api/profile/send-credentials", json=body)
+
+    def _column(self, column="maloja_api_key_enc", user=None):
+        return self.conn.execute(f"SELECT {column} FROM users WHERE id = ?", (user or self.owner,)).fetchone()[0]
+
+    def test_needs_a_session(self):
+        self.assertEqual(main.app.test_client().put("/api/profile/send-credentials", json={}).status_code, 401)
+
+    def test_stored_encrypted_and_never_returned(self):
+        resp = self._put(maloja_api_key="hunter2-value")
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("hunter2-value", resp.get_data(as_text=True))
+        self.assertNotIn("hunter2-value", self._column())
+        self.assertNotIn("maloja_api_key_enc", resp.get_json())
+        self.assertEqual(resp.get_json()["maloja_api_key_state"], "set")
+        self.assertEqual(resp.get_json()["listenbrainz_token_state"], "none")
+        self.assertNotIn("hunter2-value", self.client.get("/api/profile").get_data(as_text=True))
+
+    def test_a_field_left_out_stays_and_an_empty_one_goes(self):
+        self._put(maloja_api_key="a", listenbrainz_token="b")
+        before = self._column("listenbrainz_token_enc")
+        profile = self._put(maloja_api_key="").get_json()
+        self.assertEqual((profile["maloja_api_key_state"], profile["listenbrainz_token_state"]), ("none", "set"))
+        self.assertIsNone(self._column())
+        self.assertEqual(self._column("listenbrainz_token_enc"), before)
+
+    def test_a_pasted_value_is_trimmed_and_blanks_count_as_empty(self):
+        self._put(maloja_api_key="  a\n")
+        self.assertEqual(credential_store.decrypt(self._column(), self.owner, "maloja_api_key"), "a")
+        self._put(maloja_api_key="   ")
+        self.assertIsNone(self._column())
+
+    def test_it_is_the_callers_own(self):
+        self._put(maloja_api_key="a")
+        self.assertIsNone(self._column(user=self.other))
+
+    def test_a_whole_profile_put_leaves_them_alone(self):
+        self._put(maloja_api_key="a")
+        before = self._column()
+        profile = self.client.get("/api/profile").get_json()
+        self.assertEqual(self.client.put("/api/profile", json=profile).status_code, 200)
+        self.assertEqual(self._column(), before)
+
+    def test_a_bad_value_changes_nothing_at_all(self):
+        self._put(maloja_api_key="a")
+        before = self._column()
+        self.assertEqual(self._put(maloja_api_key="", listenbrainz_token=123).status_code, 400)
+        self.assertEqual(self._column(), before)
+
+    def test_a_lost_key_says_enter_it_again_and_breaks_nothing(self):
+        self._put(maloja_api_key="a")
+        self.key_file.unlink()
+        resp = self.client.get("/api/profile")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["maloja_api_key_state"], "unreadable")
+        self.assertEqual(self._put(maloja_api_key="again").get_json()["maloja_api_key_state"], "set")
+
+    def test_a_bad_body_is_a_400(self):
+        self.assertEqual(self.client.put("/api/profile/send-credentials", json=[]).status_code, 400)
+        self.assertEqual(self._put(maloja_api_key=1).status_code, 400)
+        self.assertEqual(self._put(maloja_api_key="x" * 501).status_code, 400)
+
+    def test_a_damaged_key_is_a_503_and_stores_nothing(self):
+        self.key_file.write_bytes(b"short")
+        self.assertEqual(self._put(maloja_api_key="a").status_code, 503)
+        self.assertIsNone(self._column())
+
+
+class PlaySendRouteTests(_RouteTestBase):
+    """PUT /api/profile/play-sends, and plays queueing a send."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"TROBAR_CREDENTIAL_KEY_FILE": str(Path(tmp.name) / "key")})
+        env.start()
+        self.addCleanup(env.stop)
+        _login(self.client, self.owner)
+        self.conn.execute("UPDATE users SET maloja_url = 'http://8.8.8.8' WHERE id = ?", (self.owner,))
+        self.conn.commit()
+
+    def _put(self, **body):
+        return self.client.put("/api/profile/play-sends", json=body)
+
+    def test_needs_a_session(self):
+        self.assertEqual(main.app.test_client().put("/api/profile/play-sends", json={}).status_code, 401)
+
+    def test_on_needs_its_credential(self):
+        self.assertEqual(self._put(target="maloja", enabled=True).status_code, 409)
+        self.client.put("/api/profile/send-credentials", json={"maloja_api_key": "k"})
+        profile = self._put(target="maloja", enabled=True).get_json()
+        self.assertEqual(profile["play_sends"]["maloja"]["on"], True)
+
+    def test_a_bad_body_is_a_400(self):
+        for body in ({"target": "spotify", "enabled": True}, {"target": "maloja", "enabled": 1}, {}):
+            self.assertEqual(self.client.put("/api/profile/play-sends", json=body).status_code, 400, body)
+        self.assertEqual(self.client.put("/api/profile/play-sends", json=[]).status_code, 400)
+
+    def test_removing_the_credential_turns_the_switch_off(self):
+        self.client.put("/api/profile/send-credentials", json={"maloja_api_key": "k"})
+        self._put(target="maloja", enabled=True)
+        profile = self.client.put("/api/profile/send-credentials", json={"maloja_api_key": ""}).get_json()
+        self.assertEqual(profile["play_sends"]["maloja"], {"on": False, "ready": False, "error": None, "rejected": 0})
+
+    def test_stored_plays_queue_a_send_only_with_a_target_on(self):
+        device_id, token = sync_state.create_device(self.conn, self.owner, "watch")
+        track = self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                                  "VALUES ('a/1.flac', 'Air', 'x', 'y', 1, 0)").lastrowid
+        self.conn.commit()
+        self.client.put("/api/profile/device-plays", json={"enabled": True})
+        self.client.put("/api/profile/send-credentials", json={"maloja_api_key": "k"})
+        self._put(target="maloja", enabled=True)
+        when = int(time.time()) - 60
+        with mock.patch("device_api.play_forward.enqueue_for") as enqueue:
+            for _ in range(2):  # the second is a retry: nothing new, nothing queued
+                self.client.post("/api/device/plays", json={"plays": [{"track_id": track, "played_at": when}]},
+                                 headers={"Authorization": f"Bearer {token}"})
+        enqueue.assert_called_once_with(mock.ANY, self.owner)
+
+
+class LastfmLinkRouteTests(_RouteTestBase):
+    """The Last.fm link, and the admin's API account."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"TROBAR_CREDENTIAL_KEY_FILE": str(Path(tmp.name) / "key")})
+        env.start()
+        self.addCleanup(env.stop)
+        _login(self.client, self.owner)
+
+    def _app(self):
+        db.set_config(self.conn, "lastfm_app_api_key", "app-key")
+        db.set_config(self.conn, play_forward.APP_SECRET_CONFIG,
+                      credential_store.encrypt("app-secret", 0, play_forward.APP_SECRET_CONFIG))
+        self.conn.commit()
+
+    def _start(self):
+        resp = self.client.get("/profile/lastfm/connect")
+        self.assertEqual(resp.status_code, 302)
+        with self.client.session_transaction() as sess:
+            return resp, sess["lastfm_link_state"]
+
+    def test_connect_needs_the_admins_account(self):
+        self.assertEqual(self.client.get("/profile/lastfm/connect").status_code, 400)
+
+    def test_connect_sends_the_person_to_lastfm_with_a_state(self):
+        self._app()
+        resp, state = self._start()
+        self.assertIn("https://www.last.fm/api/auth/?api_key=app-key", resp.location)
+        self.assertIn(state, resp.location)
+
+    def test_callback_stores_the_session_encrypted(self):
+        self._app()
+        _, state = self._start()
+        with mock.patch("auth.lastfm.get_session", return_value={"name": "air", "key": "the-session"}) as get:
+            resp = self.client.get(f"/profile/lastfm/callback?state={state}&token=tok")
+        self.assertEqual(get.call_args.args[:3], ("app-key", "app-secret", "tok"))
+        self.assertNotIn("lastfm_error", resp.location)
+        row = self.conn.execute("SELECT lastfm_session_enc, lastfm_session_name FROM users WHERE id = ?",
+                                (self.owner,)).fetchone()
+        self.assertEqual(row["lastfm_session_name"], "air")
+        self.assertNotIn("the-session", row["lastfm_session_enc"])
+        profile = self.client.get("/api/profile").get_json()
+        self.assertEqual((profile["lastfm_session_state"], profile["play_sends"]["lastfm"]["ready"]), ("set", True))
+        self.assertNotIn("lastfm_session_enc", profile)
+
+    def test_a_forged_or_replayed_callback_stores_nothing(self):
+        self._app()
+        _, state = self._start()
+        with mock.patch("auth.lastfm.get_session") as get:
+            resp = self.client.get("/profile/lastfm/callback?state=wrong&token=tok")
+            again = self.client.get(f"/profile/lastfm/callback?state={state}&token=tok")
+        get.assert_not_called()
+        self.assertIn("lastfm_error=1", resp.location)
+        self.assertIn("lastfm_error=1", again.location)
+
+    def test_a_callback_needs_a_session(self):
+        self._app()
+        with mock.patch("auth.lastfm.get_session") as get:
+            resp = main.app.test_client().get("/profile/lastfm/callback?state=x&token=t")
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/login", resp.location)
+        get.assert_not_called()
+
+    def test_a_refused_token_stores_nothing(self):
+        self._app()
+        _, state = self._start()
+        with mock.patch("auth.lastfm.get_session", return_value=None):
+            resp = self.client.get(f"/profile/lastfm/callback?state={state}&token=tok")
+        self.assertIn("lastfm_error=1", resp.location)
+        self.assertIsNone(self.conn.execute("SELECT lastfm_session_enc FROM users WHERE id = ?",
+                                            (self.owner,)).fetchone()[0])
+
+    def test_disconnect_forgets_the_session_and_turns_the_switch_off(self):
+        self._app()
+        self.conn.execute("UPDATE users SET lastfm_session_enc = ?, lastfm_session_name = 'air' WHERE id = ?",
+                          (credential_store.encrypt("s", self.owner, "lastfm_session"), self.owner))
+        self.conn.commit()
+        self.assertEqual(self.client.put("/api/profile/play-sends", json={"target": "lastfm", "enabled": True}).status_code, 200)
+        profile = self.client.delete("/api/profile/lastfm-session").get_json()
+        self.assertEqual((profile["lastfm_session_state"], profile["lastfm_session_name"]), ("none", None))
+        self.assertFalse(profile["play_sends"]["lastfm"]["on"])
+
+    def test_the_admins_secret_is_write_only_and_encrypted(self):
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.put("/api/admin/config", json={
+            "lastfm_app_api_key": "k", "lastfm_app_secret": "the-secret"}).status_code, 200)
+        stored = db.get_config(self.conn, play_forward.APP_SECRET_CONFIG)
+        self.assertNotIn("the-secret", stored or "")
+        self.assertTrue(stored)
+        config = self.client.get("/api/admin/config")
+        self.assertNotIn("the-secret", config.get_data(as_text=True))
+        self.assertTrue(config.get_json()["lastfm_app_secret_set"])
+        self.assertNotIn(stored, config.get_data(as_text=True))
+        self.client.put("/api/admin/config", json={"lastfm_app_secret": ""})
+        self.assertTrue(self.client.get("/api/admin/config").get_json()["lastfm_app_secret_set"])
+        self.assertEqual(play_forward.lastfm_app(self.conn), {"key": "k", "secret": "the-secret"})
+        self.client.put("/api/admin/config", json={"lastfm_app_secret": None})
+        self.assertFalse(self.client.get("/api/admin/config").get_json()["lastfm_app_secret_set"])
+
+    def test_only_an_admin_sets_it(self):
+        self.assertEqual(self.client.put("/api/admin/config", json={"lastfm_app_secret": "x"}).status_code, 403)
+
+
+class DeviceStorageReserveTests(_RouteTestBase):
+    """POST /api/device/storage's optional `reserve_bytes`: the space the
+    device keeps free on its volume, which its own space check won't let a
+    sync eat into. Absent is not zero, as for `foreign_bytes`."""
+
+    def setUp(self):
+        super().setUp()
+        self.device_id, self.token = sync_state.create_device(self.conn, self.owner, "phone")
+        self.conn.commit()
+
+    def _report(self, **body):
+        return self.client.post("/api/device/storage", json=body,
+                                headers={"Authorization": f"Bearer {self.token}"})
+
+    def test_a_reserve_is_stored_beside_the_report(self):
+        self._report(free_bytes=1, total_bytes=2, reserve_bytes=1_000_000_000)
+        self.assertEqual(self._reserve(), 1_000_000_000)
+
+    def test_a_report_without_a_reserve_leaves_it_as_it_was(self):
+        # Quietly: an older client sends none on every report, and that is
+        # not a client bug to warn about.
+        with self.assertNoLogs(level="WARNING"):
+            self._report(free_bytes=1, total_bytes=2)
+        self.assertIsNone(self._reserve())
+        self._report(free_bytes=1, total_bytes=2, reserve_bytes=5)
+        self._report(free_bytes=3, total_bytes=4)
+        self.assertEqual(self._reserve(), 5)
+
+    def test_an_unusable_reserve_is_ignored_without_losing_the_rest(self):
+        for bad in (-1, "5", None, True, 1.5):
+            with self.subTest(bad=bad):
+                resp = self._report(free_bytes=7, total_bytes=8, reserve_bytes=bad)
+                self.assertEqual(resp.status_code, 200)
+                self.assertIsNone(self._reserve())
+                self.assertEqual(self.conn.execute(
+                    "SELECT reported_free_bytes FROM devices WHERE id = ?", (self.device_id,)).fetchone()[0], 7)
+
+    def _reserve(self):
+        return self.conn.execute(
+            "SELECT reported_reserve_bytes FROM devices WHERE id = ?", (self.device_id,)).fetchone()[0]
+
+
+class DeviceChangesEstimatedSizeTests(_RouteTestBase):
+    """GET /api/device/changes: each download carries `estimated_size`, what
+    it will take on the device, for the device's space check before it
+    downloads. A transcoded file's size is only known once written, so it
+    gets the estimate the usage figures use; anything else, its size."""
+
+    def setUp(self):
+        super().setUp()
+        self.device, self.token = sync_state.create_device(self.conn, self.owner, "phone")
+        self.tracks = {}
+        for name, path, size, duration, lossless in (
+                ("flac", "a/1.flac", 5_000_000, 60.0, 1), ("mp3", "a/2.mp3", 1_000_000, 60.0, 0)):
+            cur = self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, size, mtime, duration, lossless) "
+                "VALUES (?, 'A', 'Al', ?, ?, 0, ?, ?)", (path, name, size, duration, lossless))
+            self.tracks[name] = sync_state._new_id(cur)
+            sync_state.create_selection(self.conn, "track", str(self.tracks[name]), self.owner, [self.device])
+        self.conn.commit()
+        patcher = mock.patch.object(main.provenance, "start_ensure_fingerprints")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _estimates(self):
+        body = self.client.get("/api/device/changes",
+                               headers={"Authorization": f"Bearer {self.token}"}).get_json()
+        return {t["track_id"]: (t["transcode"], t["estimated_size"]) for t in body["to_download"]}
+
+    def test_without_transcoding_the_estimate_is_the_size(self):
+        self.assertEqual(self._estimates(), {
+            self.tracks["flac"]: (False, 5_000_000), self.tracks["mp3"]: (False, 1_000_000)})
+
+    def test_a_transcoded_track_is_estimated_as_the_usage_figures_estimate_it(self):
+        self.conn.execute("UPDATE devices SET transcode_format = 'mp3_320' WHERE id = ?", (self.device,))
+        self.conn.commit()
+        # 60 s at 320 kbit/s (40,000 bytes a second), plus the slack; the mp3
+        # is copied as it is.
+        self.assertEqual(self._estimates(), {
+            self.tracks["flac"]: (True, 60 * 40_000 + sync_state._EST_SLACK_BYTES),
+            self.tracks["mp3"]: (False, 1_000_000)})
 
 
 class DeviceStorageForeignBytesTests(_RouteTestBase):
@@ -2246,6 +2983,8 @@ class AdminConfigUrlValidationTests(_RouteTestBase):
         bad_numbers = [
             ({"transcode_concurrency": "many"}, "transcode_concurrency"),
             ({"transcode_nice_level": 99}, "transcode_nice_level"),
+            ({"transcode_cache_gb": "lots"}, "transcode_cache_gb"),
+            ({"transcode_cache_gb": -1}, "transcode_cache_gb"),
             ({"job_retention_days": 0}, "job_retention_days"),
             ({"scan_interval_hours": -1}, "scan_interval_hours"),
         ]
@@ -2546,8 +3285,11 @@ class ProviderSwitchTests(_RouteTestBase):
 
         def get_playlist_tracks(title, source_playlist_id=None, **_kwargs):
             entries = playlists[source_playlist_id][1]
+            # An entry is (artist, title), or (artist, title, mbid) for a
+            # source that gives a MusicBrainz recording id.
             return {"status": "ok", "tracks": [
-                {"position": n, "artist": a, "title": t, "path": None} for n, (a, t) in enumerate(entries)]}
+                {"position": n, "artist": e[0], "title": e[1], "path": None, "mbid": e[2] if len(e) > 2 else None}
+                for n, e in enumerate(entries)]}
 
         return _Patches(client, list_playlists, get_playlist_tracks)
 
@@ -2565,6 +3307,34 @@ class ProviderSwitchTests(_RouteTestBase):
     def _preview(self, body=None, target=None):
         with (target or self._target(main.subsonic_client)):
             return self.client.post("/api/admin/provider/switch/preview", json=body or self._SUBSONIC)
+
+    def _set_provider(self, value):
+        db.set_config(self.conn, "provider", value)
+        self.conn.commit()
+
+    def test_a_switch_away_from_roon_stops_it(self):
+        self._set_provider("roon")
+        with mock.patch.object(main.roon_client, "stop") as stop:
+            resp, *_ = self._switch()
+        self.assertEqual(resp.status_code, 200)
+        stop.assert_called_once()
+
+    def test_a_switch_between_other_sources_leaves_roon_alone(self):
+        self._set_provider("filesystem")
+        with mock.patch.object(main.roon_client, "stop") as stop:
+            self._switch()
+        stop.assert_not_called()
+
+    def test_a_save_connects_roon_only_while_it_is_the_source(self):
+        address = {"roon_host": "core.invalid", "roon_port": 9330}
+        for provider, called in (("subsonic", "store_address"), ("roon", "reconnect")):
+            with self.subTest(provider), \
+                    mock.patch.object(main.roon_client, "reconnect") as reconnect, \
+                    mock.patch.object(main.roon_client, "store_address") as store:
+                self._set_provider(provider)
+                self.client.put("/api/admin/config", json=address)
+                ({"store_address": store, "reconnect": reconnect}[called]).assert_called_once_with("core.invalid", 9330)
+                ({"store_address": reconnect, "reconnect": store}[called]).assert_not_called()
 
     def test_the_config_put_refuses_a_different_provider_once_setup_is_done(self):
         resp = self.client.put("/api/admin/config", json={"provider": "subsonic"})
@@ -2595,6 +3365,20 @@ class ProviderSwitchTests(_RouteTestBase):
             "kept": {"tidal": 1, "filesystem": 1},
         })
         self.assertEqual(self._titles(), {"Kids", "Focus", "Discover", "Road"})
+
+    def test_the_preview_counts_a_playlist_mirrored_to_any_one_sink(self):
+        columns = ("mirror_enabled", "subsonic_mirror_enabled", "jellyfin_mirror_enabled",
+                   "emby_mirror_enabled", "music_assistant_mirror_enabled", "plex_mirror_enabled")
+        self.conn.execute(f"UPDATE playlists SET {' = 0, '.join(columns)} = 0")
+        self.conn.commit()
+        self.assertEqual(self._preview().get_json()["removed"]["mirrored"], 0)
+        for column in columns:
+            with self.subTest(column=column):
+                self.conn.execute(f"UPDATE playlists SET {column} = 1 WHERE title = 'Kids'")
+                self.conn.commit()
+                self.assertEqual(self._preview().get_json()["removed"]["mirrored"], 1)
+                self.conn.execute(f"UPDATE playlists SET {column} = 0")
+                self.conn.commit()
 
     def test_the_preview_refuses_the_active_provider_and_an_unknown_one(self):
         self.assertEqual(self._preview({**self._SUBSONIC, "provider": "jellyfin"}).status_code, 409)
@@ -2655,13 +3439,39 @@ class ProviderSwitchTests(_RouteTestBase):
         self.assertEqual(self._provider(), "jellyfin")
         self.assertEqual(self._titles(), {"Kids", "Focus", "Discover", "Road"})
 
+    def test_a_scheduled_sync_cannot_queue_while_the_switch_runs(self):
+        # An idle tick in the middle of the switch, after its last check,
+        # must not queue a sync; the switch's own sync is the only one.
+        held = []
+        real_rows = admin._switch_provider_rows
+
+        def rows_then_idle_tick(*args):
+            held.append(main._PROVIDER_SWITCH_LOCK.locked())
+            real_rows(*args)
+            main._maybe_schedule_playlist_sync()
+
+        with mock.patch.object(admin, "_switch_provider_rows", side_effect=rows_then_idle_tick):
+            resp, _test, _reconnect, start = self._switch()
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual(held, [True])
+        start.assert_called_once_with(main.subsonic_client, "subsonic")
+        self.assertFalse(main._PROVIDER_SWITCH_LOCK.locked())
+
+    def test_a_refused_switch_releases_the_lock(self):
+        # A lock left held would stop every scheduled sync, silently.
+        with mock.patch.object(main.playlist_sync, "sync_status",
+                               side_effect=[{"running": False}, {"running": True}]):
+            resp, *_ = self._switch()
+        self.assertEqual(resp.status_code, 409)
+        self.assertFalse(main._PROVIDER_SWITCH_LOCK.locked())
+
     def test_a_sync_job_runs_against_the_provider_active_when_it_starts(self):
         # Queued under Jellyfin, run after a switch to Subsonic.
         db.set_config(self.conn, "provider", "subsonic")
         self.conn.commit()
         with mock.patch.object(main.playlist_sync, "sync_playlists", return_value={}) as sync:
             main._run_playlist_sync({"provider_id": "jellyfin"}, None)
-        sync.assert_called_once_with(main.subsonic_client, "subsonic")
+        sync.assert_called_once_with(main.subsonic_client, "subsonic", None)
 
     def test_missing_fields_are_refused_before_any_test(self):
         resp, test, _reconnect, _start = self._switch({"provider": "subsonic", "url": "http://nav.local"})
@@ -2714,6 +3524,19 @@ class ProviderSwitchTests(_RouteTestBase):
                                     json={"provider": "roon", "host": "core.local", "port": "9330"})
         self.assertEqual(resp.get_json()["ok"], True)
         test.assert_called_once_with("core.local", 9330)
+
+    def test_the_connect_test_also_takes_the_active_source(self):
+        # The setup wizard, run again, tests the current source's settings as
+        # typed. Testing changes nothing, so it isn't refused like a switch.
+        with mock.patch.object(main.jellyfin_client, "test_connection",
+                               return_value={"state": "paired"}) as test:
+            resp = self.client.post("/api/admin/provider/switch/test", json={
+                "provider": "jellyfin", "url": "http://jf.local:8096", "api_key": "k", "username": "u"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["ok"], True)
+        test.assert_called_once()
+        self.assertEqual(self._preview({**self._SUBSONIC, "provider": "jellyfin"}).status_code, 409,
+                         "previewing a switch to it is still refused")
 
     def test_the_switch_endpoints_are_admin_only(self):
         _login(self.client, self.other)
@@ -2782,6 +3605,17 @@ class ProviderSwitchTests(_RouteTestBase):
         self.assertIsNotNone(sel)
         # The device keeps the playlist: nothing of it is queued for deletion.
         self.assertFalse({d["track_id"] for d in changes["to_delete"]} & set(ids))
+
+    def test_a_namesake_whose_songs_match_only_by_recording_id_is_carried_over(self):
+        pid, ids, _entries = self._party()
+        mbids = [f"8f3471b5-7e6a-48da-86a9-c1c07a0f47a{n}" for n in range(4)]
+        for track_id, mbid in zip(ids, mbids):
+            self.conn.execute("UPDATE tracks SET mbid = ? WHERE id = ?", (mbid, track_id))
+        self.conn.commit()
+        renamed = [("Someone Else", f"Retitled {n}", mbid) for n, mbid in enumerate(mbids)]
+        target = self._target(main.subsonic_client, {"s-party": ("Party Mix", renamed)})
+        preview = self._preview(target=target).get_json()
+        self.assertEqual(preview["carried"]["ids"], [pid])
 
     def test_the_preview_matches_what_the_switch_does(self):
         _pid, _ids, entries = self._party()
@@ -3394,6 +4228,697 @@ class AdminConfigScanIntervalValidationTests(_RouteTestBase):
         self.assertIsNotNone(resp.get_json()["next_scheduled_scan_at"])
 
 
+
+class AdminConfigPlaylistSyncIntervalTests(_RouteTestBase):
+    """PUT/GET /api/admin/config's playlist_sync_interval_hours, the same
+    0-to-a-year range as scan_interval_hours, 0 being off."""
+
+    def test_a_fresh_install_reports_six_hours(self):
+        _login(self.client, self.admin)
+        resp = self.client.get("/api/admin/config")
+        self.assertEqual(resp.get_json()["playlist_sync_interval_hours"], 6)
+
+    def test_zero_is_accepted_as_off(self):
+        _login(self.client, self.admin)
+        resp = self.client.put("/api/admin/config", json={"playlist_sync_interval_hours": 0})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(self.conn, "playlist_sync_interval_hours"), "0")
+
+    def test_accepts_a_valid_interval(self):
+        _login(self.client, self.admin)
+        resp = self.client.put("/api/admin/config", json={"playlist_sync_interval_hours": 24})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(self.conn, "playlist_sync_interval_hours"), "24")
+
+    def test_rejects_bad_values_and_names_the_field(self):
+        _login(self.client, self.admin)
+        for bad in (-1, 8761, "soon"):
+            resp = self.client.put("/api/admin/config", json={"playlist_sync_interval_hours": bad})
+            self.assertEqual(resp.status_code, 400, bad)
+            self.assertEqual(resp.get_json()["field"], "playlist_sync_interval_hours")
+        self.assertEqual(db.get_config(self.conn, "playlist_sync_interval_hours"), "6")
+
+    def test_next_sync_is_none_until_something_has_synced(self):
+        _login(self.client, self.admin)
+        self.assertIsNone(self.client.get("/api/admin/config").get_json()["next_scheduled_playlist_sync_at"])
+        self.conn.execute("INSERT INTO jobs (type, state, finished_at) VALUES (?, 'done', datetime('now'))",
+                          (main.playlist_sync.JOB_TYPE,))
+        self.conn.commit()
+        self.assertIsNotNone(self.client.get("/api/admin/config").get_json()["next_scheduled_playlist_sync_at"])
+
+    def test_next_sync_is_none_when_off(self):
+        self.conn.execute("INSERT INTO jobs (type, state, finished_at) VALUES (?, 'done', datetime('now'))",
+                          (main.playlist_sync.JOB_TYPE,))
+        db.set_config(self.conn, "playlist_sync_interval_hours", "0")
+        self.conn.commit()
+        _login(self.client, self.admin)
+        self.assertIsNone(self.client.get("/api/admin/config").get_json()["next_scheduled_playlist_sync_at"])
+
+
+class ScheduledPlaylistSyncHookTests(_RouteTestBase):
+    """main._maybe_schedule_playlist_sync, the jobs.on_idle hook."""
+
+    def setUp(self):
+        super().setUp()
+        db.set_config(self.conn, "provider", "jellyfin")
+        db.set_config(self.conn, "setup_completed", "1")
+        self.conn.commit()
+
+    def _queued(self):
+        return [json.loads(r["payload"]) for r in self.conn.execute(
+            "SELECT payload FROM jobs WHERE type = ? AND state = 'queued'",
+            (main.playlist_sync.JOB_TYPE,))]
+
+    def test_an_install_older_than_the_wizard_runs_its_schedule_once_migrated(self):
+        self.conn.execute("DELETE FROM app_config WHERE key = 'setup_completed'")
+        self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                          "VALUES ('a.flac', 'A', 'B', 'T', 1, 0)")
+        self.conn.commit()
+        main._maybe_schedule_playlist_sync()
+        self.assertEqual(self._queued(), [], "the fault this fixes")
+        db._migrate_setup_completed_for_old_installs(self.conn)
+        self.conn.commit()
+        main._maybe_schedule_playlist_sync()
+        self.assertEqual(self._queued(), [{"provider_id": "jellyfin"}])
+
+    def test_due_queues_a_sync_of_the_active_provider(self):
+        main._maybe_schedule_playlist_sync()
+        self.assertEqual(self._queued(), [{"provider_id": "jellyfin"}])
+
+    def test_nothing_before_setup_has_finished(self):
+        db.set_config(self.conn, "setup_completed", None)
+        self.conn.commit()
+        main._maybe_schedule_playlist_sync()
+        self.assertEqual(self._queued(), [])
+
+    def test_nothing_when_off(self):
+        db.set_config(self.conn, "playlist_sync_interval_hours", "0")
+        self.conn.commit()
+        main._maybe_schedule_playlist_sync()
+        self.assertEqual(self._queued(), [])
+
+    def test_nothing_when_not_yet_due(self):
+        self.conn.execute("INSERT INTO jobs (type, state, finished_at) VALUES (?, 'done', datetime('now'))",
+                          (main.playlist_sync.JOB_TYPE,))
+        self.conn.commit()
+        main._maybe_schedule_playlist_sync()
+        self.assertEqual(self._queued(), [])
+
+    def test_does_not_stack_on_a_queued_sync(self):
+        main._maybe_schedule_playlist_sync()
+        main._maybe_schedule_playlist_sync()
+        self.assertEqual(len(self._queued()), 1)
+
+    def test_skipped_while_a_provider_switch_holds_the_lock(self):
+        with main._PROVIDER_SWITCH_LOCK:
+            main._maybe_schedule_playlist_sync()
+        self.assertEqual(self._queued(), [])
+        self.assertFalse(main._PROVIDER_SWITCH_LOCK.locked())
+
+    def test_is_registered_as_an_idle_hook(self):
+        self.assertIn(main._maybe_schedule_playlist_sync, main.jobs._idle_hooks)
+
+
+
+class SyncAfterScanTests(_RouteTestBase):
+    """main._sync_after_scan and the pending flag _maybe_schedule_playlist_sync
+    acts on: one playlist sync after a scan that changed the library."""
+
+    CHANGED = {"added": 1, "updated": 0, "removed": 0, "unchanged": 10}
+
+    def setUp(self):
+        super().setUp()
+        db.set_config(self.conn, "provider", "jellyfin")
+        db.set_config(self.conn, "setup_completed", "1")
+        # The schedule is off, so every sync here comes from the scan.
+        db.set_config(self.conn, "playlist_sync_interval_hours", "0")
+        self.conn.commit()
+
+    def _jobs(self, state):
+        return self.conn.execute("SELECT COUNT(*) FROM jobs WHERE type = ? AND state = ?",
+                                 (main.playlist_sync.JOB_TYPE, state)).fetchone()[0]
+
+    def _pending(self):
+        return db.get_config(self.conn, main._SYNC_AFTER_SCAN_PENDING)
+
+    def _add_sync(self, state):
+        self.conn.execute("INSERT INTO jobs (type, state, dedupe_key) VALUES (?, ?, ?)",
+                          (main.playlist_sync.JOB_TYPE, state, main.playlist_sync.JOB_DEDUPE))
+        self.conn.commit()
+
+    def test_a_scan_that_changed_tracks_queues_one_sync(self):
+        main._sync_after_scan(self.CHANGED)
+        self.assertEqual(self._jobs("queued"), 1)
+        self.assertIsNone(self._pending())
+
+    def test_removed_or_updated_tracks_count_as_a_change(self):
+        for k in ("updated", "removed"):
+            self.conn.execute("DELETE FROM jobs")
+            self.conn.commit()
+            main._sync_after_scan({"added": 0, "updated": 0, "removed": 0, k: 2})
+            self.assertEqual(self._jobs("queued"), 1, k)
+
+    def test_a_scan_that_changed_nothing_asks_for_nothing(self):
+        main._sync_after_scan({"added": 0, "updated": 0, "removed": 0, "unchanged": 10})
+        self.assertEqual(self._jobs("queued"), 0)
+        self.assertIsNone(self._pending())
+
+    def test_nothing_when_turned_off(self):
+        db.set_config(self.conn, "playlist_sync_after_scan", "0")
+        self.conn.commit()
+        main._sync_after_scan(self.CHANGED)
+        self.assertEqual(self._jobs("queued"), 0)
+        self.assertIsNone(self._pending())
+
+    def test_nothing_before_setup_has_finished(self):
+        db.set_config(self.conn, "setup_completed", None)
+        self.conn.commit()
+        main._sync_after_scan(self.CHANGED)
+        self.assertEqual(self._jobs("queued"), 0)
+
+    def test_an_already_queued_sync_counts_as_the_one_asked_for(self):
+        self._add_sync("queued")
+        main._sync_after_scan(self.CHANGED)
+        self.assertEqual(self._jobs("queued"), 1)
+        self.assertIsNone(self._pending())
+
+    def test_a_running_sync_is_followed_by_another_once_it_ends(self):
+        # It may have read the tracks before the scan wrote them.
+        self._add_sync("running")
+        main._sync_after_scan(self.CHANGED)
+        self.assertEqual(self._jobs("queued"), 0)
+        self.assertEqual(self._pending(), "1")
+        main._maybe_schedule_playlist_sync()  # still running: keep waiting
+        self.assertEqual(self._jobs("queued"), 0)
+        self.conn.execute("UPDATE jobs SET state = 'done', finished_at = datetime('now'), "
+                          "dedupe_key = NULL")
+        self.conn.commit()
+        main._maybe_schedule_playlist_sync()
+        self.assertEqual(self._jobs("queued"), 1)
+        self.assertIsNone(self._pending())
+
+    def test_the_flag_waits_out_a_provider_switch(self):
+        with main._PROVIDER_SWITCH_LOCK:
+            main._sync_after_scan(self.CHANGED)
+        self.assertEqual(self._jobs("queued"), 0)
+        self.assertEqual(self._pending(), "1")
+        main._maybe_schedule_playlist_sync()
+        self.assertEqual(self._jobs("queued"), 1)
+
+    def test_the_scan_job_asks_after_running_and_keeps_its_result(self):
+        self.assertIs(main.jobs._HANDLERS[main.scanner.JOB_TYPE], main._run_library_scan)
+        with mock.patch.object(main.scanner, "run_job", return_value=self.CHANGED), \
+             mock.patch.object(main, "_sync_after_scan") as after:
+            self.assertEqual(main._run_library_scan({}, None), self.CHANGED)
+        after.assert_called_once_with(self.CHANGED)
+
+    def test_a_failure_after_the_scan_never_fails_the_scan(self):
+        with mock.patch.object(main.scanner, "run_job", return_value=self.CHANGED), \
+             mock.patch.object(main, "_sync_after_scan", side_effect=RuntimeError("db gone")):
+            self.assertEqual(main._run_library_scan({}, None), self.CHANGED)
+
+    def test_the_setting_is_on_by_default_and_can_be_turned_off(self):
+        _login(self.client, self.admin)
+        self.assertTrue(self.client.get("/api/admin/config").get_json()["playlist_sync_after_scan"])
+        resp = self.client.put("/api/admin/config", json={"playlist_sync_after_scan": False})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(self.conn, "playlist_sync_after_scan"), "0")
+        self.assertFalse(self.client.get("/api/admin/config").get_json()["playlist_sync_after_scan"])
+
+
+
+class MirrorCoverageRouteTests(_RouteTestBase):
+    """Mirror coverage (mirror_runs) in the admin overview, its Show list,
+    and the playlist rows' tooltip counts."""
+
+    def setUp(self):
+        super().setUp()
+        self.pid = self._make_playlist("Road Trip")
+        self.conn.execute("UPDATE playlists SET jellyfin_mirror_enabled = 1 WHERE id = ?", (self.pid,))
+        main.mirror_runs.record(self.conn, self.pid, "jellyfin", 64, 38)
+        main.mirror_runs.record(self.conn, self.pid, "jellyfin", 64, 40,
+                                [{"artist": "Cinder & Ash", "title": "Smoulder"}])
+        self.conn.commit()
+
+    def test_the_admin_overview_carries_each_sinks_coverage_and_history(self):
+        _login(self.client, self.admin)
+        rows = self.client.get("/api/admin/mirrors").get_json()["playlists"]
+        row = next(r for r in rows if r["id"] == self.pid)
+        self.assertEqual(set(row["coverage"]), {"jellyfin"})
+        cov = row["coverage"]["jellyfin"]
+        self.assertEqual((cov["on_target"], cov["total"], cov["lacked"], cov["history"]), (40, 64, 1, [38, 40]))
+
+    def test_show_lists_the_missing_tracks_with_their_reason(self):
+        _login(self.client, self.admin)
+        resp = self.client.get(f"/api/admin/mirrors/{self.pid}/jellyfin/missing")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body["missing"], [{"artist": "Cinder & Ash", "title": "Smoulder", "reason": "not_on_target"}])
+        self.assertEqual(body["list_max"], main.mirror_runs.LIST_MAX)
+
+    def test_show_is_admin_only_and_404s_without_a_run(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.get(f"/api/admin/mirrors/{self.pid}/jellyfin/missing").status_code, 403)
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.get(f"/api/admin/mirrors/{self.pid}/plex/missing").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/admin/mirrors/{self.pid}/filesystem/missing").status_code, 404)
+
+    def test_the_playlist_rows_carry_the_tooltip_counts(self):
+        _login(self.client, self.owner)
+        rows = self.client.get("/api/provider/playlists").get_json()
+        rows = rows["playlists"] if isinstance(rows, dict) else rows
+        row = next(r for r in rows if r["id"] == self.pid)
+        self.assertEqual(row["mirror_coverage"], {"jellyfin": {"on_target": 40, "total": 64}})
+
+
+
+class PlaylistUploadExportTests(_RouteTestBase):
+    """Uploading an .m3u/.m3u8 as a playlist, and downloading any visible
+    playlist as an .m3u8."""
+
+    def setUp(self):
+        super().setUp()
+        self.songs = [self._track("Cinder & Ash", "Emberwake", "Smoulder", "Cinder & Ash/Emberwake/01 Smoulder.flac", 241.6),
+                      self._track("Glass Meridian", "Latitude", "Two Suns", "Glass Meridian/Latitude/01 Two Suns.flac", 199)]
+
+    def _track(self, artist, album, title, path, duration):
+        cur = self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, duration, size, mtime) "
+            "VALUES (?, ?, ?, ?, ?, 1000, 0)", (path, artist, album, title, duration))
+        self.conn.commit()
+        return sync_state._new_id(cur)
+
+    _FILE = ("#EXTM3U\n#EXTINF:241,Cinder & Ash - Smoulder\n/music/Cinder & Ash/Emberwake/01 Smoulder.flac\n"
+             "#EXTINF:10,Nobody - Nothing\n/music/Nobody/None/01 Nothing.flac\n"
+             "#EXTINF:199,Glass Meridian - Two Suns\n/music/Glass Meridian/Latitude/01 Two Suns.flac\n")
+
+    def _upload(self, data: bytes, name="Road Trip.m3u8"):
+        return self.client.post("/api/provider/playlists/upload",
+                                data={"file": (io.BytesIO(data), name)}, content_type="multipart/form-data")
+
+    def _row(self, pid):
+        return self.conn.execute("SELECT * FROM playlists WHERE id = ?", (pid,)).fetchone()
+
+    def test_the_uploader_deletes_an_upload_and_its_device_selection(self):
+        # #287: an upload had no way out but uploading a file of the same name.
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        device, _ = sync_state.create_device(self.conn, self.owner, "Phone")
+        sync_state.create_selection(self.conn, "playlist", str(pid), self.owner, [device])
+        self.conn.commit()
+        self.assertEqual(self.client.delete(f"/api/provider/playlists/{pid}").status_code, 200)
+        self.assertIsNone(self._row(pid))
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM selections WHERE type = 'playlist' AND target = ?", (str(pid),)).fetchone()[0], 0)
+
+    def test_only_the_uploader_or_an_admin_deletes_an_upload(self):
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        _login(self.client, self.other)
+        self.assertEqual(self.client.delete(f"/api/provider/playlists/{pid}").status_code, 403)
+        self.assertIsNotNone(self._row(pid))
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.delete(f"/api/provider/playlists/{pid}").status_code, 200)
+        self.assertIsNone(self._row(pid))
+
+    def test_the_app_api_still_deletes_only_playlists_made_in_trobar(self):
+        # The browser's change; the App API's delete is left as it was.
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        _, token = sync_state.create_device(self.conn, self.owner, "Owner's phone", "phone")
+        self.conn.commit()
+        resp = self.client.delete(f"/api/app/playlists/{pid}", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIsNotNone(self._row(pid))
+
+    def test_an_upload_becomes_a_private_playlist_of_the_uploader(self):
+        _login(self.client, self.owner)
+        resp = self._upload(self._FILE.encode())
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        body = resp.get_json()
+        self.assertEqual((body["title"], body["tracks"], body["matched"], body["replaced"]),
+                         ("Road Trip", 3, 2, False))
+        row = self._row(body["playlist_id"])
+        self.assertEqual((row["title"], row["source_provider"], row["owner_user_id"], row["shared"]),
+                         ("Road Trip", "upload", self.owner, 0))
+        matched = [r["matched_track_id"] for r in self.conn.execute(
+            "SELECT matched_track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position",
+            (body["playlist_id"],))]
+        self.assertEqual(matched, [self.songs[0], None, self.songs[1]])
+        _login(self.client, self.other)
+        rows = self.client.get("/api/provider/playlists").get_json()
+        rows = rows["playlists"] if isinstance(rows, dict) else rows
+        self.assertNotIn(body["playlist_id"], [r["id"] for r in rows])
+
+    def test_the_unmatched_entry_goes_to_the_unresolved_review(self):
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        resp = self.client.get(f"/api/provider/playlists/{pid}/unresolved-tracks").get_json()
+        items = resp["tracks"] if isinstance(resp, dict) and "tracks" in resp else resp
+        self.assertIn("Nothing", json.dumps(items))
+
+    def test_the_same_file_name_again_replaces_its_entries(self):
+        _login(self.client, self.owner)
+        first = self._upload(self._FILE.encode()).get_json()
+        second = self._upload(b"/music/Glass Meridian/Latitude/01 Two Suns.flac\n").get_json()
+        self.assertEqual((second["playlist_id"], second["replaced"], second["tracks"]), (first["playlist_id"], True, 1))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM playlists WHERE source_provider = 'upload'").fetchone()[0], 1)
+
+    def test_two_users_uploading_the_same_name_get_their_own_playlists(self):
+        _login(self.client, self.owner)
+        a = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        _login(self.client, self.other)
+        b = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        self.assertNotEqual(a, b)
+        self.assertEqual((self._row(a)["owner_user_id"], self._row(b)["owner_user_id"]), (self.owner, self.other))
+
+    def test_bad_uploads_are_refused(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.post("/api/provider/playlists/upload", data={},
+                                          content_type="multipart/form-data").status_code, 400)
+        self.assertEqual(self._upload(self._FILE.encode(), "notes.txt").status_code, 400)
+        self.assertEqual(self._upload(b"#EXTM3U\n# nothing here\n").status_code, 400)
+        too_many = ("/music/x.flac\n" * (main._DEVICE_PLAYLIST_ENTRIES_MAX + 1)).encode()
+        self.assertEqual(self._upload(too_many).status_code, 400)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM playlists").fetchone()[0], 0)
+
+    def test_a_path_in_the_file_name_is_dropped(self):
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode(), "../../etc/Road Trip.m3u").get_json()["playlist_id"]
+        self.assertEqual(self._row(pid)["title"], "Road Trip")
+
+    def test_the_export_lists_matched_tracks_in_order_relative_to_the_library(self):
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        resp = self.client.get(f"/api/provider/playlists/{pid}/export.m3u8")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.mimetype, "audio/x-mpegurl")
+        self.assertIn('filename="Road Trip.m3u8"', resp.headers["Content-Disposition"])
+        self.assertEqual(resp.get_data(as_text=True),
+                         "#EXTM3U\n"
+                         "#EXTINF:241,Cinder & Ash - Smoulder\nCinder & Ash/Emberwake/01 Smoulder.flac\n"
+                         "#EXTINF:199,Glass Meridian - Two Suns\nGlass Meridian/Latitude/01 Two Suns.flac\n")
+
+    def test_the_export_can_keep_unresolved_entries_as_comments(self):
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        text = self.client.get(f"/api/provider/playlists/{pid}/export.m3u8?unresolved=1").get_data(as_text=True)
+        self.assertEqual(text.splitlines()[3], "# Nobody - Nothing")
+
+    def test_a_track_since_removed_is_left_out_like_an_unmatched_one(self):
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        self.conn.execute("UPDATE tracks SET deleted_at = datetime('now') WHERE id = ?", (self.songs[1],))
+        self.conn.commit()
+        text = self.client.get(f"/api/provider/playlists/{pid}/export.m3u8").get_data(as_text=True)
+        self.assertNotIn("Two Suns", text)
+
+    def test_a_line_break_in_a_tag_cannot_start_a_line(self):
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        self.conn.execute("UPDATE tracks SET title = ? WHERE id = ?", ("Smoulder\n/etc/passwd", self.songs[0]))
+        self.conn.commit()
+        lines = self.client.get(f"/api/provider/playlists/{pid}/export.m3u8").get_data(as_text=True).splitlines()
+        self.assertNotIn("/etc/passwd", lines)
+        self.assertIn("#EXTINF:241,Cinder & Ash - Smoulder /etc/passwd", lines)
+
+    def test_only_a_visible_playlist_can_be_downloaded(self):
+        _login(self.client, self.owner)
+        pid = self._upload(self._FILE.encode()).get_json()["playlist_id"]
+        _login(self.client, self.other)
+        self.assertIn(self.client.get(f"/api/provider/playlists/{pid}/export.m3u8").status_code, (403, 404))
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.get(f"/api/provider/playlists/{pid}/export.m3u8").status_code, 200)
+
+    def test_any_visible_playlist_exports_not_only_uploads(self):
+        shared = self._make_playlist("Kitchen", owner_user_id=None, shared=1)
+        self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, artist, title, matched_track_id) "
+                          "VALUES (?, 0, 'a', 't', ?)", (shared, self.songs[1]))
+        self.conn.commit()
+        _login(self.client, self.other)
+        text = self.client.get(f"/api/provider/playlists/{shared}/export.m3u8").get_data(as_text=True)
+        self.assertIn("Glass Meridian/Latitude/01 Two Suns.flac", text)
+
+
+class TrobarPlaylistTests(_RouteTestBase):
+    """Playlists made in Trobar: create, fill from the library, reorder,
+    rename, delete; owner or admin, and only on a playlist made here."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = [self._track(f"Song {i}") for i in range(3)]
+
+    def _track(self, title):
+        cur = self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+            "VALUES (?, 'Artist', 'Album', ?, 1000, 0)", (f"Artist/Album/{title}.flac", title))
+        self.conn.commit()
+        return sync_state._new_id(cur)
+
+    def _create(self, title="Road Trip"):
+        resp = self.client.post("/api/provider/playlists", json={"title": title})
+        self.assertEqual(resp.status_code, 201, resp.get_data(as_text=True))
+        return resp.get_json()["id"]
+
+    def _tracks_of(self, pid):
+        return [r["matched_track_id"] for r in self.conn.execute(
+            "SELECT matched_track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position", (pid,))]
+
+    def _row(self, pid):
+        return self.conn.execute("SELECT * FROM playlists WHERE id = ?", (pid,)).fetchone()
+
+    def test_a_new_playlist_is_empty_private_and_owned_by_its_maker(self):
+        _login(self.client, self.owner)
+        pid = self._create("  Road Trip  ")
+        row = self._row(pid)
+        self.assertEqual((row["title"], row["source_provider"], row["owner_user_id"], row["shared"]),
+                         ("Road Trip", "trobar", self.owner, 0))
+        self.assertEqual(self._tracks_of(pid), [])
+        _login(self.client, self.other)
+        rows = self.client.get("/api/provider/playlists").get_json()
+        rows = rows["playlists"] if isinstance(rows, dict) else rows
+        self.assertNotIn(pid, [r["id"] for r in rows])
+
+    def test_a_name_is_required_and_bounded(self):
+        _login(self.client, self.owner)
+        for body in ({}, {"title": "   "}, {"title": 7}, {"title": "x" * (web_common._PLAYLIST_TITLE_MAX + 1)}):
+            self.assertEqual(self.client.post("/api/provider/playlists", json=body).status_code, 400, body)
+
+    def test_put_sets_the_tracks_in_order_and_post_appends(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        resp = self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[2], self.t[0], self.t[2]]})
+        body = resp.get_json()
+        self.assertEqual((body["status"], body["tracks"], body["added"]), ("ok", 3, 3))
+        self.assertEqual([e["track_id"] for e in body["entries"]], [self.t[2], self.t[0], self.t[2]],
+                         "a write returns the entries as they now are")
+        self.assertEqual(self._tracks_of(pid), [self.t[2], self.t[0], self.t[2]])
+        resp = self.client.post(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[1]]})
+        self.assertEqual((resp.get_json()["tracks"], resp.get_json()["added"]), (4, 1))
+        self.assertEqual(self._tracks_of(pid), [self.t[2], self.t[0], self.t[2], self.t[1]])
+        self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[1]]})
+        self.assertEqual(self._tracks_of(pid), [self.t[1]], "a PUT also removes")
+        entry = self.conn.execute("SELECT artist, title FROM playlist_tracks WHERE playlist_id = ?", (pid,)).fetchone()
+        self.assertEqual((entry["artist"], entry["title"]), ("Artist", "Song 1"))
+
+    def test_only_library_tracks_can_be_added(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        self.conn.execute("UPDATE tracks SET deleted_at = datetime('now') WHERE id = ?", (self.t[1],))
+        self.conn.commit()
+        resp = self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0], self.t[1], 999999]})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["unknown"], [self.t[1], 999999])
+        self.assertEqual(self._tracks_of(pid), [], "nothing is written")
+        for body in ({}, {"track_ids": "1"}, {"track_ids": [True]}, {"track_ids": ["1"]}):
+            self.assertEqual(self.client.put(f"/api/provider/playlists/{pid}/tracks", json=body).status_code, 400, body)
+
+    def test_the_track_count_is_capped(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        with mock.patch.object(main.playlist_sync, "TROBAR_TRACKS_MAX", 2):
+            resp = self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": self.t})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_edit_rewrites_the_mirrors(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        with mock.patch.object(main.playlist_sync, "write_playlist_mirrors") as write:
+            self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0]]})
+            self.client.patch(f"/api/provider/playlists/{pid}", json={"title": "Renamed"})
+        self.assertEqual([c.args[1] for c in write.call_args_list], [pid, pid])
+
+    def test_rename_and_sharing_in_one_patch(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        resp = self.client.patch(f"/api/provider/playlists/{pid}", json={"title": "Renamed", "shared": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual((self._row(pid)["title"], self._row(pid)["shared"]), ("Renamed", 1))
+
+    def test_only_the_owner_or_an_admin_may_edit(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        _login(self.client, self.other)
+        self.assertEqual(self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0]]}).status_code, 403)
+        self.assertEqual(self.client.patch(f"/api/provider/playlists/{pid}", json={"title": "Mine"}).status_code, 403)
+        self.assertEqual(self.client.delete(f"/api/provider/playlists/{pid}").status_code, 403)
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0]]}).status_code, 200)
+        self.assertEqual(self.client.put("/api/provider/playlists/999999/tracks", json={"track_ids": []}).status_code, 404)
+
+    def test_a_providers_playlist_is_not_edited_here(self):
+        pid = self._make_playlist("From Roon", owner_user_id=self.owner)
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0]]}).status_code, 400)
+        self.assertEqual(self.client.patch(f"/api/provider/playlists/{pid}", json={"title": "Renamed"}).status_code, 400)
+        self.assertEqual(self.client.delete(f"/api/provider/playlists/{pid}").status_code, 400)
+        self.assertEqual(self._row(pid)["title"], "From Roon")
+        self.assertEqual(self.client.patch(f"/api/provider/playlists/{pid}", json={"shared": False}).status_code, 200,
+                         "the sharing toggle still works on any owned playlist")
+
+    def _album_track(self, album, title, disc, no):
+        cur = self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime, disc_no, track_no) "
+            "VALUES (?, 'Glass Meridian', ?, ?, 1000, 0, ?, ?)", (f"GM/{album}/{title}.flac", album, title, disc, no))
+        self.conn.commit()
+        return sync_state._new_id(cur)
+
+    def test_post_appends_whole_albums_in_their_own_order(self):
+        b2 = self._album_track("Latitude", "Northbound", 1, 3)
+        a1 = self._album_track("Latitude", "Two Suns", 1, 1)
+        c1 = self._album_track("Latitude", "Bonus", 2, 1)
+        a2 = self._album_track("Latitude", "Latitude", 1, 2)
+        other = self._album_track("Other", "Elsewhere", 1, 1)
+        _login(self.client, self.owner)
+        pid = self._create()
+        self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0]]})
+        resp = self.client.post(f"/api/provider/playlists/{pid}/tracks", json={"albums": [
+            {"artist": "Glass Meridian", "album": "Latitude"}, {"artist": "Glass Meridian", "album": "Other"}]})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual((resp.get_json()["added"], resp.get_json()["tracks"]), (5, 6))
+        self.assertEqual(self._tracks_of(pid), [self.t[0], a1, a2, b2, c1, other])
+
+    def test_albums_are_for_appending_and_must_be_well_formed(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        for body in ({"albums": "Latitude"}, {"albums": [{"artist": "A"}]}, {"albums": [["A", "B"]]},
+                     {"albums": [{"artist": "A", "album": "B"}] * (web_common._PLAYLIST_ALBUMS_MAX + 1)}):
+            self.assertEqual(self.client.post(f"/api/provider/playlists/{pid}/tracks", json=body).status_code, 400, body)
+        self.assertEqual(self.client.put(f"/api/provider/playlists/{pid}/tracks",
+                                         json={"albums": [{"artist": "A", "album": "B"}]}).status_code, 400)
+        resp = self.client.post(f"/api/provider/playlists/{pid}/tracks",
+                                json={"albums": [{"artist": "Nobody", "album": "Nothing"}]})
+        self.assertEqual((resp.status_code, resp.get_json()["added"]), (200, 0))
+
+    def _remove_from_library(self, track_id):
+        self.conn.execute("UPDATE tracks SET deleted_at = datetime('now') WHERE id = ?", (track_id,))
+        self.conn.commit()
+
+    def test_appending_after_a_track_left_the_library_keeps_it_in_place(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0], self.t[1]]})
+        self._remove_from_library(self.t[0])
+        resp = self.client.post(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[2]]})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        entries = resp.get_json()["entries"]
+        self.assertEqual([(e["track_id"], e["title"]) for e in entries],
+                         [(None, "Song 0"), (self.t[1], "Song 1"), (self.t[2], "Song 2")])
+        self.assertEqual(self._tracks_of(pid), [self.t[0], self.t[1], self.t[2]],
+                         "the removed track's link is kept, so it comes back if the file does")
+
+    def test_an_editor_reorder_after_a_track_left_the_library_works(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0], self.t[1]]})
+        self._remove_from_library(self.t[0])
+        entries = self.client.get(f"/api/provider/playlists/{pid}/tracks").get_json()["tracks"]
+        self.assertEqual([e["track_id"] for e in entries], [None, self.t[1]])
+        items = [{"track_id": e["track_id"]} if e["track_id"] else {"entry_id": e["entry_id"]} for e in entries]
+        resp = self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"items": items[::-1]})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual([(e["track_id"], e["title"]) for e in resp.get_json()["entries"]],
+                         [(self.t[1], "Song 1"), (None, "Song 0")])
+        row = self.conn.execute("SELECT artist, title, matched_track_id FROM playlist_tracks "
+                                "WHERE playlist_id = ? AND position = 1", (pid,)).fetchone()
+        self.assertEqual(tuple(row), ("Artist", "Song 0", self.t[0]))
+
+    def test_an_appended_playlist_keeps_an_entry_that_never_matched(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, artist, title, matched_track_id) "
+                          "VALUES (?, 0, 'Nobody', 'Nothing', NULL)", (pid,))
+        self.conn.commit()
+        self.client.post(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[1]]})
+        rows = self.conn.execute("SELECT title, matched_track_id FROM playlist_tracks WHERE playlist_id = ? "
+                                 "ORDER BY position", (pid,)).fetchall()
+        self.assertEqual([tuple(r) for r in rows], [("Nothing", None), ("Song 1", self.t[1])])
+
+    def test_items_must_be_well_formed_and_entries_from_this_playlist(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        other = self._create("Other")
+        self.client.put(f"/api/provider/playlists/{other}/tracks", json={"track_ids": [self.t[0]]})
+        foreign = self.client.get(f"/api/provider/playlists/{other}/tracks").get_json()["tracks"][0]["entry_id"]
+        resp = self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"items": [{"entry_id": foreign}]})
+        self.assertEqual((resp.status_code, resp.get_json().get("unknown_entries")), (400, [foreign]))
+        for items in ("x", [3], [{"track_id": "3"}], [{"track_id": 3, "entry_id": 4}], [{"other": 3}],
+                      [{"track_id": True}]):
+            self.assertEqual(self.client.put(f"/api/provider/playlists/{pid}/tracks",
+                                             json={"items": items}).status_code, 400, items)
+
+    def test_get_lists_the_tracks_in_order_with_their_tags(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[2], self.t[0]]})
+        tracks = self.client.get(f"/api/provider/playlists/{pid}/tracks").get_json()["tracks"]
+        self.assertEqual([(t["track_id"], t["title"], t["artist"], t["album"]) for t in tracks],
+                         [(self.t[2], "Song 2", "Artist", "Album"), (self.t[0], "Song 0", "Artist", "Album")])
+
+    def test_get_gives_an_unmatched_entry_its_own_tags_and_no_id(self):
+        pid = self._make_playlist("From Roon", owner_user_id=self.owner)
+        self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, artist, title, matched_track_id) "
+                          "VALUES (?, 0, 'Nobody', 'Nothing', NULL), (?, 1, 'x', 'y', ?)", (pid, pid, self.t[1]))
+        self.conn.commit()
+        _login(self.client, self.owner)
+        tracks = self.client.get(f"/api/provider/playlists/{pid}/tracks").get_json()["tracks"]
+        self.assertEqual([(t["track_id"], t["artist"], t["title"]) for t in tracks],
+                         [(None, "Nobody", "Nothing"), (self.t[1], "Artist", "Song 1")])
+
+    def test_get_refuses_a_playlist_the_user_cannot_see(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        _login(self.client, self.other)
+        self.assertIn(self.client.get(f"/api/provider/playlists/{pid}/tracks").status_code, (403, 404))
+
+    def test_delete_removes_it_and_its_device_selection(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0]]})
+        device, _ = sync_state.create_device(self.conn, self.owner, "Phone")
+        sync_state.create_selection(self.conn, "playlist", str(pid), self.owner, [device])
+        self.conn.commit()
+        self.assertEqual(self.client.delete(f"/api/provider/playlists/{pid}").status_code, 200)
+        self.assertIsNone(self._row(pid))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM selections WHERE type = 'playlist'").fetchone()[0], 0)
+
+    def test_a_provider_sync_leaves_playlists_made_here_alone(self):
+        _login(self.client, self.owner)
+        pid = self._create()
+        self.client.put(f"/api/provider/playlists/{pid}/tracks", json={"track_ids": [self.t[0]]})
+
+        class Empty:
+            def list_playlists(self):
+                return {"status": "ok", "playlists": []}
+
+            def get_playlist_tracks(self, *_a, **_k):
+                return {"status": "ok", "tracks": []}
+
+        main.playlist_sync.sync_playlists(Empty(), "jellyfin")
+        self.assertIsNotNone(self._row(pid))
+        self.assertEqual(self._tracks_of(pid), [self.t[0]])
+
+
 class AdminConfigSpotifyExperimentalToggleTests(_RouteTestBase):
     """#398: the admin-facing side of the experimental toggle — GET reports
     it, PUT sets it independently of the credential fields, and it defaults
@@ -3489,6 +5014,20 @@ class AdminJobsRouteTests(_RouteTestBase):
                                 headers={"Origin": "http://localhost"})
         self.assertEqual(resp.status_code, 200)
 
+    def test_an_admin_retry_runs_a_failed_full_rescan_full_again(self):
+        # Only the automatic retries are made incremental (scanner.retry_payload);
+        # an admin retrying a failed full rescan asked for a full one.
+        failed = self._add_job(job_type="library_scan", state="failed", attempts=3)
+        self.conn.execute("UPDATE jobs SET payload = ? WHERE id = ?",
+                          ('{"force": true, "confirm_mass_removal": false}', failed))
+        self.conn.commit()
+        _login(self.client, self.admin)
+        resp = self.client.post(f"/api/admin/jobs/{failed}/retry",
+                                headers={"Origin": "http://localhost"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(json.loads(self.conn.execute(
+            "SELECT payload FROM jobs WHERE id = ?", (failed,)).fetchone()[0])["force"], True)
+
     def test_overview_returns_counts_and_recent_jobs(self):
         self._add_job(state="queued")
         self._add_job(state="failed", attempts=3, last_error="boom")
@@ -3553,18 +5092,28 @@ class AdminJobsRouteTests(_RouteTestBase):
         self.assertIsNone(
             self.conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone())
 
-    def test_cancel_refuses_a_running_job_with_a_clear_reason(self):
-        # A running handler is mid-decode or mid-HTTP; it can't be interrupted
-        # safely without cooperative handlers, so this refuses rather than
-        # pretending to cancel and silently doing nothing.
+    def test_cancel_asks_a_running_job_to_stop_and_keeps_its_row(self):
+        # The handler stops itself at its next report; the row has to stay
+        # until it does, or the worker would finish a job that no longer exists.
         job_id = self._add_job(state="running", attempts=1)
+        self.addCleanup(jobs._cancel_requests.pop, job_id, None)
         _login(self.client, self.admin)
         resp = self.client.delete(f"/api/admin/jobs/{job_id}",
                                   headers={"Origin": "http://localhost"})
-        self.assertEqual(resp.status_code, 409)
-        self.assertIn("already started", resp.get_json()["error"])
-        self.assertIsNotNone(
-            self.conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone())
+        self.assertEqual(resp.status_code, 202)
+        self.assertEqual(resp.get_json(), {"status": "cancelling"})
+        self.assertEqual(jobs._cancel_requests.get(job_id), jobs.CANCEL_ADMIN)
+        self.assertEqual(
+            self.conn.execute("SELECT state FROM jobs WHERE id = ?", (job_id,)).fetchone()[0],
+            "running")
+        listed = self.client.get("/api/admin/jobs").get_json()["jobs"]
+        self.assertTrue(next(j for j in listed if j["id"] == job_id)["cancelling"])
+
+    def test_cancel_of_a_queued_job_asks_nothing_to_stop(self):
+        job_id = self._add_job(state="queued")
+        _login(self.client, self.admin)
+        self.client.delete(f"/api/admin/jobs/{job_id}", headers={"Origin": "http://localhost"})
+        self.assertNotIn(job_id, jobs._cancel_requests)
 
     def test_cancel_is_admin_only(self):
         job_id = self._add_job(state="queued")
@@ -3574,6 +5123,22 @@ class AdminJobsRouteTests(_RouteTestBase):
         self.assertEqual(resp.status_code, 403)
         self.assertIsNotNone(
             self.conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone())
+
+
+class SigtermTests(unittest.TestCase):
+    def test_sigterm_stops_the_jobs_then_exits_cleanly(self):
+        with mock.patch.object(main.jobs, "shutdown", return_value=True) as shutdown:
+            with self.assertRaises(SystemExit) as raised:
+                main._on_sigterm(15, None)
+        shutdown.assert_called_once_with(timeout=5.0)
+        self.assertEqual(raised.exception.code, 0)
+
+    def test_a_job_still_running_is_logged_and_the_server_still_exits(self):
+        with mock.patch.object(main.jobs, "shutdown", return_value=False), \
+                self.assertLogs("main", level="WARNING") as logs, \
+                self.assertRaises(SystemExit):
+            main._on_sigterm(15, None)
+        self.assertIn("queued again at the next start", logs.output[0])
 
 
 class SetupCompleteRouteTests(_RouteTestBase):
@@ -3660,6 +5225,28 @@ class SetupCompleteRouteTests(_RouteTestBase):
         self.assertFalse(self._completed())
 
 
+    def _music_root(self):
+        conn = db.get_conn()
+        try:
+            return db.get_config(conn, "music_root")
+        finally:
+            conn.close()
+
+    def test_a_rerun_checks_the_music_folder_without_saving_it(self):
+        other = Path(tempfile.mkdtemp(prefix="trobar-test-setup-other-", dir=_TMP))
+        _login(self.client, self.admin)
+        resp = self.client.post("/api/setup/music-root", json={"path": str(other), "check_only": True},
+                                headers={"Origin": "http://localhost"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["music_root"], str(other))
+        self.assertEqual(self._music_root(), str(self._root), "unchanged until the wizard finishes")
+        missing = self.client.post("/api/setup/music-root", json={"path": str(other / "nope"), "check_only": True},
+                                   headers={"Origin": "http://localhost"})
+        self.assertEqual(missing.status_code, 400)
+        self.client.post("/api/setup/music-root", json={"path": str(other)}, headers={"Origin": "http://localhost"})
+        self.assertEqual(self._music_root(), str(other), "saved without check_only")
+
+
 class SelectionCreationEnforcementTests(_RouteTestBase):
     """POST /api/selections and /api/selections/toggle-device —
     _require_playlist_visible() blocks selecting an owned-and-unshared
@@ -3720,6 +5307,77 @@ class SelectionCreationEnforcementTests(_RouteTestBase):
             "type": "playlist", "target": str(self.private),
             "device_id": self.other_device, "checked": False})
         self.assertEqual(resp.status_code, 200)
+
+
+class SelectionsTableRouteTests(_RouteTestBase):
+    """#239: the Selections table's confirmation counts what unticking would
+    delete, and unticking a box someone else's selection keeps says so."""
+
+    def setUp(self):
+        super().setUp()
+        self.device, _ = sync_state.create_device(self.conn, self.owner, "phone")
+        self.ids = [sync_state._new_id(self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+            "VALUES (?, 'Glass Meridian', 'Latitude', ?, 1, 0)", (f"lat/{n}.flac", f"Song {n}")))
+            for n in (1, 2, 3)]
+        self.other_track = sync_state._new_id(self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+            "VALUES ('x/1.flac', 'Glass Meridian', 'Longitude', 'Elsewhere', 1, 0)"))
+        self.conn.commit()
+
+    def _toggle(self, user, checked, target="Glass Meridian||Latitude"):
+        _login(self.client, user)
+        return self.client.post("/api/selections/toggle-device", json={
+            "type": "album", "target": target, "device_id": self.device, "checked": checked})
+
+    def _count(self, user, target="Glass Meridian||Latitude"):
+        _login(self.client, user)
+        return self.client.post("/api/selections/removal-count", json={
+            "type": "album", "target": target, "device_id": self.device}).get_json()["tracks"]
+
+    def test_the_count_is_what_nothing_else_on_the_device_still_needs(self):
+        self._toggle(self.owner, True)
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded'")
+        self.conn.commit()
+        self.assertEqual(self._count(self.owner), 3)
+        # An artist selection on the same device needs them too: nothing goes.
+        sync_state.create_selection(self.conn, "artist", "Glass Meridian", self.owner, [self.device])
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded'")
+        self.conn.commit()
+        self.assertEqual(self._count(self.owner), 0)
+
+    def test_only_tracks_on_the_device_count(self):
+        self._toggle(self.owner, True)  # still pending: nothing to delete yet
+        self.assertEqual(self._count(self.owner), 0)
+
+    def test_no_selection_of_ones_own_counts_nothing(self):
+        self.assertEqual(self._count(self.owner), 0)
+
+    def _owners_links(self):
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM selection_devices sd JOIN selections s ON s.id = sd.selection_id "
+            "WHERE s.created_by_user_id = ? AND sd.device_id = ?", (self.owner, self.device)).fetchone()[0]
+
+    def test_unticking_a_box_another_persons_selection_keeps_says_who(self):
+        self._toggle(self.owner, True)
+        sync_state.create_selection(self.conn, "album", "Glass Meridian||Latitude", self.admin, [self.device])
+        self.assertEqual(self._owners_links(), 1)
+        resp = self._toggle(self.owner, False)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json()["selected_by"], ["admin"])
+        # The caller's own part is still removed: otherwise their link would
+        # keep the tracks on the device once the other person unticks theirs.
+        self.assertEqual(self._owners_links(), 0)
+
+    def test_unticking_ones_own_box_is_fine(self):
+        self._toggle(self.owner, True)
+        self.assertEqual(self._toggle(self.owner, False).status_code, 200)
+
+    def test_the_count_needs_access_to_the_device(self):
+        _login(self.client, self.other)
+        resp = self.client.post("/api/selections/removal-count", json={
+            "type": "album", "target": "Glass Meridian||Latitude", "device_id": self.device})
+        self.assertEqual(resp.status_code, 403)
 
 
 class BasketTargetParsingConsistencyTests(_RouteTestBase):
@@ -4517,7 +6175,7 @@ class RevokeHelperTests(_RouteTestBase):
         return self.conn.execute("SELECT 1 FROM selections WHERE id=?", (sel_id,)).fetchone() is not None
 
     def test_revokes_non_owner_keeps_owner_and_admin(self):
-        main._revoke_non_owner_playlist_selections(self.conn, self.pl, self.owner)
+        web_common._revoke_non_owner_playlist_selections(self.conn, self.pl, self.owner)
         self.conn.commit()
         self.assertFalse(self._exists(self.other_sel))  # non-owner, revoked
         self.assertTrue(self._exists(self.owner_sel))   # owner, kept
@@ -4552,7 +6210,7 @@ class FirstRunBootstrapTests(unittest.TestCase):
 
     def test_wrong_username_rejected_when_admin_username_set(self):
         from unittest import mock
-        with mock.patch.object(main, "ADMIN_USERNAME", "owner"):
+        with mock.patch.object(settings, "ADMIN_USERNAME", "owner"):
             resp = self.client.post("/login", data={"username": "attacker", "password": "pw123456"})
         self.assertEqual(resp.status_code, 200)  # re-rendered form, not a redirect
         self.assertNotIn("/", resp.headers.get("Location", ""))
@@ -4560,7 +6218,7 @@ class FirstRunBootstrapTests(unittest.TestCase):
 
     def test_matching_username_bootstraps_admin_when_admin_username_set(self):
         from unittest import mock
-        with mock.patch.object(main, "ADMIN_USERNAME", "owner"):
+        with mock.patch.object(settings, "ADMIN_USERNAME", "owner"):
             resp = self.client.post("/login", data={"username": "owner", "password": "pw123456"})
         self.assertEqual(resp.status_code, 302)  # redirected into the app
         self.assertEqual(self._admins(), [{"username": "owner", "is_admin": 1}])
@@ -4569,7 +6227,7 @@ class FirstRunBootstrapTests(unittest.TestCase):
         # Unchanged legacy behaviour when ADMIN_USERNAME is not configured —
         # the documented "don't expose before first login" caveat covers it.
         from unittest import mock
-        with mock.patch.object(main, "ADMIN_USERNAME", ""):
+        with mock.patch.object(settings, "ADMIN_USERNAME", ""):
             resp = self.client.post("/login", data={"username": "whoever", "password": "pw123456"})
         self.assertEqual(resp.status_code, 302)
         self.assertEqual(self._admins(), [{"username": "whoever", "is_admin": 1}])
@@ -4578,10 +6236,57 @@ class FirstRunBootstrapTests(unittest.TestCase):
         # The rejection path records a failure (rate-limited like a login) and
         # never creates a row — a would-be squatter can't accrete an account.
         from unittest import mock
-        with mock.patch.object(main, "ADMIN_USERNAME", "owner"):
+        with mock.patch.object(settings, "ADMIN_USERNAME", "owner"):
             for _ in range(3):
                 self.client.post("/login", data={"username": "attacker", "password": "pw123456"})
         self.assertEqual(self._admins(), [])
+
+
+class DevicePlayPlaylistRouteTests(_RouteTestBase):
+    """The device's Play choice through PATCH /api/devices/<id>: null for
+    Everything or a playlist selected for the device; listed on the web's
+    device list and kept out of the published integration shape."""
+
+    def setUp(self):
+        super().setUp()
+        self.watch, _ = sync_state.create_device(self.conn, self.owner, "Watch", "watch")
+        self.chosen = playlist_sync.create_trobar_playlist(self.conn, self.owner, "Run")
+        self.unselected = playlist_sync.create_trobar_playlist(self.conn, self.owner, "Walk")
+        sync_state.create_selection(self.conn, "playlist", str(self.chosen), self.owner, [self.watch])
+        _login(self.client, self.owner)
+
+    def _patch(self, value):
+        return self.client.patch(f"/api/devices/{self.watch}", json={"play_playlist_id": value})
+
+    def _listed(self):
+        return next(d for d in self.client.get("/api/devices").get_json() if d["id"] == self.watch)
+
+    def test_a_selected_playlist_is_stored_and_null_clears_it(self):
+        self.assertIsNone(self._listed()["play_playlist_id"])
+        self.assertEqual(self._patch(self.chosen).status_code, 200)
+        self.assertEqual(self._listed()["play_playlist_id"], self.chosen)
+        self.assertEqual(self._patch(None).status_code, 200)
+        self.assertIsNone(self._listed()["play_playlist_id"])
+
+    def test_anything_but_a_selected_playlist_is_refused(self):
+        for bad in (self.unselected, 999999, True, str(self.chosen), 1.5):
+            with self.subTest(value=bad):
+                self.assertEqual(self._patch(bad).status_code, 400)
+        self.assertIsNone(self._listed()["play_playlist_id"])
+
+    def test_a_playlist_selected_only_for_another_device_is_refused(self):
+        phone, _ = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        sync_state.create_selection(self.conn, "playlist", str(self.unselected), self.owner, [phone])
+        self.assertEqual(self._patch(self.unselected).status_code, 400)
+        self.assertEqual(self.client.patch(f"/api/devices/{phone}",
+                                           json={"play_playlist_id": self.unselected}).status_code, 200)
+
+    def test_the_integration_api_shape_is_unchanged(self):
+        self._patch(self.chosen)
+        _token_id, token = sync_state.create_integration_token(self.conn, self.admin, "Test token")
+        rows = self.client.get("/api/integrations/devices", headers={"Authorization": f"Bearer {token}"}).get_json()
+        watch = next(d for d in rows if d["id"] == self.watch)  # the control: the device is listed
+        self.assertNotIn("play_playlist_id", watch)
 
 
 class DeviceIconTests(_RouteTestBase):
@@ -4629,7 +6334,7 @@ class DeviceIconTests(_RouteTestBase):
         # Every id the server accepts has a glyph in icons.js, so no stored
         # icon ever draws as a blank.
         icons_js = (Path(__file__).parent / "static" / "js" / "icons.js").read_text()
-        for icon in main.DEVICE_ICONS:
+        for icon in web_common.DEVICE_ICONS:
             with self.subTest(icon=icon):
                 self.assertIn(f'"device-{icon}":', icons_js)
 
@@ -4695,6 +6400,14 @@ class DeviceEndpointTests(_RouteTestBase):
     def test_max_size_at_the_limit_is_ok(self):
         r = self._post({"name": "Big", "max_size_bytes": 2**63 - 1})
         self.assertEqual(r.status_code, 200)
+
+    def test_create_takes_only_a_known_device_type(self):
+        for bad in ("android", "toaster"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._post({"name": "x", "device_type": bad}).status_code, 400)
+        did = self._post({"name": "Phone"}).get_json()["id"]
+        row = self.conn.execute("SELECT device_type FROM devices WHERE id = ?", (did,)).fetchone()
+        self.assertEqual(row["device_type"], "phone")
 
     # --- #97: transcode_format / artist_images honoured on create ---
     def test_transcode_format_honoured_on_create(self):
@@ -4773,6 +6486,14 @@ class DeviceRepairCodeRouteTests(_RouteTestBase):
                                 json={"code": code, "name": "Some new phone"}).get_json()
         self.assertEqual(body["name"], "Pixel")
 
+    def test_redeeming_with_an_unknown_device_type_is_refused_and_keeps_the_code(self):
+        code = self._mint().get_json()["code"]
+        refused = self.client.post("/api/enrollment/redeem",
+                                   json={"code": code, "name": "Pixel", "device_type": "android"})
+        self.assertEqual(refused.status_code, 400)
+        redeem = self.client.post("/api/enrollment/redeem", json={"code": code, "name": "Pixel"})
+        self.assertEqual(redeem.status_code, 200)
+
     def test_a_card_devices_code_is_8_characters_and_keeps_the_device(self):
         """The web UI's pairing action for every device, and its new-device
         flow for a DAP, card or folder: an 8-character code bound to that
@@ -4819,10 +6540,222 @@ class DeviceRepairCodeRouteTests(_RouteTestBase):
         self.assertEqual(r.status_code, 403)
 
     def test_minting_requires_a_session(self):
-        self.client.get("/logout")
-        with self.client.session_transaction() as sess:
-            sess.clear()
+        self.assertEqual(self.client.post("/logout").status_code, 302)
         self.assertNotEqual(self._mint().status_code, 200)
+
+
+class LogoutTests(_RouteTestBase):
+    """/logout is POST-only (a link elsewhere can't sign anyone out), so the
+    menu's Log out has to be a form that POSTs, and it only exists where the
+    app holds a session to end."""
+
+    _FORM = '<form method="post" action="/logout">'
+
+    def test_post_ends_the_session_and_goes_to_login(self):
+        _login(self.client, self.owner)
+        resp = self.client.post("/logout")
+        self.assertEqual((resp.status_code, resp.headers["Location"]), (302, "/login"))
+        self.assertEqual(self.client.get("/api/profile").status_code, 401)
+
+    def test_get_is_refused(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.get("/logout").status_code, 405)
+        self.assertEqual(self.client.get("/api/profile").status_code, 200)
+
+    def test_a_cross_site_post_is_refused(self):
+        _login(self.client, self.owner)
+        resp = self.client.post("/logout", headers={"Origin": "https://evil.example"})
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(self.client.get("/api/profile").status_code, 200)
+
+    def test_the_menu_posts_in_local_and_oidc_mode(self):
+        _login(self.client, self.admin)
+        self.conn.execute("INSERT OR REPLACE INTO app_config (key, value) VALUES ('setup_completed', '1')")
+        self.conn.commit()
+        for mode in ("local", "oidc"):
+            with self.subTest(mode=mode), mock.patch.object(settings, "AUTH_MODE", mode):
+                html = self.client.get("/").get_data(as_text=True)
+                self.assertIn(self._FORM, html)
+                self.assertNotIn('href="/logout"', html)
+
+    def test_no_log_out_in_forward_mode(self):
+        with mock.patch.object(settings, "AUTH_MODE", "forward"):
+            html = self.client.get("/").get_data(as_text=True)
+        self.assertIn("avatarMenuOpen", html, "the menu itself still renders")
+        self.assertNotIn(self._FORM, html)
+
+    def test_forward_mode_on_the_emergency_port_can_log_out(self):
+        _login(self.client, self.admin)
+        port = {"SERVER_PORT": "25001"}
+        with mock.patch.object(settings, "AUTH_MODE", "forward"), mock.patch.object(settings, "EMERGENCY_PORT", 25001):
+            self.assertIn(self._FORM, self.client.get("/", environ_overrides=port).get_data(as_text=True))
+            resp = self.client.post("/logout", environ_overrides=port)
+        self.assertEqual(resp.headers["Location"], "/login")
+
+
+class ForwardAuthNoHeaderTests(_RouteTestBase):
+    """Forward mode trusts the proxy's identity header. A request without it
+    (a misconfigured proxy, or one that reached the port directly) is
+    refused, not signed in as DEV_USER, except on a local dev server."""
+
+    def setUp(self):
+        super().setUp()
+        for patcher in (mock.patch.object(settings, "AUTH_MODE", "forward"),
+                        mock.patch.object(settings, "FORWARD_AUTH_SECRET", "")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _users(self):
+        return {r["username"] for r in self.conn.execute("SELECT username FROM users")}
+
+    def test_no_header_is_refused_and_logged(self):
+        before = self._users()
+        with self.assertLogs("main", level="WARNING") as log:
+            resp = self.client.get("/api/profile")
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn("X-authentik-username", log.output[0])
+        self.assertEqual(self._users(), before, "no account was created")
+
+    def test_the_header_still_signs_in(self):
+        resp = self.client.get("/api/profile", headers={"X-authentik-username": "bob"})
+        self.assertEqual((resp.status_code, resp.get_json()["username"]), (200, "bob"))
+
+    def test_a_dev_server_signs_in_as_dev_user(self):
+        with mock.patch.object(settings, "DEV_SERVER", True), \
+                mock.patch.dict(os.environ, {"DEV_USER": "devperson"}):
+            resp = self.client.get("/api/profile")
+        self.assertEqual((resp.status_code, resp.get_json()["username"]), (200, "devperson"))
+
+
+class ForwardAuthStartupWarningTests(unittest.TestCase):
+    """The startup warnings for a forward-mode deployment trusting more than
+    it may realise."""
+
+    def _warnings(self, mode="forward", secret="", dev=False):
+        with mock.patch.object(settings, "AUTH_MODE", mode), \
+                mock.patch.object(settings, "FORWARD_AUTH_SECRET", secret), \
+                mock.patch.object(settings, "DEV_SERVER", dev):
+            return main._forward_auth_warnings()
+
+    def test_none_for_a_secured_forward_deployment_or_another_mode(self):
+        self.assertEqual(self._warnings(secret="s3cret"), [])
+        self.assertEqual(self._warnings(mode="local", dev=True), [])
+
+    def test_forward_without_a_secret(self):
+        [warning] = self._warnings()
+        self.assertIn("no FORWARD_AUTH_SECRET", warning)
+
+    def test_forward_with_the_dev_server(self):
+        [warning] = self._warnings(secret="s3cret", dev=True)
+        self.assertIn("TROBAR_DEV_SERVER", warning)
+        self.assertIn("DEV_USER", warning)
+        self.assertEqual(len(self._warnings(dev=True)), 2)
+
+
+class OidcUnreachableTests(_RouteTestBase):
+    """An identity provider that's down: sign-in says so and points at the
+    local-password form; logout finishes locally."""
+
+    def setUp(self):
+        super().setUp()
+        self.oauth = mock.MagicMock()
+        down = ConnectionError("connection refused")
+        self.oauth.oidc.authorize_redirect.side_effect = down
+        self.oauth.oidc.load_server_metadata.side_effect = down
+        for patcher in (mock.patch.object(settings, "AUTH_MODE", "oidc"),
+                        mock.patch.object(settings, "OIDC_LOGOUT", True),
+                        mock.patch.object(auth, "oauth", self.oauth)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_sso_sign_in_shows_the_local_password_fallback(self):
+        with self.assertLogs("main", level="WARNING") as log:
+            resp = self.client.get("/oidc/login")
+        self.assertEqual(resp.status_code, 503)
+        page = resp.get_data(as_text=True)
+        self.assertIn("SSO is unreachable right now. An administrator can sign in with a local password.", page)
+        # Under oidc only an admin's local password works: the notice mustn't
+        # send everyone to it.
+        self.assertNotIn("Sign in with a local password", page)
+        self.assertIn('name="password"', page, "the local-password form is on the page")
+        self.assertIn("ConnectionError", log.output[0])
+
+    def test_logout_finishes_locally(self):
+        _login(self.client, self.owner)
+        with self.assertLogs("main", level="WARNING"):
+            resp = self.client.post("/logout")
+        self.assertEqual((resp.status_code, resp.headers["Location"]), (302, "/login"))
+        self.assertEqual(self.client.get("/api/profile").status_code, 401)
+
+
+class SessionLifetimeTests(_RouteTestBase):
+    """Sessions slide over a configurable lifetime, and a password change or
+    an admin reset ends the user's other sessions."""
+
+    def _client_logged_in_as(self, user_id, password="correct horse"):
+        self.conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                          (main.generate_password_hash(password), user_id))
+        self.conn.commit()
+        username = self.conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()[0]
+        client = main.app.test_client()
+        resp = client.post("/login", data={"username": username, "password": password})
+        self.assertEqual(resp.status_code, 302, "signed in")
+        return client, resp
+
+    def test_a_login_is_a_permanent_session_whose_cookie_is_renewed(self):
+        client, resp = self._client_logged_in_as(self.owner)
+        self.assertIn("Expires=", resp.headers["Set-Cookie"])
+        again = client.get("/api/profile")
+        self.assertEqual(again.status_code, 200)
+        self.assertIn("Expires=", again.headers.get("Set-Cookie", ""), "re-signed on every request: sliding")
+        self.assertEqual(main.app.config["PERMANENT_SESSION_LIFETIME"].days, 30)
+
+    def test_a_logged_out_session_stays_out_when_an_old_cookie_comes_back(self):
+        # A request in flight at logout returns a re-signed copy of the
+        # signed-in cookie after the logout's own: replaying it must not work.
+        client, _ = self._client_logged_in_as(self.owner)
+        stale = client.get_cookie("session").value
+        self.assertEqual(client.post("/logout").status_code, 302)
+        client.set_cookie("session", stale)
+        self.assertEqual(client.get("/api/profile").status_code, 401)
+        # Another session of the same user is unaffected.
+        other, _ = self._client_logged_in_as(self.owner)
+        self.assertEqual(other.get("/api/profile").status_code, 200)
+
+    def test_a_session_older_than_the_lifetime_is_over(self):
+        client, _ = self._client_logged_in_as(self.owner)
+        with mock.patch.dict(main.app.config, {"PERMANENT_SESSION_LIFETIME": timedelta(seconds=1)}):
+            time.sleep(2.1)
+            self.assertEqual(client.get("/api/profile").status_code, 401)
+
+    def test_changing_my_password_ends_my_other_sessions_and_keeps_this_one(self):
+        here, _ = self._client_logged_in_as(self.owner)
+        elsewhere, _ = self._client_logged_in_as(self.owner)
+        resp = here.post("/api/account/password",
+                         json={"password": "a new long password", "current_password": "correct horse"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(here.get("/api/profile").status_code, 200)
+        self.assertEqual(elsewhere.get("/api/profile").status_code, 401)
+
+    def test_an_admin_reset_ends_the_users_sessions(self):
+        user, _ = self._client_logged_in_as(self.owner)
+        admin, _ = self._client_logged_in_as(self.admin, "admin password!")
+        resp = admin.put(f"/api/admin/users/{self.owner}/password", json={"password": "reset by admin"},
+                         headers={"Origin": "http://localhost"})
+        self.assertEqual(resp.status_code, 200)
+        # A page first, while the stale cookie is still there: pages are guarded
+        # only by the login gate, and the API call below clears the session.
+        page = user.get("/")
+        self.assertEqual((page.status_code, page.headers.get("Location")), (302, "/login"))
+        self.assertEqual(user.get("/api/profile").status_code, 401)
+        self.assertEqual(admin.get("/api/profile").status_code, 200, "the admin's own session is untouched")
+
+    def test_the_create_admin_command_ends_the_accounts_sessions(self):
+        user, _ = self._client_logged_in_as(self.owner)
+        username = self.conn.execute("SELECT username FROM users WHERE id = ?", (self.owner,)).fetchone()[0]
+        result = main.app.test_cli_runner().invoke(args=["create-admin", username, "--password", "cli password!"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(user.get("/api/profile").status_code, 401)
 
 
 class DeviceTransferRouteTests(_RouteTestBase):
@@ -5151,6 +7084,53 @@ class ApiTokensToIntegrationTokensMigrationTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["token_hash"], self._admin_hash)
+
+
+class DeviceListSnapshotTests(_RouteTestBase):
+    """A device deleted while the list is being built (in another tab, or by
+    another user) must not fail the whole list: the rows and each device's
+    statuses are read from one snapshot."""
+
+    def setUp(self):
+        super().setUp()
+        main._rl_failures.clear()
+        self.addCleanup(main._rl_failures.clear)
+        _phone, self.phone_token = sync_state.create_device(self.conn, self.admin, "Phone", "phone")
+        self.gone, _ = sync_state.create_device(self.conn, self.admin, "Player", "dap")
+        # All three lists reach it through web_common._device_list.
+        real = web_common._device_rows_for_user
+
+        def rows_then_delete(*args, **kwargs):
+            rows = real(*args, **kwargs)
+            other = db.get_conn()
+            try:
+                other.execute("DELETE FROM devices WHERE id = ?", (self.gone,))
+                other.commit()
+            finally:
+                other.close()
+            return rows
+
+        patcher = mock.patch.object(web_common, "_device_rows_for_user", side_effect=rows_then_delete)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _check(self, resp):
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True)[:300])
+        self.assertEqual(sorted(d["name"] for d in resp.get_json()), ["Phone", "Player"])
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM devices WHERE id = ?", (self.gone,)).fetchone())
+
+    def test_the_web_list_survives_a_device_deleted_mid_list(self):
+        _login(self.client, self.admin)
+        self._check(self.client.get("/api/devices"))
+
+    def test_the_app_list_survives_a_device_deleted_mid_list(self):
+        self._check(self.client.get("/api/app/devices",
+                                    headers={"Authorization": f"Bearer {self.phone_token}"}))
+
+    def test_the_integrations_list_survives_a_device_deleted_mid_list(self):
+        _token_id, token = sync_state.create_integration_token(self.conn, self.admin, "Test token")
+        self._check(self.client.get("/api/integrations/devices",
+                                    headers={"Authorization": f"Bearer {token}"}))
 
 
 class IntegrationDevicesRouteTests(_RouteTestBase):
@@ -5551,7 +7531,8 @@ class IntegrationMirrorsRouteTests(_RouteTestBase):
         body = self._get(token).get_json()
         self.assertEqual(
             set(body.keys()),
-            {"mirrors_failing", "by_sink", "failing", "failing_truncated"},
+            {"mirrors_failing", "by_sink", "failing", "failing_truncated",
+             "mirrors_short", "short", "short_truncated"},
             self._CONTRACT_MESSAGE,
         )
 
@@ -5563,9 +7544,56 @@ class IntegrationMirrorsRouteTests(_RouteTestBase):
         self.assertFalse(body["failing_truncated"])
         self.assertEqual(
             body["by_sink"],
-            {sink: {"enabled": 0, "failing": 0}
+            {sink: {"enabled": 0, "failing": 0, "short": 0}
              for sink in ("filesystem", "subsonic", "jellyfin", "emby", "music_assistant", "plex")},
         )
+        self.assertEqual((body["mirrors_short"], body["short"], body["short_truncated"]), (0, [], False))
+
+    def test_a_pair_short_on_its_target_is_counted_and_listed(self):
+        pid = self._make_playlist("Road Trip")
+        self.conn.execute("UPDATE playlists SET jellyfin_mirror_enabled = 1, plex_mirror_enabled = 1 "
+                          "WHERE id = ?", (pid,))
+        main.mirror_runs.record(self.conn, pid, "jellyfin", 64, 40, [{"artist": "A", "title": "T"}] * 24)
+        main.mirror_runs.record(self.conn, pid, "plex", 64, 64)
+        self.conn.commit()
+        body = self._get(self._token_for(self.admin)).get_json()
+        self.assertEqual(body["mirrors_short"], 1)
+        self.assertEqual(body["by_sink"]["jellyfin"]["short"], 1)
+        self.assertEqual(body["by_sink"]["plex"]["short"], 0)
+        self.assertEqual(sum(v["short"] for v in body["by_sink"].values()), body["mirrors_short"])
+        self.assertEqual(set(body["short"][0].keys()),
+                         {"playlist_id", "title", "sink", "on_target", "total", "lacked", "refused", "run_at"},
+                         self._CONTRACT_MESSAGE)
+        self.assertEqual((body["short"][0]["sink"], body["short"][0]["on_target"], body["short"][0]["total"],
+                          body["short"][0]["lacked"]), ("jellyfin", 40, 64, 24))
+        self.assertEqual(body["mirrors_failing"], 0, "short is not failing")
+
+    def test_a_disabled_mirrors_old_runs_are_not_short(self):
+        pid = self._make_playlist("Road Trip")
+        main.mirror_runs.record(self.conn, pid, "jellyfin", 64, 40, [{"artist": "A", "title": "T"}] * 24)
+        self.conn.commit()
+        body = self._get(self._token_for(self.admin)).get_json()
+        self.assertEqual(body["mirrors_short"], 0)
+        self.assertEqual(body["by_sink"]["jellyfin"], {"enabled": 0, "failing": 0, "short": 0})
+        self.assertEqual(body["short"], [])
+
+    def test_a_disabled_sink_is_skipped_on_a_playlist_with_another_enabled(self):
+        # The row query takes every playlist with ANY sink enabled, so a
+        # disabled sink on such a playlist is only kept out by the per-sink
+        # enabled check: with its leftover error and old runs, it must
+        # count nowhere, while the enabled sink beside it counts as usual.
+        pid = self._make_playlist("Road Trip")
+        self.conn.execute(
+            "UPDATE playlists SET jellyfin_mirror_enabled = 1, plex_mirror_enabled = 0, "
+            "plex_mirror_last_error_code = 'unreachable' WHERE id = ?", (pid,))
+        main.mirror_runs.record(self.conn, pid, "plex", 64, 40, [{"artist": "A", "title": "T"}] * 24)
+        main.mirror_runs.record(self.conn, pid, "jellyfin", 64, 60, [{"artist": "A", "title": "T"}] * 4)
+        self.conn.commit()
+        body = self._get(self._token_for(self.admin)).get_json()
+        self.assertEqual(body["by_sink"]["plex"], {"enabled": 0, "failing": 0, "short": 0})
+        self.assertEqual(body["by_sink"]["jellyfin"], {"enabled": 1, "failing": 0, "short": 1})
+        self.assertEqual((body["mirrors_failing"], body["mirrors_short"]), (0, 1))
+        self.assertEqual([e["sink"] for e in body["short"]], ["jellyfin"])
 
     def test_an_enabled_healthy_mirror_counts_as_enabled_not_failing(self):
         p = self._make_playlist("OK", owner_user_id=None, shared=1)
@@ -5574,7 +7602,7 @@ class IntegrationMirrorsRouteTests(_RouteTestBase):
         self.conn.commit()
         token = self._token_for(self.admin)
         body = self._get(token).get_json()
-        self.assertEqual(body["by_sink"]["subsonic"], {"enabled": 1, "failing": 0})
+        self.assertEqual(body["by_sink"]["subsonic"], {"enabled": 1, "failing": 0, "short": 0})
         self.assertEqual(body["mirrors_failing"], 0)
         self.assertEqual(body["failing"], [])
 
@@ -5588,7 +7616,7 @@ class IntegrationMirrorsRouteTests(_RouteTestBase):
         token = self._token_for(self.admin)
         body = self._get(token).get_json()
         self.assertEqual(body["mirrors_failing"], 1)
-        self.assertEqual(body["by_sink"]["subsonic"], {"enabled": 1, "failing": 1})
+        self.assertEqual(body["by_sink"]["subsonic"], {"enabled": 1, "failing": 1, "short": 0})
         self.assertEqual(body["failing"], [{
             "playlist_id": p,
             "title": "Road Trip",
@@ -5624,8 +7652,8 @@ class IntegrationMirrorsRouteTests(_RouteTestBase):
         self.conn.commit()
         token = self._token_for(self.admin)
         body = self._get(token).get_json()
-        self.assertEqual(body["by_sink"]["subsonic"], {"enabled": 1, "failing": 1})
-        self.assertEqual(body["by_sink"]["jellyfin"], {"enabled": 1, "failing": 0})
+        self.assertEqual(body["by_sink"]["subsonic"], {"enabled": 1, "failing": 1, "short": 0})
+        self.assertEqual(body["by_sink"]["jellyfin"], {"enabled": 1, "failing": 0, "short": 0})
         self.assertEqual(body["mirrors_failing"], 1)
         self.assertEqual(len(body["failing"]), 1)
         self.assertEqual(body["failing"][0]["sink"], "subsonic")
@@ -5641,8 +7669,8 @@ class IntegrationMirrorsRouteTests(_RouteTestBase):
         self.conn.commit()
         token = self._token_for(self.admin)
         body = self._get(token).get_json()
-        self.assertEqual(body["by_sink"]["filesystem"], {"enabled": 1, "failing": 0})
-        self.assertEqual(body["by_sink"]["emby"], {"enabled": 1, "failing": 1})
+        self.assertEqual(body["by_sink"]["filesystem"], {"enabled": 1, "failing": 0, "short": 0})
+        self.assertEqual(body["by_sink"]["emby"], {"enabled": 1, "failing": 1, "short": 0})
         self.assertEqual(body["mirrors_failing"], 1)
 
     def test_a_disabled_sink_with_a_leftover_error_code_is_not_counted(self):
@@ -5656,12 +7684,12 @@ class IntegrationMirrorsRouteTests(_RouteTestBase):
         self.conn.commit()
         token = self._token_for(self.admin)
         body = self._get(token).get_json()
-        self.assertEqual(body["by_sink"]["subsonic"], {"enabled": 0, "failing": 0})
+        self.assertEqual(body["by_sink"]["subsonic"], {"enabled": 0, "failing": 0, "short": 0})
         self.assertEqual(body["mirrors_failing"], 0)
         self.assertEqual(body["failing"], [])
 
     def test_the_failing_worklist_is_capped_but_the_counts_stay_exact(self):
-        for i in range(main._MIRRORS_FAILING_LIMIT + 5):
+        for i in range(integrations._MIRRORS_FAILING_LIMIT + 5):
             p = self._make_playlist(f"Failing {i:03d}", owner_user_id=None, shared=1)
             self.conn.execute(
                 "UPDATE playlists SET subsonic_mirror_enabled = 1, "
@@ -5669,9 +7697,9 @@ class IntegrationMirrorsRouteTests(_RouteTestBase):
         self.conn.commit()
         token = self._token_for(self.admin)
         body = self._get(token).get_json()
-        self.assertEqual(body["mirrors_failing"], main._MIRRORS_FAILING_LIMIT + 5)
-        self.assertEqual(body["by_sink"]["subsonic"]["failing"], main._MIRRORS_FAILING_LIMIT + 5)
-        self.assertEqual(len(body["failing"]), main._MIRRORS_FAILING_LIMIT)
+        self.assertEqual(body["mirrors_failing"], integrations._MIRRORS_FAILING_LIMIT + 5)
+        self.assertEqual(body["by_sink"]["subsonic"]["failing"], integrations._MIRRORS_FAILING_LIMIT + 5)
+        self.assertEqual(len(body["failing"]), integrations._MIRRORS_FAILING_LIMIT)
         self.assertTrue(body["failing_truncated"])
 
     def test_error_code_is_the_raw_code_not_a_rendered_message(self):
@@ -5902,6 +7930,201 @@ class IntegrationTokenDemotionTests(_RouteTestBase):
         self.assertEqual(resp.status_code, 401)
 
 
+class DeviceLimitTests(_RouteTestBase):
+    """A device's size limit: validated on both routes, 0 meaning no limit, and
+    a change refreshing the frozen auto-fit set."""
+
+    def setUp(self):
+        super().setUp()
+        _login(self.client, self.owner)
+        self.device, self.token = sync_state.create_device(
+            self.conn, self.owner, "phone", max_size_bytes=20_000)
+        for artist, album in (("Glass Meridian", "Latitude"), ("Aphelion", "Event Horizon")):
+            for n in (1, 2):
+                self.conn.execute(
+                    "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                    "VALUES (?, ?, ?, ?, 3000, 0)", (f"{artist}/{album}/{n}.mp3", artist, album, f"T{n}"))
+        self.conn.commit()
+        ranked = [("glass meridian", "latitude"), ("aphelion", "event horizon")]
+        # Both names: the autofit routes in devices call devices', the limit
+        # refresh in web_common calls its own.
+        for module in (devices, web_common):
+            patcher = mock.patch.object(module, "_ranked_album_keys_for_user", return_value=ranked)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _limit(self):
+        return self.conn.execute(
+            "SELECT max_size_bytes FROM devices WHERE id = ?", (self.device,)).fetchone()[0]
+
+    def _autofit_track_count(self):
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM autofit_tracks a JOIN selections s ON s.id = a.selection_id "
+            "JOIN selection_devices sd ON sd.selection_id = s.id WHERE sd.device_id = ?",
+            (self.device,)).fetchone()[0]
+
+    def _device_patch(self, body):
+        return self.client.patch("/api/device/limit", json=body,
+                                 headers={"Authorization": f"Bearer {self.token}"})
+
+    def test_lowering_the_limit_on_the_web_refreshes_autofit(self):
+        self.client.post(f"/api/devices/{self.device}/autofit", json={})
+        self.assertEqual(self._autofit_track_count(), 4)
+        resp = self.client.patch(f"/api/devices/{self.device}", json={"max_size_bytes": 7_000})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._autofit_track_count(), 2, "only the first album fits now")
+        # ...and the device is told: the second album's tracks leave it.
+        states = dict(self.conn.execute(
+            "SELECT status, COUNT(*) FROM device_track_state WHERE device_id = ? GROUP BY status",
+            (self.device,)).fetchall())
+        self.assertEqual(states, {"pending": 2, "removed": 2})
+
+    def test_lowering_the_limit_from_the_device_refreshes_autofit(self):
+        self.client.post(f"/api/devices/{self.device}/autofit", json={})
+        self.assertEqual(self._device_patch({"max_size_bytes": 7_000}).status_code, 200)
+        self.assertEqual(self._autofit_track_count(), 2)
+
+    def _held(self):
+        return (self._autofit_track_count(), dict(self.conn.execute(
+            "SELECT status, COUNT(*) FROM device_track_state WHERE device_id = ? GROUP BY status",
+            (self.device,)).fetchall()))
+
+    def _autofit_all_downloaded(self):
+        self.client.post(f"/api/devices/{self.device}/autofit", json={})
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded' WHERE device_id = ?",
+                          (self.device,))
+        self.conn.commit()
+        self.assertEqual(self._held(), (4, {"downloaded": 4}))
+
+    def test_a_limit_change_during_a_lastfm_outage_keeps_autofit(self):
+        # lastfm.top_albums gives [] on any failure: the set must not be
+        # refreshed from nothing, which would remove every auto-fit track.
+        self._autofit_all_downloaded()
+        # The state is checked inside each block, so it is what fails first;
+        # the warning is checked as the block closes.
+        with mock.patch.object(web_common, "_ranked_album_keys_for_user", return_value=[]):
+            with self.assertLogs("main", level="WARNING"):
+                self.assertEqual(self._device_patch({"max_size_bytes": 30_000}).status_code, 200)
+                self.assertEqual(self._held(), (4, {"downloaded": 4}))
+            with self.assertLogs("main", level="WARNING"):
+                self.assertEqual(self.client.patch(f"/api/devices/{self.device}",
+                                                   json={"max_size_bytes": 40_000}).status_code, 200)
+                self.assertEqual(self._held(), (4, {"downloaded": 4}))
+
+    def test_resending_the_same_limit_from_the_device_leaves_autofit_alone(self):
+        self._autofit_all_downloaded()
+        # A ranking that would now fit only the first album: not consulted.
+        with mock.patch.object(web_common, "_ranked_album_keys_for_user",
+                               return_value=[("glass meridian", "latitude")]):
+            self.assertEqual(self._device_patch({"max_size_bytes": 20_000}).status_code, 200)
+        self.assertEqual(self._held(), (4, {"downloaded": 4}))
+
+    def test_the_device_route_validates_the_limit(self):
+        for bad in (-1, "10", True, 1.5):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._device_patch({"max_size_bytes": bad}).status_code, 400)
+        self.assertEqual(self._limit(), 20_000)
+
+    def test_zero_means_no_limit_on_both_routes(self):
+        self.assertEqual(self._device_patch({"max_size_bytes": 0}).status_code, 200)
+        self.assertIsNone(self._limit())
+        self.client.patch(f"/api/devices/{self.device}", json={"max_size_bytes": 5_000})
+        self.client.patch(f"/api/devices/{self.device}", json={"max_size_bytes": 0})
+        self.assertIsNone(self._limit())
+
+    def test_a_zero_stored_before_is_no_limit_in_usage(self):
+        self.conn.execute("UPDATE devices SET max_size_bytes = 0 WHERE id = ?", (self.device,))
+        self.conn.commit()
+        sync_state.create_selection(self.conn, "artist", "Aphelion", self.owner, [self.device])
+        usage = self.client.get(f"/api/devices/{self.device}/usage").get_json()
+        self.assertEqual((usage["max_size_bytes"], usage["over_limit"]), (None, False))
+
+    def test_device_type_is_one_of_the_known_types(self):
+        resp = self.client.patch(f"/api/devices/{self.device}", json={"device_type": "toaster"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.client.patch(f"/api/devices/{self.device}",
+                                           json={"device_type": "dap"}).status_code, 200)
+
+    def test_android_is_not_a_device_type_any_more(self):
+        # It silently became "phone" at the next start, so the choice never stuck.
+        resp = self.client.patch(f"/api/devices/{self.device}", json={"device_type": "android"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_the_known_types_are_the_ones_the_ui_labels(self):
+        self.assertEqual(set(web_common.DEVICE_TYPES), set(main._build_js_i18n()["deviceType"]))
+
+
+class HistorySourceOutageTests(_RouteTestBase):
+    """A history service that doesn't answer is reported as "error", not as
+    "nothing played", and an auto-fit refresh during a Last.fm outage keeps
+    the set it has."""
+
+    def setUp(self):
+        super().setUp()
+        _login(self.client, self.owner)
+        self.conn.execute("UPDATE users SET lastfm_username = 'alice', lastfm_api_key = 'k' WHERE id = ?",
+                          (self.owner,))
+        self.conn.commit()
+        self.device, self.token = sync_state.create_device(
+            self.conn, self.owner, "phone", max_size_bytes=20_000)
+
+    def _app_get(self, path):
+        return self.client.get(path, headers={"Authorization": f"Bearer {self.token}"}).get_json()
+
+    def test_sources_say_which_service_did_not_answer(self):
+        with mock.patch.object(main.lastfm, "suggestions", return_value=None), \
+                mock.patch.object(main.lastfm, "recently_played_suggestions", return_value=[]), \
+                mock.patch.object(main.lastfm, "most_played", return_value=None):
+            sug = self._app_get("/api/app/suggestions")
+            top = self._app_get("/api/app/suggestions/most-played")
+            web = self.client.get("/api/suggestions").get_json()
+        expected = {"lastfm": "error", "listenbrainz": "unconfigured", "maloja": "unconfigured",
+                             "device_plays": "unconfigured"}
+        self.assertEqual((sug["sources"], top["sources"]), (expected, expected))
+        self.assertIsInstance(web, list, "the web route keeps its bare list")
+
+    def test_sources_say_ok_when_the_service_answered_with_nothing(self):
+        with mock.patch.object(main.lastfm, "most_played", return_value=[]):
+            top = self._app_get("/api/app/suggestions/most-played")
+        self.assertEqual((top["items"], top["sources"]["lastfm"]), ([], "ok"))
+
+    def _autofit_all_downloaded(self):
+        for n, (artist, album) in enumerate((("Glass Meridian", "Latitude"), ("Aphelion", "Event Horizon"))):
+            self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                "VALUES (?, ?, ?, 'T', 3000, 0)", (f"{n}.mp3", artist, album))
+        self.conn.commit()
+        albums = [{"name": "Latitude", "artist": {"name": "Glass Meridian"}},
+                  {"name": "Event Horizon", "artist": {"name": "Aphelion"}}]
+        with mock.patch.object(main.lastfm, "top_albums", return_value=albums):
+            self.client.post(f"/api/devices/{self.device}/autofit", json={})
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded' WHERE device_id = ?",
+                          (self.device,))
+        self.conn.commit()
+
+    def _held(self):
+        return dict(self.conn.execute(
+            "SELECT status, COUNT(*) FROM device_track_state WHERE device_id = ? GROUP BY status",
+            (self.device,)).fetchall())
+
+    def test_an_autofit_refresh_during_a_lastfm_outage_keeps_the_set(self):
+        self._autofit_all_downloaded()
+        self.assertEqual(self._held(), {"downloaded": 2})
+        with mock.patch.object(main.lastfm, "top_albums", return_value=None):
+            with self.assertLogs("main", level="WARNING"):
+                resp = self.client.post(f"/api/devices/{self.device}/autofit", json={})
+                self.assertEqual(self._held(), {"downloaded": 2})
+        body = resp.get_json()
+        self.assertEqual((resp.status_code, body["reason"], body["tracks"]), (200, "lastfm_unavailable", 2))
+
+    def test_a_limit_change_during_a_lastfm_outage_keeps_the_set(self):
+        self._autofit_all_downloaded()
+        with mock.patch.object(main.lastfm, "top_albums", return_value=None):
+            with self.assertLogs("main", level="WARNING"):
+                self.client.patch(f"/api/devices/{self.device}", json={"max_size_bytes": 4_000})
+                self.assertEqual(self._held(), {"downloaded": 2})
+
+
 class AutofitApiTests(_RouteTestBase):
     """#217: the fill-percentage cap — persisted via POST .../autofit; the
     percent-independent preview basis read via GET .../autofit/preview."""
@@ -6023,6 +8246,194 @@ class DeviceFileAuthorizationTests(_RouteTestBase):
         tid = self._make_track_file("a/v.flac")
         self._offer(tid, "pending", device_id=other_id)
         self.assertEqual(self._get(tid).status_code, 404)
+
+
+class DeviceFileTranscodeTests(_RouteTestBase):
+    """GET /api/device/file/<id> for a device that transcodes: a failed or
+    hung encode is an error, never an empty 200 a client would keep, and a
+    busy server says so instead of holding the request."""
+
+    def setUp(self):
+        super().setUp()
+        self._music = Path(tempfile.mkdtemp(dir=_TMP))
+        db.set_config(self.conn, "music_root", str(self._music))
+        self.device_id, self.token = sync_state.create_device(self.conn, self.owner, "dap")
+        self.conn.execute("UPDATE devices SET transcode_format = 'mp3_320' WHERE id = ?", (self.device_id,))
+        (self._music / "a").mkdir()
+        (self._music / "a" / "x.flac").write_bytes(b"FLACDATA")
+        cur = self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                                "VALUES ('a/x.flac', 'A', 'Al', 'T', 8, 0)")
+        self.track = sync_state._new_id(cur)
+        self.conn.execute("INSERT INTO device_track_state (device_id, track_id, status, updated_at) "
+                          "VALUES (?, ?, 'pending', datetime('now'))", (self.device_id, self.track))
+        self.conn.commit()
+        main.transcode._active = 0
+        self.cache = main.transcode.cache_dir(db.DATA_DIR)
+        shutil.rmtree(self.cache, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.cache, True)
+
+    def _encode(self, returncode, content=b"ID3mp3bytes", out_dir=None):
+        fd, out_path = tempfile.mkstemp(dir=out_dir or _TMP, suffix=".mp3")
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        fd, err_path = tempfile.mkstemp(dir=_TMP, suffix=".log")
+        os.close(fd)
+        proc = mock.Mock()
+        proc.wait.return_value = None
+        proc.returncode = returncode
+        return proc, out_path, err_path
+
+    def _get(self):
+        resp = self.client.get(f"/api/device/file/{self.track}", headers={"Authorization": f"Bearer {self.token}"})
+        data = resp.get_data()
+        resp.close()
+        return resp, data
+
+    def test_a_finished_encode_is_sent_with_its_length(self):
+        # Streamed from its temp file: with no cache, nothing is kept.
+        db.set_config(self.conn, "transcode_cache_gb", "0")
+        self.conn.commit()
+        started = self._encode(0)
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "start", return_value=started):
+            resp, data = self._get()
+        self.assertEqual((resp.status_code, data, resp.headers["Content-Length"]), (200, b"ID3mp3bytes", "11"))
+        self.assertEqual(main.transcode._active, 0)
+
+    def test_a_failed_encode_is_an_error_not_an_empty_track(self):
+        started = self._encode(1, b"partial")
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "start", return_value=started), \
+                self.assertLogs("transcode", level="WARNING"):
+            resp, data = self._get()
+        self.assertEqual(resp.status_code, 500)
+        self.assertNotEqual(data, b"partial")
+        self.assertEqual(main.transcode._active, 0)
+        self.assertFalse(os.path.exists(started[1]))
+
+    def _start(self, content=b"ID3mp3bytes"):
+        """A stand-in for transcode.start that writes where the real one
+        would: into out_dir when the route passes one."""
+        def start(abs_path, fmt, nice_level, out_dir=None):
+            if out_dir is not None:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            return self._encode(0, content, out_dir=out_dir)
+        return mock.Mock(side_effect=start)
+
+    def _cached_files(self):
+        return sorted(p.name for p in self.cache.glob("*.mp3")) if self.cache.exists() else []
+
+    def test_a_second_fetch_is_served_from_the_cache_without_encoding(self):
+        start = self._start()
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "start", start):
+            first, first_data = self._get()
+            second, second_data = self._get()
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual((first.status_code, first_data), (200, b"ID3mp3bytes"))
+        self.assertEqual((second.status_code, second_data), (200, b"ID3mp3bytes"))
+        self.assertEqual(second.mimetype, "audio/mpeg")
+        mtime = (self._music / "a" / "x.flac").stat().st_mtime_ns
+        self.assertEqual(self._cached_files(), [f"{self.track}-{mtime}-mp3_320.mp3"])
+        self.assertEqual(main.transcode._active, 0)
+
+    def test_a_cached_transcode_can_be_fetched_in_ranges(self):
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "start", self._start()):
+            self._get()
+        resp = self.client.get(f"/api/device/file/{self.track}",
+                               headers={"Authorization": f"Bearer {self.token}", "Range": "bytes=3-5"})
+        self.assertEqual((resp.status_code, resp.get_data()), (206, b"mp3"))
+        resp.close()
+
+    def test_a_changed_source_is_encoded_again(self):
+        start = self._start()
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "start", start):
+            self._get()
+            source = self._music / "a" / "x.flac"
+            stat = source.stat()
+            os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+            self._get()
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(len(self._cached_files()), 2)
+
+    def test_the_cap_is_counted_in_gigabytes(self):
+        # Two cached tracks are far inside the 2 GB default: neither is evicted.
+        self.cache.mkdir(parents=True, exist_ok=True)
+        other = self.cache / "999-1-mp3_320.mp3"
+        other.write_bytes(b"x" * 4096)
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "start", self._start()):
+            self._get()
+        self.assertTrue(other.exists())
+        self.assertEqual(len(self._cached_files()), 2)
+
+    def test_a_cache_of_zero_keeps_nothing(self):
+        db.set_config(self.conn, "transcode_cache_gb", "0")
+        self.conn.commit()
+        start = self._start()
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "start", start):
+            resp, data = self._get()
+            self._get()
+        self.assertEqual((resp.status_code, data, resp.headers["Accept-Ranges"]), (200, b"ID3mp3bytes", "none"))
+        self.assertEqual(start.call_count, 2)
+        self.assertIsNone(start.call_args.kwargs["out_dir"])
+        self.assertEqual(self._cached_files(), [])
+
+    def test_an_encode_finished_while_waiting_for_the_slot_is_served(self):
+        mtime = (self._music / "a" / "x.flac").stat().st_mtime_ns
+        cached = main.transcode.cache_path(db.DATA_DIR, self.track, mtime, "mp3_320")
+
+        def acquire(limit, timeout=None):
+            # Another request encodes the track while this one waits.
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(b"ID3fromtheother")
+            main.transcode._active += 1
+            return True
+
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "acquire_slot", side_effect=acquire), \
+                mock.patch.object(main.transcode, "start") as start:
+            resp, data = self._get()
+        start.assert_not_called()
+        self.assertEqual((resp.status_code, data), (200, b"ID3fromtheother"))
+        self.assertEqual(main.transcode._active, 0)
+
+    def test_a_transcode_the_cache_cannot_take_is_still_sent(self):
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "start", self._start()), \
+                mock.patch.object(main.transcode.os, "replace", side_effect=OSError("disk full")), \
+                self.assertLogs("transcode", level="WARNING"):
+            resp, data = self._get()
+        self.assertEqual((resp.status_code, data), (200, b"ID3mp3bytes"))
+        self.assertEqual(main.transcode._active, 0)
+        self.assertEqual(list(self.cache.iterdir()), [])
+
+    def test_saving_a_smaller_cache_frees_the_space_now(self):
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "start", self._start()):
+            self._get()
+        self.assertEqual(len(self._cached_files()), 1)
+        _login(self.client, self.admin)
+        resp = self.client.put("/api/admin/config", json={"transcode_cache_gb": 0})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["transcode_cache_gb"], 0)
+        self.assertEqual(self._cached_files(), [])
+
+    def test_the_cache_defaults_to_two_gb(self):
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.get("/api/admin/config").get_json()["transcode_cache_gb"], 2)
+
+    def test_a_busy_server_answers_503_with_retry_after(self):
+        with mock.patch.object(main.transcode, "ffmpeg_available", return_value=True), \
+                mock.patch.object(main.transcode, "acquire_slot", return_value=False) as acquire, \
+                mock.patch.object(main.transcode, "start") as start:
+            resp, _data = self._get()
+        self.assertEqual((resp.status_code, resp.headers["Retry-After"]), (503, str(main.transcode.SLOT_WAIT_SECONDS)))
+        self.assertEqual(acquire.call_args.kwargs["timeout"], main.transcode.SLOT_WAIT_SECONDS)
+        start.assert_not_called()
 
 
 class HttpHardeningTests(unittest.TestCase):
@@ -6211,6 +8622,41 @@ class LibraryScanBackgroundRouteTests(_RouteTestBase):
         self.assertEqual(resp.status_code, 202)
         start.assert_called_once()
 
+    def test_only_an_admin_can_confirm_a_mass_removal(self):
+        with mock.patch.object(scanner, "start_scan", return_value={"status": "started"}) as start:
+            _login(self.client, self.owner)
+            self.assertEqual(self.client.post("/api/library/scan?confirm_mass_removal=1").status_code, 403)
+            start.assert_not_called()
+            _login(self.client, self.admin)
+            self.assertEqual(self.client.post("/api/library/scan?confirm_mass_removal=1").status_code, 202)
+        self.assertIs(start.call_args.kwargs["confirm_mass_removal"], True)
+
+    def test_only_an_admin_can_run_a_full_rescan(self):
+        with mock.patch.object(scanner, "start_scan", return_value={"status": "started"}) as start:
+            _login(self.client, self.owner)
+            resp = self.client.post("/api/library/scan?force=1")
+            self.assertEqual(resp.status_code, 403)
+            self.assertIn("full rescan", resp.get_json()["error"])
+            start.assert_not_called()
+            self.assertEqual(self.client.post("/api/library/scan").status_code, 202)
+            self.assertIs(start.call_args.kwargs["force"], False)
+            _login(self.client, self.admin)
+            self.assertEqual(self.client.post("/api/library/scan?force=1").status_code, 202)
+        self.assertIs(start.call_args.kwargs["force"], True)
+
+    def test_the_scan_job_is_registered_to_retry_incremental(self):
+        self.assertIs(jobs._ON_RETRY[scanner.JOB_TYPE], scanner.retry_payload)
+
+    def test_a_refused_scan_reports_why(self):
+        _login(self.client, self.admin)
+        self.conn.execute(
+            "INSERT INTO jobs (type, state, payload, last_error, finished_at) VALUES (?, 'failed', '{}', ?, datetime('now'))",
+            (scanner.JOB_TYPE, "MassRemovalRefused: The scan found no audio files under /music"))
+        self.conn.commit()
+        last = self.client.get("/api/library/scan/status").get_json()["last_result"]
+        self.assertEqual(last["status"], "error")
+        self.assertIn("found no audio files", last["reason"])
+
     def test_status_endpoint_reports_running_and_last_result(self):
         _login(self.client, self.admin)
         resp = self.client.get("/api/library/scan/status")
@@ -6263,6 +8709,191 @@ class DeviceSourceOfTruthRouteTests(_RouteTestBase):
             "/api/device/info", headers={"Authorization": f"Bearer {self.token}"})
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["source_of_truth"], "server")
+
+
+class DevicePrunePreviewRouteTests(_RouteTestBase):
+    """GET /api/devices/<id>/prune-preview: how many tracks switching Keep
+    device content off removes from the device, for the question the switch
+    asks. Only tracks on the device and outside every selection count."""
+
+    def setUp(self):
+        super().setUp()
+        self.device, _token = sync_state.create_device(self.conn, self.owner, "kept-dev")
+        self.conn.execute("UPDATE devices SET source_of_truth = 'device' WHERE id = ?", (self.device,))
+        self.tracks = {}
+        for name in ("kept", "extra1", "extra2", "pending", "excluded"):
+            cur = self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                "VALUES (?, 'A', 'Al', ?, 1, 0)", (f"a/{name}.flac", name))
+            self.tracks[name] = sync_state._new_id(cur)
+        # One track a selection still asks for; the rest are on the device or
+        # pending or excluded with no selection behind them.
+        sync_state.create_selection(self.conn, "track", str(self.tracks["kept"]), self.owner, [self.device])
+        for name, status in (("kept", "downloaded"), ("extra1", "downloaded"), ("extra2", "downloaded"),
+                             ("pending", "pending"), ("excluded", "excluded")):
+            self.conn.execute(
+                "INSERT OR REPLACE INTO device_track_state (device_id, track_id, status, updated_at) "
+                "VALUES (?, ?, ?, datetime('now'))", (self.device, self.tracks[name], status))
+        self.conn.commit()
+
+    def test_counts_the_tracks_on_the_device_that_no_selection_includes(self):
+        _login(self.client, self.owner)
+        resp = self.client.get(f"/api/devices/{self.device}/prune-preview")
+        self.assertEqual((resp.status_code, resp.get_json()), (200, {"tracks": 2}))
+
+    def test_the_count_is_what_switching_it_off_then_removes(self):
+        _login(self.client, self.owner)
+        before = self.client.get(f"/api/devices/{self.device}/prune-preview").get_json()["tracks"]
+        self.client.patch(f"/api/devices/{self.device}", json={"source_of_truth": "server"})
+        removed_from_device = self.conn.execute(
+            "SELECT COUNT(*) FROM device_track_state WHERE device_id = ? AND status = 'removed' "
+            "AND track_id IN (?, ?, ?)",
+            (self.device, self.tracks["kept"], self.tracks["extra1"], self.tracks["extra2"])).fetchone()[0]
+        self.assertEqual(before, removed_from_device)
+
+    def test_it_writes_nothing(self):
+        _login(self.client, self.owner)
+        snapshot = self.conn.execute(
+            "SELECT track_id, status FROM device_track_state WHERE device_id = ? ORDER BY track_id",
+            (self.device,)).fetchall()
+        self.client.get(f"/api/devices/{self.device}/prune-preview")
+        self.assertEqual(self.conn.execute(
+            "SELECT track_id, status FROM device_track_state WHERE device_id = ? ORDER BY track_id",
+            (self.device,)).fetchall(), snapshot)
+
+    def test_only_someone_who_may_manage_the_device_can_ask(self):
+        _login(self.client, self.other)
+        self.assertEqual(self.client.get(f"/api/devices/{self.device}/prune-preview").status_code, 403)
+        self.assertEqual(self.client.get("/api/devices/999999/prune-preview").status_code, 404)
+
+
+class DeviceSendProjectionRouteTests(_RouteTestBase):
+    """GET /api/devices/send-projection: what sending an item adds to each
+    device, for the Sync to… picker's bars. Only the item's tracks the device
+    neither requires, holds nor excludes count as new."""
+
+    def setUp(self):
+        super().setUp()
+        self.device, _token = sync_state.create_device(self.conn, self.owner, "phone")
+        self.conn.execute("UPDATE devices SET max_size_bytes = 10000, reported_free_bytes = 2000 WHERE id = ?",
+                          (self.device,))
+        self.tracks = {}
+        for name, size in (("held", 100), ("new", 300), ("excluded", 400), ("queued", 500), ("elsewhere", 700)):
+            album = "Other" if name == "elsewhere" else "Al"
+            cur = self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                "VALUES (?, 'A', ?, ?, ?, 0)", (f"a/{name}.flac", album, name, size))
+            self.tracks[name] = sync_state._new_id(cur)
+        # Already asked for: held (on the device, smaller there than its file)
+        # and queued (not downloaded yet). The excluded one was asked for and
+        # left deleted on purpose.
+        for name in ("held", "queued", "excluded"):
+            sync_state.create_selection(self.conn, "track", str(self.tracks[name]), self.owner, [self.device])
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded', bytes_on_device = 80 "
+                          "WHERE device_id = ? AND track_id = ?", (self.device, self.tracks["held"]))
+        self.conn.execute("UPDATE device_track_state SET status = 'excluded' "
+                          "WHERE device_id = ? AND track_id = ?", (self.device, self.tracks["excluded"]))
+        self.conn.commit()
+
+    def _get(self, **params):
+        return self.client.get("/api/devices/send-projection", query_string=params)
+
+    def test_only_what_the_device_lacks_counts_as_new(self):
+        _login(self.client, self.owner)
+        resp = self._get(type="album", target="A||Al")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        # The album is four tracks; only "new" is new to the device.
+        self.assertEqual((body["tracks"], body["bytes"]), (4, 100 + 300 + 400 + 500))
+        self.assertEqual(body["devices"], {str(self.device): {
+            "new_tracks": 1, "new_bytes": 300,
+            # held as reported by the device, queued by its file; not the excluded one.
+            "used_bytes": 80 + 500, "on_device_bytes": 80,
+            "max_size_bytes": 10000, "reported_free_bytes": 2000, "reserve_bytes": None,
+        }})
+
+    def test_the_reserve_the_device_reported_comes_with_it(self):
+        self.conn.execute("UPDATE devices SET reported_reserve_bytes = 1500 WHERE id = ?", (self.device,))
+        self.conn.commit()
+        _login(self.client, self.owner)
+        projected = self._get(type="album", target="A||Al").get_json()["devices"][str(self.device)]
+        self.assertEqual(projected["reserve_bytes"], 1500)
+
+    def test_held_or_excluded_without_a_selection_is_not_new(self):
+        # Kept on a device whose content is kept, and left deleted on purpose:
+        # neither is required by a selection, and sending neither adds bytes.
+        for name, status in (("kept", "downloaded"), ("refused", "excluded")):
+            cur = self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                "VALUES (?, 'A', 'Al', ?, 1000, 0)", (f"a/{name}.flac", name))
+            self.conn.execute("INSERT INTO device_track_state (device_id, track_id, status) VALUES (?, ?, ?)",
+                              (self.device, sync_state._new_id(cur), status))
+        self.conn.commit()
+        _login(self.client, self.owner)
+        projected = self._get(type="album", target="A||Al").get_json()["devices"][str(self.device)]
+        self.assertEqual((projected["new_tracks"], projected["new_bytes"]), (1, 300))
+
+    def test_a_device_deleted_meanwhile_does_not_fail_the_projection(self):
+        # Another tab or user deletes a device while the projection reads
+        # them: it is read from one snapshot, so it answers, not 404s.
+        doomed, _token = sync_state.create_device(self.conn, self.owner, "old phone")
+        self.conn.commit()
+        real_usage = web_common._device_usage
+        deleted: list[int] = []
+
+        def usage_then_delete(conn, user_id, device_id):
+            if not deleted:
+                other = db.get_conn()
+                other.execute("DELETE FROM devices WHERE id = ?", (doomed,))
+                other.commit()
+                other.close()
+                deleted.append(doomed)
+            return real_usage(conn, user_id, device_id)
+
+        _login(self.client, self.owner)
+        with mock.patch.object(web_common, "_device_usage", side_effect=usage_then_delete):
+            resp = self._get(type="album", target="A||Al")
+        self.assertEqual(deleted, [doomed])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(set(resp.get_json()["devices"]), {str(self.device), str(doomed)})
+
+    def test_several_targets_are_measured_together(self):
+        _login(self.client, self.owner)
+        body = self._get(type="album", target=["A||Al", "A||Other"]).get_json()
+        self.assertEqual(body["devices"][str(self.device)]["new_bytes"], 300 + 700)
+
+    def test_new_bytes_are_what_sending_it_then_adds_to_usage(self):
+        _login(self.client, self.owner)
+        projected = self._get(type="album", target="A||Al").get_json()["devices"][str(self.device)]
+        sync_state.create_selection(self.conn, "album", "A||Al", self.owner, [self.device])
+        after = self.client.get(f"/api/devices/{self.device}/usage").get_json()["used_bytes"]
+        self.assertEqual(after, projected["used_bytes"] + projected["new_bytes"])
+
+    def test_it_writes_nothing(self):
+        _login(self.client, self.owner)
+        query = "SELECT device_id, track_id, status FROM device_track_state ORDER BY 1, 2"
+        snapshot = self.conn.execute(query).fetchall()
+        self._get(type="album", target="A||Al")
+        self.assertEqual(self.conn.execute(query).fetchall(), snapshot)
+
+    def test_each_user_sees_only_the_devices_they_may_manage(self):
+        _login(self.client, self.other)
+        self.assertEqual(self._get(type="album", target="A||Al").get_json()["devices"], {})
+        _login(self.client, self.admin)
+        self.assertIn(str(self.device), self._get(type="album", target="A||Al").get_json()["devices"])
+
+    def test_a_private_playlist_is_not_measured_for_someone_else(self):
+        private = self._make_playlist("mine", owner_user_id=self.owner, shared=0)
+        _login(self.client, self.other)
+        self.assertEqual(self._get(type="playlist", target=str(private)).status_code, 403)
+        _login(self.client, self.owner)
+        self.assertEqual(self._get(type="playlist", target=str(private)).status_code, 200)
+
+    def test_bad_requests_are_refused(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self._get(type="autofit", target="1").status_code, 400)
+        self.assertEqual(self._get(type="album", target=["x||y"] * 1001).status_code, 400)
+        self.assertEqual(self._get(type="album").get_json()["tracks"], 0)
 
 
 class DeviceManifestRouteTests(_RouteTestBase):
@@ -6372,6 +9003,113 @@ class DevicePlaylistsRouteTests(_RouteTestBase):
         [row] = self._rows()
         self.assertEqual(self._matched(row["id"]), [None])
 
+    # A file Trobar didn't put on the card, named the way Trobar names them.
+    _COPIED = "Music/Glass Meridian/Latitude/07 - Two Suns.mp3"
+
+    def _b(self):
+        return self.conn.execute("SELECT id FROM tracks WHERE relative_path = 'lib/b.flac'").fetchone()[0]
+
+    def _review(self, playlist_id):
+        return self.client.get(f"/api/provider/playlists/{playlist_id}/unresolved-tracks").get_json()
+
+    def _unresolved_count(self, playlist_id):
+        rows = self.client.get("/api/provider/playlists").get_json()
+        rows = rows["playlists"] if isinstance(rows, dict) else rows
+        return next(r for r in rows if r["id"] == playlist_id)["unresolved_count"]
+
+    def _accept(self, playlist_id, ids, accepted=True):
+        return self.client.post(f"/api/provider/playlists/{playlist_id}/unresolved-tracks/accept",
+                                json={"ids": ids, "accepted": accepted})
+
+    def test_a_file_named_like_a_library_track_is_only_a_suggestion(self):
+        self._upload([{"path": "Mix.m3u", "entries": [self._COPIED]}])
+        [row] = self._rows()
+        self.assertEqual(self._matched(row["id"]), [None], "never matched, nor sent anywhere, until accepted")
+        _login(self.client, self.owner)
+        [entry] = self._review(row["id"])
+        self.assertEqual((entry["suggested"]["track_id"], entry["source_path"], entry["accepted"]),
+                         (self._b(), self._COPIED, False))
+        self.assertEqual((entry["suggested"]["artist"], entry["suggested"]["title"]), ("Glass Meridian", "Two Suns"))
+        self.assertEqual(self._unresolved_count(row["id"]), 1)
+
+    def test_a_card_path_under_a_mount_point_still_gives_its_artist(self):
+        self._upload([{"path": "Mix.m3u", "entries": ["/mnt/sdcard/" + self._COPIED]}])
+        [row] = self._rows()
+        _login(self.client, self.owner)
+        self.assertEqual(self._review(row["id"])[0]["suggested"]["track_id"], self._b())
+
+    def test_accepting_matches_it_at_once_and_after_the_next_upload_and_undo_takes_it_back(self):
+        self._upload([{"path": "Mix.m3u", "entries": [self._COPIED]}])
+        [row] = self._rows()
+        _login(self.client, self.owner)
+        [entry] = self._review(row["id"])
+        resp = self._accept(row["id"], [entry["id"]])
+        self.assertEqual(resp.get_json(), {"changed": [entry["id"]], "unresolved_count": 0})
+        self.assertEqual(self._matched(row["id"]), ["lib/b.flac"])
+        self._upload([{"path": "Mix.m3u", "entries": [self._COPIED]}])
+        self.assertEqual(self._matched(row["id"]), ["lib/b.flac"], "the acceptance survives a re-upload")
+        self.assertEqual(self._review(row["id"])[0]["accepted"], True)
+        self.assertEqual(self._unresolved_count(row["id"]), 0)
+        self._accept(row["id"], [entry["id"]], accepted=False)
+        self.assertEqual(self._matched(row["id"]), [None])
+        self.assertEqual(self._unresolved_count(row["id"]), 1)
+
+    def test_accepting_sends_the_track_to_a_device_selecting_the_playlist(self):
+        self._upload([{"path": "Mix.m3u", "entries": [self._COPIED]}])
+        [row] = self._rows()
+        sync_state.create_selection(self.conn, "playlist", str(row["id"]), self.owner, [self.device])
+        self.conn.commit()
+        _login(self.client, self.owner)
+        self._accept(row["id"], [self._review(row["id"])[0]["id"]])
+        self.assertEqual([tuple(r) for r in self.conn.execute(
+            "SELECT track_id, status FROM device_track_state WHERE device_id = ?", (self.device,))],
+            [(self._b(), "pending")])
+
+    def test_accepting_rewrites_the_playlists_mirrors(self):
+        self._upload([{"path": "Mix.m3u", "entries": [self._COPIED]}])
+        [row] = self._rows()
+        _login(self.client, self.owner)
+        with mock.patch.object(main.playlist_sync, "write_playlist_mirrors") as write:
+            self._accept(row["id"], [self._review(row["id"])[0]["id"]])
+        write.assert_called_once()
+        self.assertEqual(write.call_args.args[1], row["id"])
+
+    def test_a_name_that_fits_nothing_has_no_suggestion(self):
+        self._upload([{"path": "Mix.m3u", "entries": ["Side Loaded/Bootleg/01 - Live.mp3"]}])
+        [row] = self._rows()
+        _login(self.client, self.owner)
+        [entry] = self._review(row["id"])
+        self.assertIsNone(entry["suggested"])
+        self.assertEqual(self._accept(row["id"], [entry["id"]]).get_json()["changed"], [])
+
+    def test_a_suggestion_that_changes_must_be_accepted_again(self):
+        self._upload([{"path": "Mix.m3u", "entries": [self._COPIED]}])
+        [row] = self._rows()
+        _login(self.client, self.owner)
+        self._accept(row["id"], [self._review(row["id"])[0]["id"]])
+        # The accepted track leaves the library; another copy of the song is
+        # what the file name now fits.
+        self.conn.execute("UPDATE tracks SET deleted_at = 'now' WHERE relative_path = 'lib/b.flac'")
+        self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, track_no, size, mtime) "
+                          "VALUES ('lib/c.flac', 'Glass Meridian', 'Latitude (Deluxe)', 'Two Suns', 2, 1, 0)")
+        self.conn.commit()
+        self._upload([{"path": "Mix.m3u", "entries": [self._COPIED]}])
+        self.assertEqual(self._matched(row["id"]), [None])
+        [entry] = self._review(row["id"])
+        self.assertEqual((entry["accepted"], entry["suggested"]["album"]), (False, "Latitude (Deluxe)"))
+
+    def test_only_the_playlists_owner_or_an_admin_may_accept(self):
+        self._upload([{"path": "Mix.m3u", "entries": [self._COPIED]}])
+        [row] = self._rows()
+        self.conn.execute("UPDATE playlists SET shared = 1 WHERE id = ?", (row["id"],))
+        self.conn.commit()
+        _login(self.client, self.other)
+        [entry] = self._review(row["id"])
+        self.assertEqual(self._accept(row["id"], [entry["id"]]).status_code, 403)
+        self.assertEqual(self._matched(row["id"]), [None])
+        _login(self.client, self.owner)
+        self.assertEqual(self._accept(row["id"], ["x"]).status_code, 400)
+
     def test_a_reupload_updates_and_a_file_gone_from_the_card_is_removed(self):
         a, b = self.on_card["lib/a.flac"], self.on_card["lib/b.flac"]
         self._upload([{"path": "One.m3u", "entries": [a]}, {"path": "Two.m3u", "entries": [a]}])
@@ -6475,7 +9213,7 @@ class DevicePlaylistsRouteTests(_RouteTestBase):
     def test_the_caps_bound_one_upload(self):
         # The only bound on the work one device token can ask for.
         one = {"path": "x.m3u", "entries": [self.on_card["lib/a.flac"]]}
-        at_cap = [dict(one, path=f"p{i}.m3u") for i in range(main._DEVICE_PLAYLISTS_MAX)]
+        at_cap = [dict(one, path=f"p{i}.m3u") for i in range(device_api._DEVICE_PLAYLISTS_MAX)]
         self.assertEqual(self._upload(at_cap).status_code, 200)
         over = at_cap + [dict(one, path="one-more.m3u")]
         self.assertEqual(self._upload(over).status_code, 400)
@@ -6527,6 +9265,28 @@ class DeviceFingerprintsRouteTests(_RouteTestBase):
         ])
         self.assertIsNone(body["next_after"])
         self.assertEqual(body["pending"], 0)
+
+    def test_a_delivered_track_is_named_as_it_is_on_the_device(self):
+        # The album-artist layout names new deliveries; a file already on the
+        # device keeps its delivered name, and that is the one the client stores.
+        track = self._add_held_track("catalog/1.flac", fingerprint="FP", fingerprint_seq=1)
+        self.conn.execute("UPDATE tracks SET album_artist = 'Various Artists' WHERE id = ?", (track,))
+        self.conn.execute("UPDATE device_track_state SET delivered_path = 'Ar/Al/Ti.flac' WHERE track_id = ?",
+                          (track,))
+        self.conn.commit()
+        body = self.client.get("/api/device/fingerprints", headers=self._auth()).get_json()
+        self.assertEqual([e["path"] for e in body["entries"]], ["Ar/Al/Ti.flac"])
+
+    def test_a_track_queued_again_is_named_by_its_new_delivery(self):
+        # pending with an old delivered_path (a format change, a re-download):
+        # the client is about to write the new name, so that is its path.
+        track = self._add_held_track("catalog/1.flac", fingerprint="FP", fingerprint_seq=1, status="pending")
+        self.conn.execute("UPDATE tracks SET album_artist = 'Various Artists' WHERE id = ?", (track,))
+        self.conn.execute("UPDATE device_track_state SET delivered_path = 'Ar/Al/Ti.flac' WHERE track_id = ?",
+                          (track,))
+        self.conn.commit()
+        body = self.client.get("/api/device/fingerprints", headers=self._auth()).get_json()
+        self.assertEqual([e["path"] for e in body["entries"]], ["Various Artists/Al/Ti.flac"])
 
     def test_a_track_without_a_fingerprint_is_omitted_but_counted_pending(self):
         self._add_held_track("has.flac", fingerprint="FP")
@@ -6736,7 +9496,7 @@ class DeviceProvenancePushRouteTests(_RouteTestBase):
         self.assertEqual(resp.status_code, 400)
 
     def test_rejects_an_oversized_page(self):
-        entries = [{"fingerprint": "F", "path": f"p{i}"} for i in range(main._PROVENANCE_PUSH_MAX + 1)]
+        entries = [{"fingerprint": "F", "path": f"p{i}"} for i in range(device_api._PROVENANCE_PUSH_MAX + 1)]
         resp = self._post(entries)
         self.assertEqual(resp.status_code, 400)
         self.assertIn("smaller pages", resp.get_json()["error"])
@@ -7029,8 +9789,13 @@ class AdminUserDeleteLockoutGuardrailTests(_RouteTestBase):
         # still authorizes the caller but its own-account check no longer
         # matches.
         _login(self.client, self.admin)
-        with mock.patch.object(main, "get_current_user_id", side_effect=[999999, self.admin]):
+        # One mock under both names, so the sequence holds: the route (in
+        # admin) asks first, require_admin (in web_common) second.
+        ids = mock.Mock(side_effect=[999999, self.admin])
+        with mock.patch.object(admin, "get_current_user_id", ids), \
+                mock.patch.object(web_common, "get_current_user_id", ids):
             resp = self.client.delete(f"/api/admin/users/{self.admin}")
+        self.assertEqual(ids.call_count, 2)
         self.assertEqual(resp.status_code, 400)
         self.assertIn("last admin", resp.get_json()["error"])
 
@@ -7042,7 +9807,7 @@ class AdminUserDeleteLockoutGuardrailTests(_RouteTestBase):
         self.conn.commit()
         second_admin = self._make_user("second-admin", is_admin=True)
         _login(self.client, second_admin)
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.delete(f"/api/admin/users/{self.admin}")
         self.assertEqual(resp.status_code, 400)
         self.assertIn("local password", resp.get_json()["error"])
@@ -7056,7 +9821,7 @@ class AdminUserDeleteLockoutGuardrailTests(_RouteTestBase):
             "UPDATE users SET password_hash = 'x' WHERE id = ?", (self.owner,))
         self.conn.commit()
         _login(self.client, self.admin)
-        with mock.patch.object(main, "AUTH_MODE", "local"):
+        with mock.patch.object(settings, "AUTH_MODE", "local"):
             resp = self.client.delete(f"/api/admin/users/{self.owner}")
         self.assertEqual(resp.status_code, 200)
 
@@ -7065,7 +9830,7 @@ class AdminUserDeleteLockoutGuardrailTests(_RouteTestBase):
             "UPDATE users SET password_hash = 'x' WHERE id IN (?, ?)", (self.admin, self.owner))
         self.conn.commit()
         _login(self.client, self.admin)
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.delete(f"/api/admin/users/{self.owner}")
         self.assertEqual(resp.status_code, 200)  # self.admin still has one
 
@@ -7080,6 +9845,13 @@ class OidcBreakGlassPasswordTests(_RouteTestBase):
     already requires the separate emergency port, unlike oidc's plain
     /login."""
 
+    def setUp(self):
+        super().setUp()
+        # The failure counts are module-level: one test's wrong guesses
+        # mustn't count toward the next one's limit.
+        main._rl_failures.clear()
+        self.addCleanup(main._rl_failures.clear)
+
     def _set_password(self, user_id: int, password: str) -> None:
         self.conn.execute(
             "UPDATE users SET password_hash = ? WHERE id = ?",
@@ -7090,20 +9862,20 @@ class OidcBreakGlassPasswordTests(_RouteTestBase):
 
     def test_login_honours_admin_password_under_oidc(self):
         self._set_password(self.admin, "adminpass123")
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.post("/login", data={"username": "admin", "password": "adminpass123"})
         self.assertEqual(resp.status_code, 302)
 
     def test_login_rejects_correct_non_admin_password_under_oidc(self):
         self._set_password(self.owner, "ownerpass123")
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.post("/login", data={"username": "owner", "password": "ownerpass123"})
         self.assertEqual(resp.status_code, 200)  # re-rendered login form, not a redirect
 
     def test_login_honours_non_admin_password_under_local_mode(self):
         # Unchanged legacy behaviour — the oidc restriction is mode-specific.
         self._set_password(self.owner, "ownerpass123")
-        with mock.patch.object(main, "AUTH_MODE", "local"):
+        with mock.patch.object(settings, "AUTH_MODE", "local"):
             resp = self.client.post("/login", data={"username": "owner", "password": "ownerpass123"})
         self.assertEqual(resp.status_code, 302)
 
@@ -7111,34 +9883,86 @@ class OidcBreakGlassPasswordTests(_RouteTestBase):
 
     def test_self_service_password_change_blocked_for_non_admin_under_oidc(self):
         _login(self.client, self.owner)
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.post("/api/account/password", json={"password": "newpassword1"})
         self.assertEqual(resp.status_code, 400)
 
     def test_self_service_password_change_allowed_for_admin_under_oidc(self):
         _login(self.client, self.admin)
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.post("/api/account/password", json={"password": "newpassword1"})
         self.assertEqual(resp.status_code, 200)
 
     def test_self_service_password_change_allowed_for_non_admin_under_local_mode(self):
         _login(self.client, self.owner)
-        with mock.patch.object(main, "AUTH_MODE", "local"):
+        with mock.patch.object(settings, "AUTH_MODE", "local"):
             resp = self.client.post("/api/account/password", json={"password": "newpassword1"})
         self.assertEqual(resp.status_code, 200)
+
+    def _change_own_password(self, current):
+        body = {"password": "a brand new one"}
+        if current is not None:
+            body["current_password"] = current
+        return self.client.post("/api/account/password", json=body)
+
+    def _password_is(self, user_id, password):
+        row = self.conn.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,)).fetchone()
+        return main.check_password_hash(row["password_hash"], password)
+
+    def test_changing_a_password_asks_for_the_current_one(self):
+        self._set_password(self.owner, "ownerpass123")
+        _login(self.client, self.owner)
+        for current in (None, "", "not it at all"):
+            with self.subTest(current=current):
+                resp = self._change_own_password(current)
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(resp.get_json()["field"], "current_password")
+                self.assertTrue(self._password_is(self.owner, "ownerpass123"), "unchanged")
+        self.assertEqual(self._change_own_password("ownerpass123").status_code, 200)
+        self.assertTrue(self._password_is(self.owner, "a brand new one"))
+
+    def test_a_first_password_needs_no_current_one(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self._change_own_password(None).status_code, 200)
+        self.assertTrue(self._password_is(self.owner, "a brand new one"))
+
+    def test_wrong_current_passwords_are_throttled_per_account(self):
+        self._set_password(self.owner, "ownerpass123")
+        _login(self.client, self.owner)
+        for _ in range(10):
+            self.assertEqual(self._change_own_password("guess").status_code, 400)
+        # Past the limit even the right one is refused for now.
+        self.assertEqual(self._change_own_password("ownerpass123").status_code, 429)
+        self.assertTrue(self._password_is(self.owner, "ownerpass123"))
+
+    def test_the_right_current_password_resets_the_count(self):
+        self._set_password(self.owner, "ownerpass123")
+        _login(self.client, self.owner)
+        for _ in range(9):
+            self.assertEqual(self._change_own_password("guess").status_code, 400)
+        self.assertEqual(self._change_own_password("ownerpass123").status_code, 200)
+        # Ten more wrong ones are all answered, not refused: the count began again.
+        for _ in range(10):
+            self.assertEqual(self._change_own_password("guess").status_code, 400)
+
+    def test_the_profile_says_whether_there_is_a_local_password(self):
+        _login(self.client, self.owner)
+        self.assertIs(self.client.get("/api/profile").get_json()["has_local_password"], False)
+        self._set_password(self.owner, "ownerpass123")
+        self.assertIs(self.client.get("/api/profile").get_json()["has_local_password"], True)
 
     # --- admin-managed create POST /api/admin/users ---
 
     def test_creating_local_account_blocked_under_oidc(self):
         _login(self.client, self.admin)
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.post(
                 "/api/admin/users", json={"username": "newuser", "password": "newpassword1"})
         self.assertEqual(resp.status_code, 400)
 
     def test_creating_local_account_allowed_under_local_mode(self):
         _login(self.client, self.admin)
-        with mock.patch.object(main, "AUTH_MODE", "local"):
+        with mock.patch.object(settings, "AUTH_MODE", "local"):
             resp = self.client.post(
                 "/api/admin/users", json={"username": "newuser", "password": "newpassword1"})
         self.assertEqual(resp.status_code, 200)
@@ -7147,7 +9971,7 @@ class OidcBreakGlassPasswordTests(_RouteTestBase):
 
     def test_admin_reset_blocked_for_non_admin_target_under_oidc(self):
         _login(self.client, self.admin)
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.put(
                 f"/api/admin/users/{self.owner}/password", json={"password": "newpassword1"})
         self.assertEqual(resp.status_code, 400)
@@ -7155,21 +9979,21 @@ class OidcBreakGlassPasswordTests(_RouteTestBase):
     def test_admin_reset_allowed_for_admin_target_under_oidc(self):
         other_admin = self._make_user("second-admin", is_admin=True)
         _login(self.client, self.admin)
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.put(
                 f"/api/admin/users/{other_admin}/password", json={"password": "newpassword1"})
         self.assertEqual(resp.status_code, 200)
 
     def test_admin_reset_allowed_for_non_admin_target_under_local_mode(self):
         _login(self.client, self.admin)
-        with mock.patch.object(main, "AUTH_MODE", "local"):
+        with mock.patch.object(settings, "AUTH_MODE", "local"):
             resp = self.client.put(
                 f"/api/admin/users/{self.owner}/password", json={"password": "newpassword1"})
         self.assertEqual(resp.status_code, 200)
 
     def test_admin_reset_404_for_nonexistent_user_under_oidc(self):
         _login(self.client, self.admin)
-        with mock.patch.object(main, "AUTH_MODE", "oidc"):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
             resp = self.client.put(
                 "/api/admin/users/999999/password", json={"password": "newpassword1"})
         self.assertEqual(resp.status_code, 404)
@@ -7218,31 +10042,31 @@ class DashboardWidgetsCoverLimitTests(unittest.TestCase):
     push an arbitrary count into the template's cover grid."""
 
     def test_default_when_absent(self):
-        result = main._normalize_dashboard_widgets({"disabled": []})
+        result = web_common._normalize_dashboard_widgets({"disabled": []})
         self.assertEqual(result["settings"]["cover_limit"], 15)
 
     def test_default_for_non_dict_input(self):
-        result = main._normalize_dashboard_widgets(None)
+        result = web_common._normalize_dashboard_widgets(None)
         self.assertEqual(result["settings"]["cover_limit"], 15)
 
     def test_valid_values_pass_through(self):
         for n in (15, 30, 45, 60):
             with self.subTest(n=n):
-                result = main._normalize_dashboard_widgets({"settings": {"cover_limit": n}})
+                result = web_common._normalize_dashboard_widgets({"settings": {"cover_limit": n}})
                 self.assertEqual(result["settings"]["cover_limit"], n)
 
     def test_out_of_range_value_clamped_to_default(self):
-        result = main._normalize_dashboard_widgets({"settings": {"cover_limit": 999}})
+        result = web_common._normalize_dashboard_widgets({"settings": {"cover_limit": 999}})
         self.assertEqual(result["settings"]["cover_limit"], 15)
 
     def test_non_numeric_value_clamped_to_default(self):
-        result = main._normalize_dashboard_widgets({"settings": {"cover_limit": "lots"}})
+        result = web_common._normalize_dashboard_widgets({"settings": {"cover_limit": "lots"}})
         self.assertEqual(result["settings"]["cover_limit"], 15)
 
     def test_other_settings_keys_preserved(self):
         # Per-widget settings (e.g. recently_added's "months") share the
         # same dict — validating cover_limit must not drop them.
-        result = main._normalize_dashboard_widgets(
+        result = web_common._normalize_dashboard_widgets(
             {"settings": {"recently_added": {"months": 6}, "cover_limit": 30}})
         self.assertEqual(result["settings"]["recently_added"], {"months": 6, "cover_limit": 30})  # its count from the single value
         self.assertEqual(result["settings"]["cover_limit"], 30)
@@ -7260,7 +10084,7 @@ class DashboardWidgetsPerWidgetCoverLimitTests(_RouteTestBase):
         return self.client.patch("/api/profile/dashboard-widgets", json=body)
 
     def test_an_older_set_reads_as_its_single_value_for_each_cover_widget(self):
-        result = main._normalize_dashboard_widgets({"settings": {"cover_limit": 45}})
+        result = web_common._normalize_dashboard_widgets({"settings": {"cover_limit": 45}})
         for widget in ("suggestions", "recently_added", "recently_released"):
             self.assertEqual(result["settings"][widget]["cover_limit"], 45)
         self.assertEqual(result["settings"]["cover_limit"], 45)
@@ -7317,23 +10141,23 @@ class DashboardWidgetsOrderTests(unittest.TestCase):
     not something the server can validate without duplicating the catalog)."""
 
     def test_default_empty_when_absent(self):
-        result = main._normalize_dashboard_widgets({"disabled": []})
+        result = web_common._normalize_dashboard_widgets({"disabled": []})
         self.assertEqual(result["order"], [])
 
     def test_default_empty_for_non_dict_input(self):
-        result = main._normalize_dashboard_widgets(None)
+        result = web_common._normalize_dashboard_widgets(None)
         self.assertEqual(result["order"], [])
 
     def test_valid_list_passes_through(self):
-        result = main._normalize_dashboard_widgets({"order": ["devices", "library"]})
+        result = web_common._normalize_dashboard_widgets({"order": ["devices", "library"]})
         self.assertEqual(result["order"], ["devices", "library"])
 
     def test_non_list_value_falls_back_to_empty(self):
-        result = main._normalize_dashboard_widgets({"order": "devices,library"})
+        result = web_common._normalize_dashboard_widgets({"order": "devices,library"})
         self.assertEqual(result["order"], [])
 
     def test_order_does_not_disturb_disabled_or_settings(self):
-        result = main._normalize_dashboard_widgets(
+        result = web_common._normalize_dashboard_widgets(
             {"disabled": ["administration"], "order": ["devices"], "settings": {"cover_limit": 30}})
         self.assertEqual(result["disabled"], ["administration"])
         self.assertEqual(result["order"], ["devices"])
@@ -7456,6 +10280,71 @@ class MostPlayedRouteTests(_RouteTestBase):
         self.assertEqual(resp.status_code, 200)
         albums = [r["album"] for r in resp.get_json()]
         self.assertEqual(albums, ["High playcount", "Low playcount"])
+
+    def test_with_sources_says_which_source_did_not_answer(self):
+        # The web page asks for the sources beside the items, so an outage
+        # isn't shown as "nothing played".
+        import requests
+        self.conn.execute(
+            "UPDATE users SET lastfm_username = 'alice', lastfm_api_key = 'k', "
+            "listenbrainz_username = 'alice' WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        lb_body = {"payload": {"release_groups": [
+            {"artist_name": "B", "release_group_name": "High playcount", "listen_count": 99},
+        ]}}
+        _login(self.client, self.owner)
+        with mock.patch("requests.get", side_effect=[
+                requests.ConnectionError("down"), self._mock_response(lb_body)]):
+            body = self.client.get("/api/suggestions/most-played?with_sources=1").get_json()
+        self.assertEqual([r["album"] for r in body["items"]], ["High playcount"])
+        self.assertEqual(body["sources"], {"lastfm": "error", "listenbrainz": "ok", "maloja": "unconfigured",
+                             "device_plays": "unconfigured"})
+
+    def test_fresh_asks_the_service_again(self):
+        # The module turns the cache off; here it is on, as in production.
+        self.conn.execute("UPDATE users SET lastfm_username = 'alice', lastfm_api_key = 'k' WHERE id = ?",
+                          (self.owner,))
+        self.conn.commit()
+        body = {"topalbums": {"album": [{"artist": {"name": "A"}, "name": "Kept", "playcount": "5"}]}}
+        _login(self.client, self.owner)
+        history_cache.clear()
+        self.addCleanup(history_cache.clear)
+        with mock.patch.object(history_cache, "TTL_SECONDS", 300), \
+                mock.patch("requests.get", return_value=self._mock_response(body)) as get:
+            self.client.get("/api/suggestions/most-played")
+            self.client.get("/api/suggestions/most-played")
+            self.assertEqual(get.call_count, 1, "the second is answered from memory")
+            self.client.get("/api/suggestions/most-played?fresh=1")
+            self.assertEqual(get.call_count, 2)
+
+    def test_fresh_asks_the_services_again_for_suggestions_too(self):
+        # The Suggestions tab's Refresh and Retry hit this route.
+        self.conn.execute("UPDATE users SET lastfm_username = 'alice', lastfm_api_key = 'k' WHERE id = ?",
+                          (self.owner,))
+        self.conn.commit()
+        body: dict = {"topalbums": {"album": []}, "recenttracks": {"track": []}}
+        _login(self.client, self.owner)
+        history_cache.clear()
+        self.addCleanup(history_cache.clear)
+        with mock.patch.object(history_cache, "TTL_SECONDS", 300), \
+                mock.patch("requests.get", return_value=self._mock_response(body)) as get:
+            self.client.get("/api/suggestions")
+            asked = get.call_count  # top albums and recent tracks
+            self.assertGreater(asked, 0)
+            self.client.get("/api/suggestions")
+            self.assertEqual(get.call_count, asked, "the second is answered from memory")
+            self.client.get("/api/suggestions?fresh=1")
+            self.assertEqual(get.call_count, 2 * asked)
+
+    def test_without_with_sources_the_answer_is_still_a_bare_list(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.get("/api/suggestions/most-played").get_json(), [])
+        self.assertIsInstance(self.client.get("/api/suggestions").get_json(), list)
+        body = self.client.get("/api/suggestions?with_sources=1").get_json()
+        self.assertEqual(set(body), {"items", "sources"})
+        self.assertEqual(body["sources"], {"lastfm": "unconfigured", "listenbrainz": "unconfigured",
+                                           "maloja": "unconfigured",
+                             "device_plays": "unconfigured"})
 
     def test_garbage_limit_falls_back_to_default_instead_of_500ing(self):
         _login(self.client, self.owner)
@@ -7683,6 +10572,209 @@ class SuggestionsPeriodMappingRouteTests(_RouteTestBase):
         self.assertEqual(ranges, ["month"])
 
 
+class LibraryAlbumTracksRouteTests(_RouteTestBase):
+    """GET /api/library/album-tracks: an album's tracks in disc and track
+    order, the album as selecting it syncs (its album artist, or one of its
+    track artists)."""
+
+    def _track(self, title, artist, disc, no, album="Event Horizon", album_artist="Aphelion", deleted=False):
+        self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album_artist, album, title, disc_no, track_no, duration, "
+            "size, mtime, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, 241.6, 1, 0, ?)",
+            (f"{album}/{disc}-{no}.flac", artist, album_artist, album, title, disc, no,
+             "2026-01-01" if deleted else None))
+        self.conn.commit()
+
+    def _get(self, artist, album="Event Horizon"):
+        _login(self.client, self.owner)
+        resp = self.client.get("/api/library/album-tracks", query_string={"artist": artist, "album": album})
+        self.assertEqual(resp.status_code, 200)
+        return [(r["disc_no"], r["track_no"], r["title"], r["artist"]) for r in resp.get_json()]
+
+    def test_tracks_come_in_disc_then_track_order_with_their_artist(self):
+        self._track("Afterglow", "Aphelion", 2, 1)
+        self._track("Perihelion", "Aphelion feat. Cinder", 1, 2)
+        self._track("Singularity", "Aphelion", 1, 1)
+        self._track("Gone", "Aphelion", 1, 3, deleted=True)
+        self.assertEqual(self._get("Aphelion"), [
+            (1, 1, "Singularity", "Aphelion"), (1, 2, "Perihelion", "Aphelion feat. Cinder"),
+            (2, 1, "Afterglow", "Aphelion")])
+
+    def test_by_a_track_artist_it_is_that_artists_tracks(self):
+        self._track("One", "Glass Meridian", 1, 1, album="Night Drive", album_artist="Various Artists")
+        self._track("Two", "Low Orbit", 1, 2, album="Night Drive", album_artist="Various Artists")
+        self.assertEqual([t[2] for t in self._get("Various Artists", "Night Drive")], ["One", "Two"])
+        self.assertEqual([t[2] for t in self._get("Low Orbit", "Night Drive")], ["Two"])
+
+    def test_it_needs_a_session(self):
+        self.assertEqual(self.client.get("/api/library/album-tracks?artist=A&album=B").status_code, 401)
+
+
+class LibraryAlbumArtistTests(_RouteTestBase):
+    """#240: the web Library groups albums by album artist, and an artist's
+    page lists the albums they only appear on. The App API doesn't change."""
+
+    def setUp(self):
+        super().setUp()
+        self.device, self.token = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        for path, artist, album_artist, album, title in (
+                ("n/1.flac", "Glass Meridian", "Various Artists", "Night Drive", "One"),
+                ("n/2.flac", "Low Orbit", "Various Artists", "Night Drive", "Two"),
+                ("n/3.flac", "Low Orbit", "Various Artists", "Night Drive", "Three"),
+                ("e/1.flac", "Aphelion", "Aphelion", "Event Horizon", "Singularity"),
+                ("e/2.flac", "Aphelion feat. Cinder", "Aphelion", "Event Horizon", "Perihelion"),
+                ("l/1.flac", "Glass Meridian", "Glass Meridian", "Latitude", "Song")):
+            self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album_artist, album, title, size, mtime) "
+                "VALUES (?, ?, ?, ?, ?, 1, 0)", (path, artist, album_artist, album, title))
+        self.conn.commit()
+        _login(self.client, self.owner)
+
+    def _get(self, path):
+        resp = self.client.get(path)
+        self.assertEqual(resp.status_code, 200)
+        return resp.get_json()
+
+    def test_a_compilation_is_one_album_under_its_album_artist(self):
+        artists = {a["artist"]: a for a in self._get("/api/library/artists")}
+        self.assertEqual((artists["Various Artists"]["album_count"], artists["Various Artists"]["track_count"]), (1, 3))
+        self.assertEqual(artists["Various Artists"]["albums"], ["Night Drive"])
+        # Glass Meridian: one album of their own, and they appear on one.
+        self.assertEqual((artists["Glass Meridian"]["album_count"], artists["Glass Meridian"]["appears_on_count"]), (1, 1))
+        # Low Orbit only appears on others' albums, and is still listed.
+        self.assertEqual((artists["Low Orbit"]["album_count"], artists["Low Orbit"]["appears_on_count"]), (0, 1))
+        # A guest track counts with its album, not as an artist of its own album.
+        self.assertEqual(artists["Aphelion"]["track_count"], 2)
+        self.assertEqual(artists["Aphelion feat. Cinder"]["album_count"], 0)
+
+    def test_an_artists_albums_are_their_own(self):
+        self.assertEqual([a["album"] for a in self._get("/api/library/albums?artist=Glass%20Meridian")], ["Latitude"])
+        self.assertEqual([(a["album"], a["track_count"]) for a in
+                          self._get("/api/library/albums?artist=Various%20Artists")], [("Night Drive", 3)])
+
+    def test_also_appears_on_lists_others_albums_with_their_track_count(self):
+        self.assertEqual([(a["album"], a["album_artist"], a["track_count"]) for a in
+                          self._get("/api/library/appears-on?artist=Low%20Orbit")],
+                         [("Night Drive", "Various Artists", 2)])
+        self.assertEqual(self._get("/api/library/appears-on?artist=Aphelion"), [])
+
+    def _app(self, path):
+        return self.client.get(path, headers={"Authorization": f"Bearer {self.token}"})
+
+    def test_the_app_api_serves_the_browsers_grouping_beside_its_own(self):
+        for app, session in (("album-artists", "artists"),
+                             ("album-artist-albums?artist=Various%20Artists", "albums?artist=Various%20Artists"),
+                             ("appears-on?artist=Low%20Orbit", "appears-on?artist=Low%20Orbit")):
+            with self.subTest(route=app):
+                resp = self._app(f"/api/app/library/{app}")
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.get_json(), self._get(f"/api/library/{session}"))
+                self.assertTrue(resp.get_json())
+
+    def test_those_routes_need_the_device_token(self):
+        for route in ("album-artists", "album-artist-albums?artist=A", "appears-on?artist=A"):
+            with self.subTest(route=route):
+                self.assertEqual(self.client.get(f"/api/app/library/{route}").status_code, 401)
+
+    def test_the_row_counts_what_the_artists_page_lists(self):
+        # The same album name under two album artists is two albums to appear on.
+        self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album_artist, album, title, size, mtime) "
+            "VALUES ('o/1.flac', 'Low Orbit', 'Someone Else', 'Night Drive', 'Other', 1, 0)")
+        self.conn.commit()
+        rows = {a["artist"]: a for a in self._get("/api/library/artists")}
+        self.assertEqual(rows["Low Orbit"]["appears_on_count"], 2)
+        for name, row in rows.items():
+            with self.subTest(artist=name):
+                query = urllib.parse.quote(name)
+                self.assertEqual(row["appears_on_count"], len(self._get(f"/api/library/appears-on?artist={query}")))
+                self.assertEqual(row["album_count"], len(self._get(f"/api/library/albums?artist={query}")))
+
+    def test_the_app_api_still_groups_by_track_artist(self):
+        resp = self.client.get("/api/app/library/artists", headers={"Authorization": f"Bearer {self.token}"})
+        names = {a["artist"] for a in resp.get_json()}
+        self.assertNotIn("Various Artists", names)
+        self.assertIn("Low Orbit", names)
+
+    def test_a_selection_of_one_artists_tracks_says_whose_album_it_is(self):
+        for target in ("Low Orbit||Night Drive", "Various Artists||Night Drive", "Glass Meridian"):
+            sync_state.create_selection(self.conn, "album" if "||" in target else "artist", target,
+                                        self.owner, [self.device])
+        sels = {s["target"]: s["appears_on"] for s in self._get("/api/selections")}
+        self.assertEqual(sels["Low Orbit||Night Drive"], {"album_artist": "Various Artists", "tracks": 2, "of": 3})
+        self.assertIsNone(sels["Various Artists||Night Drive"], "the whole album")
+        self.assertIsNone(sels["Glass Meridian"], "not an album")
+
+    def test_a_whole_album_selection_carries_its_track_count(self):
+        for target in ("Low Orbit||Night Drive", "Various Artists||Night Drive", "Glass Meridian||Latitude",
+                       "Glass Meridian", "Nobody||Gone"):
+            sync_state.create_selection(self.conn, "album" if "||" in target else "artist", target,
+                                        self.owner, [self.device])
+        counts = {s["target"]: s["album_tracks"] for s in self._get("/api/selections")}
+        self.assertEqual(counts["Various Artists||Night Drive"], 3)
+        self.assertEqual(counts["Glass Meridian||Latitude"], 1)
+        self.assertIsNone(counts["Low Orbit||Night Drive"], "one artist's tracks: appears_on says it")
+        self.assertIsNone(counts["Glass Meridian"], "not an album")
+        self.assertIsNone(counts["Nobody||Gone"], "no tracks left in the library")
+
+    def test_the_whole_album_suffix_reads_right_in_french(self):
+        from babel.messages.pofile import read_po
+        with main.app.test_request_context("/"):
+            ids = main._build_js_i18n()["wholeAlbumRow"]
+        with open(os.path.join(os.path.dirname(main.__file__), "translations", "fr", "LC_MESSAGES", "messages.po"), "rb") as f:
+            fr = read_po(f, locale="fr")
+        self.assertEqual(str(fr[ids["other"]].string).replace("{n}", "14"), "album entier, 14 morceaux")
+        self.assertEqual(str(fr[ids["one"]].string).replace("{n}", "1"), "album entier, 1 morceau")
+
+    def test_a_cover_and_add_to_playlist_find_the_album_by_its_album_artist(self):
+        self.assertIsNotNone(main._library_cover_row(self.conn, "Various Artists", "Night Drive"))
+        ids = web_common._album_track_ids(self.conn, {"albums": [{"artist": "Various Artists", "album": "Night Drive"}]})
+        self.assertEqual(len(ids), 3)
+        # From "Also appears on": one artist's tracks on it.
+        ids = web_common._album_track_ids(self.conn, {"albums": [{"artist": "Low Orbit", "album": "Night Drive"}]})
+        self.assertEqual(len(ids), 2)
+
+    def test_the_selections_row_count_reads_right_in_french(self):
+        # The page picks the plural form from n, the album's total, so the
+        # noun has to follow the total: one guest track on a compilation.
+        from babel.messages.pofile import read_po
+        with main.app.test_request_context("/"):
+            ids = main._build_js_i18n()["appearsOnRow"]
+        with open(os.path.join(os.path.dirname(main.__file__), "translations", "fr", "LC_MESSAGES", "messages.po"), "rb") as f:
+            fr = read_po(f, locale="fr")
+        fill = lambda form, count, n: str(fr[ids[form]].string).replace("{count}", str(count)).replace("{n}", str(n))
+        self.assertEqual(fill("other", 1, 14), "1 sur 14 morceaux")
+        self.assertEqual(fill("one", 1, 1), "1 sur 1 morceau")
+
+    def test_counts_against_a_total_read_right_in_french(self):
+        # Same rule for the upload results and the mirror line: the form is
+        # picked from n, the total, so the noun follows the total.
+        from babel.messages.pofile import read_po
+        with main.app.test_request_context("/"):
+            js = main._build_js_i18n()
+        with open(os.path.join(os.path.dirname(main.__file__), "translations", "fr", "LC_MESSAGES", "messages.po"), "rb") as f:
+            fr = read_po(f, locale="fr")
+
+        def fill(key, form, **values):
+            text = str(fr[js[key][form]].string)
+            for name, value in values.items():
+                text = text.replace("{" + name + "}", str(value))
+            return text
+
+        self.assertEqual(fill("playlistUploaded", "other", title="Mix", matched=1, n=14),
+                         "« Mix » envoyée : 1 sur 14 titres associés.")
+        self.assertEqual(fill("playlistUploaded", "one", title="Mix", matched=1, n=1),
+                         "« Mix » envoyée : 1 sur 1 titre associé.")
+        self.assertEqual(fill("playlistUploadReplaced", "other", title="Mix", matched=1, n=14),
+                         "« Mix » remplacée : 1 sur 14 titres associés.")
+        self.assertEqual(fill("playlistUploadReplaced", "one", title="Mix", matched=0, n=1),
+                         "« Mix » remplacée : 0 sur 1 titre associé.")
+        self.assertEqual(fill("mirrorSomeOnTarget", "other", on=1, n=14, provider="Plex"),
+                         "1 sur 14 morceaux sur Plex")
+        self.assertEqual(fill("mirrorSomeOnTarget", "one", on=1, n=1, provider="Plex"),
+                         "1 sur 1 morceau sur Plex")
+
+
 class LibraryQuizPairRouteTests(_RouteTestBase):
     """#508: thin route-layer coverage for api_library_quiz_pair() — the
     actual pair-selection logic has its own thorough, DB-free unit tests in
@@ -7754,8 +10846,1056 @@ class LibraryQuizPairRouteTests(_RouteTestBase):
         self.assertEqual(body, {"available": False})
 
 
+
+class AvatarRouteTests(_RouteTestBase):
+    """POST/DELETE /api/profile/avatar and GET /api/profile/avatar-image (#259):
+    a user's own picture, an upload checked for type and size, and a stored
+    name that can't reach outside the avatar directory."""
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.avatar_dir = Path(tmp.name) / "avatars"
+        patcher = mock.patch.object(user_profile, "AVATAR_DIR", self.avatar_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        _login(self.client, self.owner)
+
+    def _upload(self, data, mimetype="image/png", filename="me.png"):
+        return self.client.post("/api/profile/avatar", data={
+            "avatar": (io.BytesIO(data), filename, mimetype)}, content_type="multipart/form-data")
+
+    def _stored(self, user_id):
+        return self.conn.execute("SELECT avatar_path FROM users WHERE id = ?", (user_id,)).fetchone()[0]
+
+    def test_an_upload_is_stored_under_the_users_id_and_served_back(self):
+        self.assertEqual(self._upload(self.PNG).status_code, 200)
+        self.assertEqual(self._stored(self.owner), f"{self.owner}.png")
+        resp = self.client.get("/api/profile/avatar-image")
+        self.assertEqual((resp.status_code, resp.mimetype, resp.data), (200, "image/png", self.PNG))
+
+    def test_anything_but_jpeg_png_or_webp_is_refused(self):
+        resp = self._upload(b"<svg onload=alert(1)>", mimetype="image/svg+xml", filename="x.svg")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIsNone(self._stored(self.owner))
+        self.assertFalse(self.avatar_dir.exists() and any(self.avatar_dir.iterdir()))
+
+    def test_an_image_over_two_megabytes_is_refused(self):
+        resp = self._upload(b"\0" * (user_profile.AVATAR_MAX_BYTES + 1))
+        self.assertEqual(resp.status_code, 400)
+        self.assertIsNone(self._stored(self.owner))
+
+    def test_a_request_without_a_file_is_refused(self):
+        resp = self.client.post("/api/profile/avatar", data={}, content_type="multipart/form-data")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_a_new_upload_replaces_the_old_file(self):
+        self._upload(self.PNG)
+        self._upload(b"\xff\xd8\xff" + b"\0" * 16, mimetype="image/jpeg", filename="me.jpg")
+        self.assertEqual(self._stored(self.owner), f"{self.owner}.jpg")
+        self.assertEqual(sorted(p.name for p in self.avatar_dir.iterdir()), [f"{self.owner}.jpg"])
+
+    def test_delete_removes_the_file_and_the_picture(self):
+        self._upload(self.PNG)
+        self.assertEqual(self.client.delete("/api/profile/avatar").status_code, 200)
+        self.assertIsNone(self._stored(self.owner))
+        self.assertEqual(list(self.avatar_dir.iterdir()), [])
+        self.assertEqual(self.client.get("/api/profile/avatar-image").status_code, 404)
+
+    def test_each_user_only_ever_gets_their_own_picture(self):
+        self._upload(self.PNG)
+        _login(self.client, self.other)
+        self.assertEqual(self.client.get("/api/profile/avatar-image").status_code, 404)
+
+    def test_a_stored_name_outside_the_directory_is_neither_served_nor_deleted(self):
+        # The directory exists, as on any server that has had one upload:
+        # without it, "avatars/../secret.png" can't resolve at all, and the
+        # test would pass whether or not the route checks containment.
+        self.avatar_dir.mkdir()
+        outside = self.avatar_dir.parent / "secret.png"
+        outside.write_bytes(self.PNG)
+        self.conn.execute("UPDATE users SET avatar_path = '../secret.png' WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        self.assertEqual(self.client.get("/api/profile/avatar-image").status_code, 404)
+        self.client.delete("/api/profile/avatar")
+        self.assertTrue(outside.exists())
+
+    def test_signed_out_is_refused(self):
+        with self.client.session_transaction() as sess:
+            sess.clear()
+        self.assertEqual(self.client.get("/api/profile/avatar-image").status_code, 401)
+        self.assertEqual(self._upload(self.PNG).status_code, 401)
+        self.assertEqual(self.client.delete("/api/profile/avatar").status_code, 401)
+
+
+
+class OidcCallbackRouteTests(_RouteTestBase):
+    """GET /oidc/callback (#259): a session starts only from a token that
+    validates and names a user. Authlib's own validation (signature, iss/aud,
+    exp, nonce) is stubbed here: what's tested is what the route does with
+    its answer."""
+
+    def setUp(self):
+        super().setUp()
+        self.oauth = mock.MagicMock()
+        for target, name, value in ((settings, "AUTH_MODE", "oidc"), (auth, "oauth", self.oauth)):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _session(self):
+        with self.client.session_transaction() as sess:
+            return dict(sess)
+
+    def _user_ids(self, username):
+        return [r[0] for r in self.conn.execute("SELECT id FROM users WHERE username = ?", (username,))]
+
+    def test_a_valid_token_signs_the_named_user_in(self):
+        self.oauth.oidc.authorize_access_token.return_value = {
+            "userinfo": {settings.OIDC_USERNAME_CLAIM: "carol", "email": "carol@example.invalid"}}
+        resp = self.client.get("/oidc/callback")
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(self._session().get("local_user_id"), self._user_ids("carol")[0])
+
+    def test_an_existing_user_is_signed_in_not_duplicated(self):
+        self.oauth.oidc.authorize_access_token.return_value = {
+            "userinfo": {settings.OIDC_USERNAME_CLAIM: "owner"}}
+        self.client.get("/oidc/callback")
+        self.assertEqual(self._user_ids("owner"), [self.owner])
+        self.assertEqual(self._session().get("local_user_id"), self.owner)
+
+    def test_a_token_that_fails_validation_starts_no_session(self):
+        self.oauth.oidc.authorize_access_token.side_effect = ValueError("bad signature")
+        resp = self.client.get("/oidc/callback")
+        self.assertEqual(resp.status_code, 401)
+        self.assertNotIn("local_user_id", self._session())
+
+    def test_a_token_without_a_username_starts_no_session_and_makes_no_user(self):
+        before = self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        self.oauth.oidc.authorize_access_token.return_value = {"userinfo": {"email": "x@example.invalid"}}
+        resp = self.client.get("/oidc/callback")
+        self.assertEqual(resp.status_code, 401)
+        self.assertNotIn("local_user_id", self._session())
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0], before)
+
+    def test_outside_oidc_mode_the_callback_does_nothing(self):
+        with mock.patch.object(settings, "AUTH_MODE", "local"):
+            resp = self.client.get("/oidc/callback")
+        self.assertEqual(resp.status_code, 302)
+        self.oauth.oidc.authorize_access_token.assert_not_called()
+        self.assertNotIn("local_user_id", self._session())
+
+
+
+class AdminDelegationRouteTests(_RouteTestBase):
+    """/api/admin/delegations (#259): admin-only grants of device-management
+    rights from one user over another's devices, and their revocation."""
+
+    def setUp(self):
+        super().setUp()
+        self.kid = self._make_user("kid")
+        self.kid_device, _ = sync_state.create_device(self.conn, self.kid, "Kid's phone", "phone")
+        self.conn.commit()
+
+    def _grant(self, grantee, target):
+        return self.client.post("/api/admin/delegations",
+                                json={"grantee_user_id": grantee, "target_user_id": target})
+
+    def test_only_an_admin_can_list_grant_or_revoke(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.get("/api/admin/delegations").status_code, 403)
+        self.assertEqual(self._grant(self.owner, self.kid).status_code, 403)
+        self.assertEqual(self.client.delete("/api/admin/delegations/1").status_code, 403)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM device_delegations").fetchone()[0], 0)
+
+    def test_an_admin_grants_and_the_list_names_both_users(self):
+        _login(self.client, self.admin)
+        resp = self._grant(self.owner, self.kid)
+        self.assertEqual(resp.status_code, 200)
+        listed = self.client.get("/api/admin/delegations").get_json()
+        self.assertEqual([(d["grantee_username"], d["target_username"]) for d in listed],
+                         [("owner", "kid")])
+
+    def test_a_user_cannot_be_delegated_to_themselves(self):
+        _login(self.client, self.admin)
+        self.assertEqual(self._grant(self.kid, self.kid).status_code, 400)
+
+    def test_an_unknown_user_is_refused(self):
+        _login(self.client, self.admin)
+        for grantee, target in ((self.owner, 9999), (9999, self.kid)):
+            resp = self._grant(grantee, target)
+            # The message, not only the status: without the existence check
+            # the insert's foreign key would still answer 400, as a duplicate.
+            self.assertEqual((resp.status_code, resp.get_json()["error"]), (400, "User not found"))
+
+    def test_a_grant_missing_a_user_or_not_a_number_is_a_400_not_a_500(self):
+        _login(self.client, self.admin)
+        for body in ({}, {"grantee_user_id": self.owner}, {"target_user_id": self.kid},
+                     {"grantee_user_id": str(self.owner), "target_user_id": self.kid},
+                     {"grantee_user_id": True, "target_user_id": self.kid}, [1, 2]):
+            with self.subTest(body=body):
+                resp = self.client.post("/api/admin/delegations", json=body)
+                self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM device_delegations").fetchone()[0], 0)
+
+    def test_the_same_grant_twice_is_refused(self):
+        _login(self.client, self.admin)
+        self._grant(self.owner, self.kid)
+        self.assertEqual(self._grant(self.owner, self.kid).status_code, 400)
+
+    def test_revoking_drops_the_grantees_pins_on_the_targets_devices_only(self):
+        _login(self.client, self.admin)
+        self._grant(self.owner, self.kid)
+        delegation = self.conn.execute("SELECT id FROM device_delegations").fetchone()[0]
+        # A second grant, which the revoke must leave alone.
+        self._grant(self.other, self.kid)
+        own_device, _ = sync_state.create_device(self.conn, self.other, "Bob's card", "sdcard")
+        self.conn.execute("INSERT INTO device_pins (user_id, device_id) VALUES (?, ?), (?, ?)",
+                          (self.owner, self.kid_device, self.owner, own_device))
+        self.conn.commit()
+
+        self.assertEqual(self.client.delete(f"/api/admin/delegations/{delegation}").status_code, 200)
+
+        remaining = [tuple(r) for r in self.conn.execute(
+            "SELECT grantee_user_id, target_user_id FROM device_delegations")]
+        self.assertEqual(remaining, [(self.other, self.kid)])
+        pins = [r[0] for r in self.conn.execute(
+            "SELECT device_id FROM device_pins WHERE user_id = ?", (self.owner,))]
+        self.assertEqual(pins, [own_device])
+
+    def test_revoking_an_unknown_grant_is_a_no_op(self):
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.delete("/api/admin/delegations/9999").status_code, 200)
+
+
+class AdminRoonProfilesRouteTests(_RouteTestBase):
+    """/api/admin/roon-profiles (#259): admin-only, and a suggestion only for
+    a user who has no Roon profile mapped yet."""
+
+    def test_only_an_admin_sees_the_roon_profiles(self):
+        _login(self.client, self.owner)
+        with mock.patch.object(main.roon_client, "list_profiles") as listed:
+            self.assertEqual(self.client.get("/api/admin/roon-profiles").status_code, 403)
+        listed.assert_not_called()
+
+    def test_an_unmapped_user_gets_a_close_profile_as_a_suggestion(self):
+        self.conn.execute("UPDATE users SET roon_profile = 'Living room' WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        _login(self.client, self.admin)
+        # "owner" is an exact match, so only the mapped-user rule keeps it
+        # from being suggested to the already-mapped owner.
+        profiles = {"status": "ok", "profiles": [
+            {"title": "Living room"}, {"title": "owner"}, {"title": "bobb"}]}
+        with mock.patch.object(main.roon_client, "list_profiles", return_value=profiles):
+            body = self.client.get("/api/admin/roon-profiles").get_json()
+        users = {u["username"]: u for u in body["users"]}
+        self.assertEqual(users["bob"]["suggested"], "bobb")  # ratio 0.857 >= 0.85
+        # Already mapped: no suggestion, whatever the names look like.
+        self.assertIsNone(users["owner"]["suggested"])
+
+    def test_a_roon_that_cannot_be_reached_is_reported_as_such(self):
+        _login(self.client, self.admin)
+        with mock.patch.object(main.roon_client, "list_profiles",
+                               return_value={"status": "unreachable"}):
+            body = self.client.get("/api/admin/roon-profiles").get_json()
+        self.assertEqual(body, {"status": "unreachable"})
+
+
+
+class DeviceSelfServiceRouteTests(_RouteTestBase):
+    """PATCH /api/device/limit, POST /api/device/missing-tracks and
+    GET /api/device/artist-image (#259): device-token routes, each acting on
+    the calling device only."""
+
+    def setUp(self):
+        super().setUp()
+        self.phone, self.phone_token = sync_state.create_device(
+            self.conn, self.owner, "Phone", "phone", max_size_bytes=5_000)
+        self.other_phone, self.other_token = sync_state.create_device(
+            self.conn, self.other, "Bob's phone", "phone", max_size_bytes=7_000)
+        cur = self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+            "VALUES ('a/b.flac', 'A', 'B', 'C', 1, 0)")
+        self.track = sync_state._new_id(cur)
+        for device in (self.phone, self.other_phone):
+            self.conn.execute(
+                "INSERT INTO device_track_state (device_id, track_id, status) VALUES (?, ?, 'downloaded')",
+                (device, self.track))
+        self.conn.commit()
+
+    def _as(self, token):
+        return {"Authorization": f"Bearer {token}"}
+
+    def _limit(self, device):
+        return self.conn.execute(
+            "SELECT max_size_bytes FROM devices WHERE id = ?", (device,)).fetchone()[0]
+
+    def _status(self, device):
+        return self.conn.execute(
+            "SELECT status FROM device_track_state WHERE device_id = ? AND track_id = ?",
+            (device, self.track)).fetchone()[0]
+
+    def test_a_device_sets_its_own_limit_and_no_one_elses(self):
+        resp = self.client.patch("/api/device/limit", json={"max_size_bytes": 9_000},
+                                 headers=self._as(self.phone_token))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual((self._limit(self.phone), self._limit(self.other_phone)), (9_000, 7_000))
+
+    def test_an_invalid_limit_is_refused_and_nothing_changes(self):
+        resp = self.client.patch("/api/device/limit", json={"max_size_bytes": -1},
+                                 headers=self._as(self.phone_token))
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self._limit(self.phone), 5_000)
+
+    def test_missing_tracks_change_only_the_calling_devices_state(self):
+        resp = self.client.post("/api/device/missing-tracks", json={"redownload": [self.track]},
+                                headers=self._as(self.phone_token))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual((self._status(self.phone), self._status(self.other_phone)),
+                         ("pending", "downloaded"))
+
+    def test_a_missing_track_can_be_excluded(self):
+        self.client.post("/api/device/missing-tracks", json={"exclude": [self.track]},
+                         headers=self._as(self.phone_token))
+        self.assertEqual((self._status(self.phone), self._status(self.other_phone)),
+                         ("excluded", "downloaded"))
+
+    def test_missing_tracks_that_are_not_lists_of_ids_are_a_400_not_a_500(self):
+        for body in ({"redownload": ["x"]}, {"exclude": [1.5]}, {"redownload": [True]},
+                     {"exclude": "1"}, {"redownload": None}, [self.track]):
+            with self.subTest(body=body):
+                resp = self.client.post("/api/device/missing-tracks", json=body,
+                                        headers=self._as(self.phone_token))
+                self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self._status(self.phone), "downloaded")
+
+    def test_missing_tracks_with_neither_list_change_nothing(self):
+        resp = self.client.post("/api/device/missing-tracks", json={},
+                                headers=self._as(self.phone_token))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._status(self.phone), "downloaded")
+
+    def test_without_a_device_token_every_route_is_refused(self):
+        for method, path, body in (("patch", "/api/device/limit", {"max_size_bytes": 1}),
+                                   ("post", "/api/device/missing-tracks", {"redownload": [self.track]}),
+                                   ("get", "/api/device/artist-image?artist=A", None)):
+            with self.subTest(path=path):
+                no_token: dict[str, str] = {}
+                for headers in (no_token, self._as("not-a-token")):
+                    resp = getattr(self.client, method)(path, json=body, headers=headers)
+                    self.assertEqual(resp.status_code, 401)
+        self.assertEqual(self._limit(self.phone), 5_000)
+        self.assertEqual(self._status(self.phone), "downloaded")
+
+    def test_an_artist_image_needs_an_artist_and_reports_when_there_is_none(self):
+        self.assertEqual(self.client.get("/api/device/artist-image",
+                                         headers=self._as(self.phone_token)).status_code, 404)
+        with mock.patch.object(main.artist_images, "get_artist_image", return_value=None):
+            resp = self.client.get("/api/device/artist-image?artist=Nobody",
+                                   headers=self._as(self.phone_token))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_an_artist_image_is_served_and_the_small_one_downscaled(self):
+        with mock.patch.object(main.artist_images, "get_artist_image",
+                               return_value=(b"full", "image/jpeg")), \
+             mock.patch.object(main.artist_images, "downscale",
+                               return_value=(b"small", "image/jpeg")) as downscale:
+            full = self.client.get("/api/device/artist-image?artist=A",
+                                   headers=self._as(self.phone_token))
+            small = self.client.get("/api/device/artist-image?artist=A&size=small",
+                                    headers=self._as(self.phone_token))
+        self.assertEqual((full.status_code, full.data, small.data), (200, b"full", b"small"))
+        downscale.assert_called_once()
+
+
+
+class AboutDocRouteTests(_RouteTestBase):
+    """GET /about/<doc> (#259): two named documents, nothing else."""
+
+    def setUp(self):
+        super().setUp()
+        _login(self.client, self.owner)
+
+    def test_the_license_and_the_notices_are_served_as_plain_text(self):
+        for doc in ("license", "notices"):
+            with self.subTest(doc=doc):
+                resp = self.client.get(f"/about/{doc}")
+                # Both files ship at the repo root and in the image: a missing
+                # one is the regression this test is for, not a reason to skip.
+                self.assertEqual(resp.status_code, 200)
+                self.assertTrue(resp.content_type.startswith("text/plain"))
+
+    def test_anything_but_the_two_names_is_a_404(self):
+        for doc in ("LICENSE", "THIRD_PARTY_NOTICES.md", "..", "main.py", "%2e%2e%2fmain.py", "secret"):
+            with self.subTest(doc=doc):
+                self.assertEqual(self.client.get(f"/about/{doc}").status_code, 404)
+
+
+class TidalLinkRouteTests(_RouteTestBase):
+    """GET /profile/tidal/connect and /profile/tidal/callback (#259): a link
+    only for a signed-in user, stored on that user only, and only when both
+    the code exchange and the profile fetch succeed."""
+
+    def setUp(self):
+        super().setUp()
+        self.tidal = mock.MagicMock()
+        self.tidal.authorize_redirect.return_value = main.redirect("https://tidal.invalid/authorize")
+        self.tidal.authorize_access_token.return_value = {"access_token": "a", "refresh_token": "r"}
+        self.tidal.client_kwargs = {"scope": tidal_client.SCOPES}
+        patcher = mock.patch.object(auth, "_tidal_oauth_client", return_value=self.tidal)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _link(self, user_id):
+        return tuple(self.conn.execute(
+            "SELECT tidal_refresh_token, tidal_user_id, tidal_display_name FROM users WHERE id = ?",
+            (user_id,)).fetchone())
+
+    def _profile_ok(self):
+        return mock.patch.object(main.tidal_client, "get_current_user", return_value={
+            "status": "ok", "user_id": "t-1", "display_name": "Owner on Tidal"})
+
+    def _to_login(self, resp):
+        # A page route: signed out goes to the login page, not to Tidal.
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/login", resp.location)
+
+    def test_connect_signed_out_goes_to_login_not_to_tidal(self):
+        self._to_login(self.client.get("/profile/tidal/connect"))
+        self.tidal.authorize_redirect.assert_not_called()
+
+    def test_connect_without_tidal_configured_is_a_400(self):
+        _login(self.client, self.owner)
+        with mock.patch.object(auth, "_tidal_oauth_client", return_value=None):
+            self.assertEqual(self.client.get("/profile/tidal/connect").status_code, 400)
+
+    def test_connect_redirects_to_tidal(self):
+        _login(self.client, self.owner)
+        resp = self.client.get("/profile/tidal/connect")
+        self.assertEqual((resp.status_code, resp.location), (302, "https://tidal.invalid/authorize"))
+
+    def test_the_callback_links_the_signed_in_user_only(self):
+        _login(self.client, self.owner)
+        with self._profile_ok():
+            resp = self.client.get("/profile/tidal/callback")
+        self.assertEqual(resp.status_code, 302)
+        self.assertNotIn("tidal_error", resp.location)
+        self.assertEqual(self._link(self.owner), ("r", "t-1", "Owner on Tidal"))
+        self.assertEqual(self._link(self.other), (None, None, None))
+
+    def test_the_callback_signed_out_stores_nothing(self):
+        with self._profile_ok():
+            self._to_login(self.client.get("/profile/tidal/callback"))
+        self.tidal.authorize_access_token.assert_not_called()
+        self.assertEqual(self._link(self.owner), (None, None, None))
+
+    def test_a_failed_exchange_or_profile_fetch_stores_nothing(self):
+        _login(self.client, self.owner)
+        cases: dict[str, dict[str, object]] = {
+            "exchange raises": dict(side_effect=ValueError("bad code")),
+            "no refresh token": dict(return_value={"access_token": "a"}),
+        }
+        for name, behaviour in cases.items():
+            with self.subTest(name):
+                self.tidal.authorize_access_token.reset_mock(return_value=True, side_effect=True)
+                self.tidal.authorize_access_token.configure_mock(**behaviour)
+                with self._profile_ok():
+                    resp = self.client.get("/profile/tidal/callback")
+                self.assertIn("tidal_error=1", resp.location)
+        self.tidal.authorize_access_token.reset_mock(return_value=True, side_effect=True)
+        self.tidal.authorize_access_token.return_value = {"access_token": "a", "refresh_token": "r"}
+        with mock.patch.object(main.tidal_client, "get_current_user", return_value={"status": "error"}):
+            resp = self.client.get("/profile/tidal/callback")
+        self.assertIn("tidal_error=1", resp.location)
+        self.assertEqual(self._link(self.owner), (None, None, None))
+
+
+    def _scopes(self, user_id):
+        return self.conn.execute("SELECT tidal_scopes FROM users WHERE id = ?", (user_id,)).fetchone()[0]
+
+    def test_the_callback_stores_the_granted_scope(self):
+        _login(self.client, self.owner)
+        self.tidal.authorize_access_token.return_value = {
+            "access_token": "a", "refresh_token": "r", "scope": "user.read playlists.write"}
+        with self._profile_ok():
+            self.client.get("/profile/tidal/connect")
+            self.client.get("/profile/tidal/callback")
+        self.assertEqual(self._scopes(self.owner), "user.read playlists.write")
+
+    def test_without_a_scope_in_the_answer_the_requested_one_is_stored(self):
+        _login(self.client, self.owner)
+        self.tidal.client_kwargs = {"scope": tidal_client.scopes(True)}
+        with self._profile_ok():
+            self.client.get("/profile/tidal/connect")
+            self.client.get("/profile/tidal/callback")
+        self.assertEqual(self._scopes(self.owner), tidal_client.scopes(True))
+
+    def test_disconnect_clears_the_scope(self):
+        _login(self.client, self.owner)
+        self.conn.execute("UPDATE users SET tidal_refresh_token = 'r', tidal_scopes = 'x' WHERE id = ?",
+                          (self.owner,))
+        self.conn.commit()
+        self.client.delete("/api/profile/tidal")
+        self.assertIsNone(self._scopes(self.owner))
+
+
+class TidalWriteScopeTests(_RouteTestBase):
+    """playlists.write is requested only once the admin says their Tidal app
+    has it; Profile asks for a reconnect when a link predates it."""
+
+    def setUp(self):
+        super().setUp()
+        db.set_config(self.conn, "tidal_client_id", "cid")
+        db.set_config(self.conn, "tidal_client_secret", "csecret")
+        self.conn.commit()
+        main.oauth._clients.pop("tidal", None)
+        self.addCleanup(main.oauth._clients.pop, "tidal", None)
+        _login(self.client, self.admin)
+
+    def _registered_scope(self):
+        with db.connection() as conn:
+            return auth._tidal_oauth_client(conn).client_kwargs["scope"]
+
+    def _link(self, scopes):
+        self.conn.execute("UPDATE users SET tidal_refresh_token = 'r', tidal_scopes = ? WHERE id = ?",
+                          (scopes, self.admin))
+        self.conn.commit()
+
+    def _profile(self):
+        p = self.client.get("/api/profile").get_json()
+        return p["tidal_can_share"], p["tidal_needs_reconnect"]
+
+    def test_off_by_default_requests_the_read_scopes_only(self):
+        self.assertEqual(self._registered_scope(), tidal_client.SCOPES)
+        self.assertFalse(self.client.get("/api/admin/config").get_json()["tidal_playlists_write"])
+
+    def test_ticking_the_box_re_registers_with_the_write_scope(self):
+        self.assertNotIn("playlists.write", self._registered_scope())
+        resp = self.client.put("/api/admin/config", json={"tidal_playlists_write": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._registered_scope().split(), tidal_client.SCOPES.split() + ["playlists.write"])
+        self.assertTrue(self.client.get("/api/admin/config").get_json()["tidal_playlists_write"])
+        self.client.put("/api/admin/config", json={"tidal_playlists_write": False})
+        self.assertEqual(self._registered_scope(), tidal_client.SCOPES)
+
+    def test_an_unchanged_box_keeps_the_cached_client(self):
+        self.client.put("/api/admin/config", json={"tidal_playlists_write": True})
+        self._registered_scope()
+        first = main.oauth._clients["tidal"]
+        self.client.put("/api/admin/config", json={"tidal_playlists_write": True})
+        self.assertIs(main.oauth._clients["tidal"], first)
+
+    def test_profile_flags_follow_the_box_and_the_grant(self):
+        self.assertEqual(self._profile(), (False, False))       # not linked, box off
+        self._link(tidal_client.SCOPES)
+        self.assertEqual(self._profile(), (False, False))       # box off: no prompt at all
+        db.set_config(self.conn, "tidal_playlists_write", "1")
+        self.conn.commit()
+        self.assertEqual(self._profile(), (False, True))        # read-only link: reconnect
+        self._link(None)
+        self.assertEqual(self._profile(), (False, True))        # link from before scopes were kept
+        self._link(tidal_client.scopes(True))
+        self.assertEqual(self._profile(), (True, False))
+        self.conn.execute("UPDATE users SET tidal_refresh_token = NULL WHERE id = ?", (self.admin,))
+        self.conn.commit()
+        self.assertEqual(self._profile(), (False, False))       # not linked: Connect, not reconnect
+
+    def test_has_write_scope_matches_whole_words(self):
+        self.assertTrue(tidal_client.has_write_scope("a playlists.write b"))
+        self.assertFalse(tidal_client.has_write_scope("playlists.writer"))
+        self.assertFalse(tidal_client.has_write_scope(None))
+
+
+class TidalShareRouteTests(_RouteTestBase):
+    """/api/tidal-shares*: invitations, admin push, ending, and who may do
+    each. Nothing here calls Tidal; the sync does (test_tidal_shares)."""
+
+    def setUp(self):
+        super().setUp()
+        db.set_config(self.conn, "tidal_playlists_write", "1")
+        for uid in (self.owner, self.other, self.admin):
+            self.conn.execute("UPDATE users SET tidal_refresh_token = 'r', tidal_scopes = ? WHERE id = ?",
+                              (tidal_client.scopes(True), uid))
+        cur = self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, source_playlist_id, owner_user_id, shared, "
+            "last_synced_at) VALUES ('Road Trip', 'tidal', 'tid-1', ?, 0, datetime('now'))", (self.owner,))
+        self.playlist = cur.lastrowid
+        self.conn.execute(
+            "INSERT INTO unresolved_playlist_tracks (playlist_id, position, artist, title) "
+            "VALUES (?, 0, 'A', 'T'), (?, 1, 'B', 'U')", (self.playlist, self.playlist))
+        self.conn.commit()
+
+    def _create(self, who, **body):
+        _login(self.client, who)
+        payload = {"playlist_id": self.playlist, "recipient_user_id": self.other}
+        payload.update(body)
+        return self.client.post("/api/tidal-shares", json=payload)
+
+    def _status(self, sid):
+        return self.conn.execute("SELECT status FROM tidal_shares WHERE id = ?", (sid,)).fetchone()[0]
+
+    def test_everything_is_hidden_while_sharing_is_off(self):
+        db.set_config(self.conn, "tidal_playlists_write", "0")
+        self.conn.commit()
+        _login(self.client, self.owner)
+        for method, url in (("GET", "/api/tidal-shares"), ("GET", "/api/tidal-shares/recipients"),
+                            ("POST", "/api/tidal-shares"), ("POST", "/api/tidal-shares/1/accept"),
+                            ("POST", "/api/tidal-shares/1/decline"), ("POST", "/api/tidal-shares/1/end"),
+                            ("PATCH", "/api/tidal-shares/1")):
+            with self.subTest(url=url, method=method):
+                self.assertEqual(self.client.open(url, method=method, json={}).status_code, 404)
+
+    def test_an_invitation_starts_pending_with_the_title_and_track_count(self):
+        resp = self._create(self.owner, two_way=True)
+        self.assertEqual(resp.status_code, 201)
+        share = resp.get_json()
+        self.assertEqual((share["status"], share["title"], share["two_way"], share["track_count"]),
+                         ("pending", "Road Trip", True, 2))
+        self.assertEqual(share["owner"]["username"], "owner")
+        self.assertIsNone(share["accepted_at"])
+        _login(self.client, self.other)
+        incoming = self.client.get("/api/tidal-shares").get_json()["incoming"]
+        self.assertEqual([s["id"] for s in incoming], [share["id"]])
+
+    def test_only_your_own_tidal_playlist_can_be_shared(self):
+        roon = self._make_playlist("Roon one", owner_user_id=self.owner)
+        self.assertEqual(self._create(self.owner, playlist_id=roon).status_code, 404)
+        self.assertEqual(self._create(self.other, recipient_user_id=self.admin).status_code, 404)
+        self.assertEqual(self._create(self.owner, recipient_user_id=self.owner).status_code, 400)
+        self.assertEqual(self._create(self.owner, recipient_user_id=9999).status_code, 404)
+        self.assertEqual(self._create(self.owner, playlist_id="x").status_code, 400)
+
+    def test_one_live_share_per_playlist_and_recipient(self):
+        first = self._create(self.owner).get_json()
+        self.assertEqual(self._create(self.owner).status_code, 409)
+        self.client.post(f"/api/tidal-shares/{first['id']}/end")
+        self.assertEqual(self._create(self.owner).status_code, 201)
+
+    def test_only_an_admin_can_push(self):
+        self.assertEqual(self._create(self.owner, push=True).status_code, 403)
+        self.conn.execute("UPDATE playlists SET owner_user_id = ? WHERE id = ?", (self.admin, self.playlist))
+        self.conn.commit()
+        share = self._create(self.admin, push=True).get_json()
+        self.assertEqual(share["status"], "active")
+        self.assertIsNotNone(share["accepted_at"])
+
+    def test_only_the_recipient_answers_and_only_once(self):
+        sid = self._create(self.owner).get_json()["id"]
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/accept").status_code, 403)
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/accept").status_code, 403)
+        _login(self.client, self.other)
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/accept").status_code, 200)
+        self.assertEqual(self._status(sid), "active")
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/accept").status_code, 409)
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/decline").status_code, 409)
+
+    def test_declining_ends_it(self):
+        sid = self._create(self.owner).get_json()["id"]
+        for who in (self.owner, self.admin):
+            _login(self.client, who)
+            self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/decline").status_code, 403)
+        self.assertEqual(self._status(sid), "pending")
+        _login(self.client, self.other)
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/decline").status_code, 200)
+        self.assertEqual(self._status(sid), "ended")
+
+    def test_either_side_or_an_admin_ends_it_and_no_one_else(self):
+        third = self._make_user("carol")
+        for who in (self.owner, self.other, self.admin):
+            with self.subTest(who=who):
+                sid = self._create(self.owner).get_json()["id"]
+                _login(self.client, third)
+                self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/end").status_code, 403)
+                _login(self.client, who)
+                self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/end").status_code, 200)
+                self.assertEqual(self._status(sid), "ended")
+                self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/end").status_code, 409)
+
+    def test_only_the_owner_switches_two_way(self):
+        sid = self._create(self.owner).get_json()["id"]
+        _login(self.client, self.other)
+        self.assertEqual(self.client.patch(f"/api/tidal-shares/{sid}", json={"two_way": True}).status_code, 403)
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.patch(f"/api/tidal-shares/{sid}", json={}).status_code, 400)
+        resp = self.client.patch(f"/api/tidal-shares/{sid}", json={"two_way": True})
+        self.assertTrue(resp.get_json()["two_way"])
+
+    def _ended_with_copy(self):
+        sid = self._create(self.owner).get_json()["id"]
+        self.conn.execute("UPDATE tidal_shares SET status = 'ended', copy_remote_id = 'copy-1' WHERE id = ?", (sid,))
+        self.conn.commit()
+        return sid
+
+    def test_only_the_owner_asks_to_delete_the_original_of_an_ended_share(self):
+        sid = self._ended_with_copy()
+        for who in (self.other, self.admin):
+            _login(self.client, who)
+            self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/delete-original").status_code, 403)
+        _login(self.client, self.owner)
+        resp = self.client.post(f"/api/tidal-shares/{sid}/delete-original")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNotNone(resp.get_json()["delete_original_requested_at"])
+        resp = self.client.delete(f"/api/tidal-shares/{sid}/delete-original")
+        self.assertIsNone(resp.get_json()["delete_original_requested_at"])
+
+    def test_the_tracks_that_kept_the_original_are_shown_until_asked_again(self):
+        sid = self._ended_with_copy()
+        self.conn.execute("UPDATE tidal_shares SET last_error = 'copy_lacks_tracks', delete_blocked_tracks = ? "
+                          "WHERE id = ?", ('[{"track_id": "u", "position": 2}]', sid))
+        self.conn.commit()
+        _login(self.client, self.owner)
+        share = self.client.get("/api/tidal-shares").get_json()["outgoing"][0]
+        self.assertEqual(share["delete_blocked_tracks"], [{"track_id": "u", "position": 2}])
+        resp = self.client.post(f"/api/tidal-shares/{sid}/delete-original")
+        self.assertEqual(resp.get_json()["delete_blocked_tracks"], [])
+
+    def test_no_deletion_can_be_asked_while_the_share_is_live(self):
+        # A request taken now would wait, and the first pass after the share
+        # ends would delete the original with no fresh decision.
+        for status in ("pending", "active"):
+            with self.subTest(status=status):
+                sid = self._create(self.owner).get_json()["id"]
+                self.conn.execute("UPDATE tidal_shares SET status = ?, copy_remote_id = 'copy-1' WHERE id = ?",
+                                  (status, sid))
+                self.conn.commit()
+                _login(self.client, self.owner)
+                resp = self.client.post(f"/api/tidal-shares/{sid}/delete-original")
+                self.assertEqual(resp.status_code, 409)
+                self.assertIsNone(self.conn.execute(
+                    "SELECT delete_original_requested_at FROM tidal_shares WHERE id = ?", (sid,)).fetchone()[0])
+                self.client.post(f"/api/tidal-shares/{sid}/end")
+
+    def test_deleting_the_original_is_refused_while_it_is_still_needed(self):
+        live = self._create(self.owner).get_json()["id"]
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{live}/delete-original").status_code, 409)
+        self.client.post(f"/api/tidal-shares/{live}/end")
+        # Ended, but no copy was ever made: the original is the only one.
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{live}/delete-original").status_code, 409)
+        sid = self._ended_with_copy()
+        carol = self._make_user("carol")
+        _login(self.client, self.owner)
+        self.client.post("/api/tidal-shares", json={"playlist_id": self.playlist, "recipient_user_id": carol})
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/delete-original").status_code, 409)
+        self.conn.execute("UPDATE tidal_shares SET status = 'ended' WHERE recipient_user_id = ?", (carol,))
+        self.conn.execute("UPDATE tidal_shares SET original_deleted_at = datetime('now') WHERE id = ?", (sid,))
+        self.conn.commit()
+        self.assertEqual(self.client.post(f"/api/tidal-shares/{sid}/delete-original").status_code, 409)
+
+    def test_a_third_user_sees_neither_side(self):
+        self._create(self.owner)
+        _login(self.client, self._make_user("carol"))
+        self.assertEqual(self.client.get("/api/tidal-shares").get_json(), {"outgoing": [], "incoming": []})
+
+    def test_recipients_are_other_linked_users_with_their_readiness(self):
+        self.conn.execute("UPDATE users SET tidal_scopes = ? WHERE id = ?", (tidal_client.SCOPES, self.other))
+        unlinked = self._make_user("carol")
+        self.conn.commit()
+        _login(self.client, self.owner)
+        got = self.client.get("/api/tidal-shares/recipients").get_json()
+        self.assertEqual(got, [{"id": self.admin, "username": "admin", "can_receive": True},
+                               {"id": self.other, "username": "bob", "can_receive": False}])
+        self.assertNotIn(unlinked, [r["id"] for r in got])
+
+
+class HistoryStatusRouteTests(_RouteTestBase):
+    """GET /api/lastfm/status and /api/listenbrainz/status (#259): not
+    configured answers without calling the service; configured checks the
+    signed-in user's own account."""
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute(
+            "UPDATE users SET lastfm_username = 'bob_fm', lastfm_api_key = 'bobs-key', "
+            "listenbrainz_username = 'bob_lb' WHERE id = ?", (self.other,))
+        self.conn.commit()
+        _login(self.client, self.owner)
+
+    def test_not_configured_says_so_without_calling_either_service(self):
+        with mock.patch.object(main.lastfm, "check_connection") as fm, \
+             mock.patch.object(main.listenbrainz, "check_connection") as lb:
+            self.assertEqual(self.client.get("/api/lastfm/status").get_json(),
+                             {"configured": False, "ok": False})
+            self.assertEqual(self.client.get("/api/listenbrainz/status").get_json(),
+                             {"configured": False, "ok": False})
+        fm.assert_not_called()
+        lb.assert_not_called()
+
+    def test_lastfm_checks_the_users_own_account_and_key(self):
+        self.conn.execute("UPDATE users SET lastfm_username = 'own_fm', lastfm_api_key = 'own-key' "
+                          "WHERE id = ?", (self.owner,))
+        # A default exists too: the user's own key has to win over it.
+        db.set_config(self.conn, "lastfm_api_key_default", "the-default")
+        self.conn.commit()
+        with mock.patch.object(main.lastfm, "check_connection", return_value=True) as fm:
+            body = self.client.get("/api/lastfm/status").get_json()
+        self.assertEqual(body, {"configured": True, "ok": True})
+        self.assertEqual(fm.call_args.args[:2], ("own_fm", "own-key"))
+
+    def test_lastfm_without_a_key_of_its_own_uses_the_default(self):
+        self.conn.execute("UPDATE users SET lastfm_username = 'own_fm' WHERE id = ?", (self.owner,))
+        db.set_config(self.conn, "lastfm_api_key_default", "the-default")
+        self.conn.commit()
+        with mock.patch.object(main.lastfm, "check_connection", return_value=False) as fm:
+            body = self.client.get("/api/lastfm/status").get_json()
+        self.assertEqual(body, {"configured": True, "ok": False})
+        self.assertEqual(fm.call_args.args[:2], ("own_fm", "the-default"))
+
+    def test_listenbrainz_checks_the_users_own_account(self):
+        self.conn.execute("UPDATE users SET listenbrainz_username = 'own_lb' WHERE id = ?", (self.owner,))
+        self.conn.commit()
+        with mock.patch.object(main.listenbrainz, "check_connection", return_value=True) as lb:
+            body = self.client.get("/api/listenbrainz/status").get_json()
+        self.assertEqual(body, {"configured": True, "ok": True})
+        self.assertEqual(lb.call_args.args[0], "own_lb")
+
+
+class SetupStatusRouteTests(_RouteTestBase):
+    """GET /api/setup/status (#259): admin-only."""
+
+    def test_a_non_admin_is_refused(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.get("/api/setup/status").status_code, 403)
+
+    def test_an_admin_sees_whether_setup_is_complete(self):
+        _login(self.client, self.admin)
+        with mock.patch.object(auth, "_music_root_is_readonly", return_value=True):
+            before = self.client.get("/api/setup/status").get_json()
+            db.set_config(self.conn, "setup_completed", "1")
+            self.conn.commit()
+            after = self.client.get("/api/setup/status").get_json()
+        self.assertEqual((before["completed"], after["completed"]), (False, True))
+        self.assertFalse(after["music_root_writable"])
+
+
+
+class OidcLoginRouteTests(_RouteTestBase):
+    """GET /oidc/login (#259): starts the IdP flow only in oidc mode, and an
+    unreachable IdP is a 503 page rather than a 500."""
+
+    def setUp(self):
+        super().setUp()
+        self.oauth = mock.MagicMock()
+        self.oauth.oidc.authorize_redirect.return_value = main.redirect("https://idp.invalid/authorize")
+        patcher = mock.patch.object(auth, "oauth", self.oauth)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_outside_oidc_mode_it_goes_to_the_login_page(self):
+        with mock.patch.object(settings, "AUTH_MODE", "local"):
+            resp = self.client.get("/oidc/login")
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/login", resp.location)
+        self.oauth.oidc.authorize_redirect.assert_not_called()
+
+    def test_in_oidc_mode_it_redirects_to_the_identity_provider(self):
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
+            resp = self.client.get("/oidc/login")
+        self.assertEqual((resp.status_code, resp.location), (302, "https://idp.invalid/authorize"))
+
+    def test_an_unreachable_identity_provider_is_a_503_page(self):
+        self.oauth.oidc.authorize_redirect.side_effect = ConnectionError("down")
+        with mock.patch.object(settings, "AUTH_MODE", "oidc"):
+            resp = self.client.get("/oidc/login")
+        self.assertEqual(resp.status_code, 503)
+
+
+class ProviderPairingRouteTests(_RouteTestBase):
+    """GET /api/provider/status and POST /api/provider/pair (#259, #378):
+    status for any signed-in user, pairing for an admin only, and both
+    refused when signed out."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = mock.MagicMock()
+        self.provider.status.return_value = {"status": "paired"}
+        self.provider.retry_pairing.return_value = {"status": "pairing"}
+        patcher = mock.patch.object(playlists, "_active_provider", return_value=self.provider)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_signed_out_neither_route_reaches_the_provider(self):
+        self.assertEqual(self.client.get("/api/provider/status").status_code, 401)
+        self.assertEqual(self.client.post("/api/provider/pair").status_code, 401)
+        self.provider.status.assert_not_called()
+        self.provider.retry_pairing.assert_not_called()
+
+    def test_any_signed_in_user_reads_the_status(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.get("/api/provider/status").get_json(), {"status": "paired"})
+
+    def test_a_non_admin_cannot_start_a_pairing(self):
+        _login(self.client, self.owner)
+        self.assertEqual(self.client.post("/api/provider/pair").status_code, 403)
+        self.provider.retry_pairing.assert_not_called()
+
+    def test_an_admin_starts_a_pairing(self):
+        _login(self.client, self.admin)
+        self.assertEqual(self.client.post("/api/provider/pair").get_json(), {"status": "pairing"})
+        self.provider.retry_pairing.assert_called_once()
+
+
+class SetupMusicRootRouteTests(_RouteTestBase):
+    """POST /api/setup/music-root (#259): admin-only; a folder that doesn't
+    exist is refused; check_only checks without saving."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.folder = tmp.name
+        patcher = mock.patch.object(auth, "_music_root_is_readonly", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _saved(self):
+        return db.get_config(self.conn, "music_root")
+
+    def test_a_non_admin_is_refused_and_nothing_is_saved(self):
+        _login(self.client, self.owner)
+        resp = self.client.post("/api/setup/music-root", json={"path": self.folder})
+        self.assertEqual(resp.status_code, 403)
+        self.assertIsNone(self._saved())
+
+    def test_a_folder_that_does_not_exist_is_refused(self):
+        _login(self.client, self.admin)
+        for path in ("", "/nonexistent/music", f"{self.folder}/missing"):
+            with self.subTest(path=path):
+                resp = self.client.post("/api/setup/music-root", json={"path": path})
+                self.assertEqual(resp.status_code, 400)
+        self.assertIsNone(self._saved())
+
+    def test_check_only_checks_without_saving_and_a_plain_post_saves(self):
+        _login(self.client, self.admin)
+        checked = self.client.post("/api/setup/music-root",
+                                   json={"path": self.folder, "check_only": True})
+        self.assertEqual((checked.status_code, self._saved()), (200, None))
+        saved = self.client.post("/api/setup/music-root", json={"path": self.folder})
+        self.assertEqual((saved.status_code, self._saved()), (200, self.folder))
+
+
+class AppRecentlyRouteTests(_RouteTestBase):
+    """GET /api/app/library/recently-{added,released} (#259): App API routes
+    act as the owner of the device whose token is sent, and pass ?months on."""
+
+    def setUp(self):
+        super().setUp()
+        self.device, self.token = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        self.conn.commit()
+
+    def test_both_lists_act_as_the_devices_owner_with_the_months_asked(self):
+        for path, helper in (("/api/app/library/recently-added", "_recently_added_for"),
+                             ("/api/app/library/recently-released", "_recently_released_for")):
+            with self.subTest(path=path), \
+                 mock.patch.object(app_api, helper, return_value=[{"album": "X"}]) as called:
+                default = self.client.get(path, headers={"Authorization": f"Bearer {self.token}"})
+                asked = self.client.get(f"{path}?months=12",
+                                        headers={"Authorization": f"Bearer {self.token}"})
+                self.assertEqual((default.get_json(), asked.status_code), ([{"album": "X"}], 200))
+                self.assertEqual([c.args[1:] for c in called.call_args_list],
+                                 [(self.owner, 3), (self.owner, 12)])
+
+    def test_without_a_device_token_both_are_refused(self):
+        for path in ("/api/app/library/recently-added", "/api/app/library/recently-released"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 401)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelectionAlbumCountTests(_RouteTestBase):
+    """The album counts on a list of selections: one query however long the
+    list, and the answers a query per selection gave."""
+
+    # (album, artist, album_artist): a whole album, a guest on it, one with no
+    # album artist tag, a name two album artists share, and a guest on both.
+    TRACKS = [
+        ("Solo", "One", "One"), ("Solo", "One", "One"), ("Solo", "Guest", "One"),
+        ("Untagged", "Two", None), ("Untagged", "Two", None),
+        ("Shared", "Beta", "Beta"), ("Shared", "Guest", "Beta"), ("Shared", "Guest", "Beta"),
+        ("Shared", "Alpha", "Alpha"), ("Shared", "Guest", "Alpha"),
+        ("Pipes", "A||B", "A||B"), ("With || bars", "One", "One"),
+    ]
+    TARGETS = ["One||Solo", "Guest||Solo", "Two||Untagged", "Beta||Shared", "Alpha||Shared",
+               "Guest||Shared", "Nobody||Solo", "One||Gone", "A||B||Pipes", "One||With || bars", "Gone"]
+
+    def setUp(self):
+        super().setUp()
+        self.device, _ = sync_state.create_device(self.conn, self.owner, "Phone", "phone")
+        for i, (album, artist, album_artist) in enumerate(self.TRACKS):
+            self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, album_artist, title, size, mtime) "
+                "VALUES (?, ?, ?, ?, 'T', 1, 0)", (f"{i}.flac", artist, album, album_artist))
+        self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime, deleted_at) "
+            "VALUES ('gone.flac', 'One', 'Solo', 'T', 1, 0, datetime('now'))")
+        self.conn.commit()
+
+    def _per_selection(self, sel):
+        """What each selection used to run for itself, as the reference."""
+        out = {"appears_on": None, "album_tracks": None}
+        if sel["type"] != "album":
+            return out
+        artist, _, album = sel["target"].partition("||")
+        expr = "COALESCE(album_artist, artist)"
+        whole = self.conn.execute(
+            f"SELECT COUNT(*) FROM tracks WHERE deleted_at IS NULL AND album = ? AND {expr} = ?",
+            (album, artist)).fetchone()[0]
+        if whole:
+            return {**out, "album_tracks": whole}
+        row = self.conn.execute(
+            f"SELECT {expr} AS album_artist, COUNT(*) AS n FROM tracks WHERE deleted_at IS NULL "
+            "AND album = ? AND artist = ? GROUP BY album_artist LIMIT 1", (album, artist)).fetchone()
+        if row is None:
+            return out
+        of = self.conn.execute(
+            f"SELECT COUNT(*) FROM tracks WHERE deleted_at IS NULL AND album = ? AND {expr} = ?",
+            (album, row["album_artist"])).fetchone()[0]
+        return {**out, "appears_on": {"album_artist": row["album_artist"], "tracks": row["n"], "of": of}}
+
+    def _select(self, targets):
+        for target in targets:
+            sync_state.create_selection(self.conn, "album" if "||" in target else "artist", target,
+                                        self.owner, [self.device])
+
+    def test_the_answers_are_the_ones_a_query_per_selection_gave(self):
+        self._select(self.TARGETS)
+        got = main._selections_for(self.conn, self.owner)
+        self.assertEqual({s["target"] for s in got}, set(self.TARGETS))
+        for sel in got:
+            with self.subTest(target=sel["target"]):
+                self.assertEqual({k: sel[k] for k in ("appears_on", "album_tracks")}, self._per_selection(sel))
+        # The reference can't be trusted to have meant anything by itself.
+        by_target = {s["target"]: s for s in got}
+        self.assertEqual(by_target["One||Solo"]["album_tracks"], 3)
+        self.assertEqual(by_target["Guest||Shared"]["appears_on"], {"album_artist": "Alpha", "tracks": 1, "of": 2})
+        self.assertIsNone(by_target["Nobody||Solo"]["appears_on"])
+
+    def _queries_on_tracks(self, targets):
+        self._select(targets)
+        seen: list[str] = []
+        self.conn.set_trace_callback(seen.append)
+        try:
+            main._selections_for(self.conn, self.owner)
+        finally:
+            self.conn.set_trace_callback(None)
+        return sum(" FROM tracks " in q for q in seen)
+
+    def test_the_query_count_does_not_grow_with_the_list(self):
+        self.assertEqual(self._queries_on_tracks(self.TARGETS[:2]), 1)
+        self.assertEqual(self._queries_on_tracks(self.TARGETS), 1)
+
+    def test_no_album_selection_reads_no_tracks(self):
+        self.assertEqual(self._queries_on_tracks(["Gone"]), 0)
 
 
 class AppApiAuthTests(_RouteTestBase):
@@ -7818,9 +11958,9 @@ class AppApiAuthTests(_RouteTestBase):
 
     def test_require_app_admin_is_403_for_a_non_admin_and_silent_for_an_admin(self):
         with main.app.test_request_context("/api/app/whoami"):
-            main._require_app_admin(True)
+            app_api._require_app_admin(True)
             with self.assertRaises(Exception) as cm:
-                main._require_app_admin(False)
+                app_api._require_app_admin(False)
             self.assertEqual(getattr(cm.exception, "code", None), 403)
 
     def test_session_routes_stay_gated_and_a_device_token_does_not_open_them(self):
@@ -7870,13 +12010,14 @@ class AppApiAuthTests(_RouteTestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["app_api"], main.APP_API_VERSION)
 
-    def test_the_level_is_two_since_the_playlist_section(self):
+    def test_the_level_is_four_since_removing_a_selection(self):
         # Pinned rather than read from the constant: the Android app shows its
-        # Playlists tab only on level 2 or above, so a level that slid back
-        # would hide the tab on a server that has every route it needs.
+        # Playlists tab only on level 2 or above, and will offer playlist
+        # authoring only on level 3, and removing a selection only on level 4,
+        # so a level that slid back would hide what a server has every route for.
         resp = self.client.get(
             "/api/device/info", headers={"Authorization": f"Bearer {self.token}"})
-        self.assertEqual(resp.get_json()["app_api"], 2)
+        self.assertEqual(resp.get_json()["app_api"], 6)
 
     def test_every_route_under_the_prefix_refuses_an_unauthenticated_request(self):
         # The login gate exempts /api/app/ wholesale, so a route added under
@@ -7913,7 +12054,7 @@ class DashboardWidgetsMonthsTests(unittest.TestCase):
     default applies, rather than persisted for another client to read."""
 
     def test_in_range_months_kept(self):
-        result = main._normalize_dashboard_widgets(
+        result = web_common._normalize_dashboard_widgets(
             {"settings": {"recently_added": {"months": 6}, "recently_released": {"months": 24}}})
         self.assertEqual(result["settings"]["recently_added"]["months"], 6)
         self.assertEqual(result["settings"]["recently_released"]["months"], 24)
@@ -7921,24 +12062,24 @@ class DashboardWidgetsMonthsTests(unittest.TestCase):
     def test_out_of_range_months_dropped(self):
         for bad in (0, 25, -3, 99):
             with self.subTest(months=bad):
-                result = main._normalize_dashboard_widgets(
+                result = web_common._normalize_dashboard_widgets(
                     {"settings": {"recently_added": {"months": bad}}})
                 self.assertNotIn("months", result["settings"]["recently_added"])
 
     def test_non_integer_months_dropped(self):
         for bad in ("6", 6.5, True, None, [6]):
             with self.subTest(months=bad):
-                result = main._normalize_dashboard_widgets(
+                result = web_common._normalize_dashboard_widgets(
                     {"settings": {"recently_added": {"months": bad}}})
                 self.assertNotIn("months", result["settings"]["recently_added"])
 
     def test_months_on_a_widget_without_that_setting_dropped(self):
-        result = main._normalize_dashboard_widgets({"settings": {"devices": {"months": 3}}})
+        result = web_common._normalize_dashboard_widgets({"settings": {"devices": {"months": 3}}})
         self.assertNotIn("devices", result["settings"])
 
     def test_unknown_settings_keys_dropped(self):
-        result = main._normalize_dashboard_widgets({"settings": {"theme": "dark", "cover_limit": 30}})
-        self.assertEqual(result["settings"], {"suggestions": {"cover_limit": 30}, "recently_added": {"cover_limit": 30}, "recently_released": {"cover_limit": 30}, "cover_limit": 30})
+        result = web_common._normalize_dashboard_widgets({"settings": {"theme": "dark", "cover_limit": 30}})
+        self.assertEqual(result["settings"], {"playlists": {"limit": 3}, "suggestions": {"cover_limit": 30}, "recently_added": {"cover_limit": 30}, "recently_released": {"cover_limit": 30}, "cover_limit": 30})
 
 
 class DashboardWidgetsPatchRouteTests(_RouteTestBase):
@@ -8064,10 +12205,16 @@ class AppApiLibraryTests(_RouteTestBase):
         _login(self.client, user or self.owner)
         return self.client.get(path)
 
-    def test_artists_match_the_session_route(self):
+    def test_artists_are_grouped_by_track_artist(self):
+        # The App API keeps the track-artist grouping until the Android app
+        # shows "Also appears on" (#240); the web Library groups by album
+        # artist (LibraryAlbumArtistTests). Without compilations the two
+        # agree on everything the App API returns.
         resp = self._app("/api/app/library/artists")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.get_json(), self._session("/api/library/artists").get_json())
+        web = {a["artist"]: a for a in self._session("/api/library/artists").get_json()}
+        for a in resp.get_json():
+            self.assertEqual({k: web[a["artist"]][k] for k in a}, a)
         by_name = {a["artist"]: a for a in resp.get_json()}
         self.assertEqual(by_name["Alpha"],
                          {"artist": "Alpha", "track_count": 3, "album_count": 2, "albums": ["X", "Y"]})
@@ -8107,13 +12254,23 @@ class AppApiLibraryTests(_RouteTestBase):
             self.assertEqual(self._app("/api/app/library/similar-artists").get_json(), [])
         similar.assert_not_called()
 
+    def test_the_web_cover_route_serves_the_small_variant_on_size_small(self):
+        with mock.patch.object(web_common, "_contained", return_value=Path("/music/a/x/1.flac")), \
+                mock.patch.object(web_common.covers, "get_cover", return_value=(b"FULL", "image/png")), \
+                mock.patch.object(web_common.covers, "get_small_cover", return_value=(b"SMALL", "image/jpeg")):
+            full = self._session("/api/library/cover?artist=Alpha&album=X")
+            small = self._session("/api/library/cover?artist=Alpha&album=X&size=small")
+            other = self._session("/api/library/cover?artist=Alpha&album=X&size=huge")
+        self.assertEqual((full.data, small.data, other.data), (b"FULL", b"SMALL", b"FULL"))
+        self.assertEqual(small.mimetype, "image/jpeg")
+
     def test_cover_404s_for_an_unknown_album_with_a_json_error(self):
         resp = self._app("/api/app/library/cover?artist=Alpha&album=Nope")
         self.assertEqual(resp.status_code, 404)
         self.assertIn("error", resp.get_json())
 
     def test_cover_serves_the_cached_bytes_with_the_cache_header(self):
-        with mock.patch.object(main, "_contained", return_value=Path("/music/a/x/1.flac")), \
+        with mock.patch.object(web_common, "_contained", return_value=Path("/music/a/x/1.flac")), \
                 mock.patch.object(main.covers, "get_cover", return_value=(b"JPEGBYTES", "image/jpeg")):
             resp = self._app("/api/app/library/cover?artist=Alpha&album=X")
             via_session = self._session("/api/library/cover?artist=Alpha&album=X")
@@ -8137,6 +12294,30 @@ class AppApiLibraryTests(_RouteTestBase):
         with mock.patch.object(main.artist_images, "get_artist_image", return_value=None):
             self.assertEqual(self._app("/api/app/library/artist-image?artist=Alpha").status_code, 404)
         self.assertEqual(self._app("/api/app/library/artist-image").status_code, 404)
+
+    def test_album_tracks_match_the_session_route(self):
+        self._track("t/2.flac", artist="Guest", album_artist="Tracked", album="Two Discs",
+                    title="Last", disc_no=2, track_no=1, duration=61)
+        self._track("t/1.flac", artist="Tracked", album_artist="Tracked", album="Two Discs",
+                    title="First", disc_no=1, track_no=1)
+        self._track("t/gone.flac", artist="Tracked", album_artist="Tracked", album="Two Discs",
+                    title="Deleted", disc_no=1, track_no=2)
+        self.conn.execute("UPDATE tracks SET deleted_at = datetime('now') WHERE title = 'Deleted'")
+        self.conn.commit()
+        path = "/api/library/album-tracks?artist=Tracked&album=Two%20Discs"
+        resp = self._app(path.replace("/api/", "/api/app/", 1))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), self._session(path).get_json())
+        self.assertEqual([(t["title"], t["artist"], t["disc_no"], t["duration"]) for t in resp.get_json()],
+                         [("First", "Tracked", 1, None), ("Last", "Guest", 2, 61)])
+
+    def test_album_tracks_of_an_album_not_held_are_empty(self):
+        resp = self._app("/api/app/library/album-tracks?artist=Alpha&album=Nothing")
+        self.assertEqual((resp.status_code, resp.get_json()), (200, []))
+
+    def test_album_tracks_need_the_device_token(self):
+        resp = self.client.get("/api/app/library/album-tracks?artist=Alpha&album=X")
+        self.assertEqual(resp.status_code, 401)
 
     def test_the_session_routes_still_require_a_session(self):
         for path in ("/api/library/artists", "/api/library/albums?artist=Alpha",
@@ -8225,7 +12406,9 @@ class AppApiBasketTests(_RouteTestBase):
         app_dev = self._app("GET", "/api/app/devices").get_json()
         app_use = self._app("GET", f"/api/app/devices/{self.phone}/usage").get_json()
         _login(self.client, self.owner)
-        self.assertEqual(app_sel, self.client.get("/api/selections").get_json())
+        # The app's list also says what to show for each.
+        self.assertEqual([{k: v for k, v in r.items() if k != "title"} for r in app_sel],
+                         self.client.get("/api/selections").get_json())
         self.assertEqual(app_dev, self.client.get("/api/devices").get_json())
         self.assertEqual(app_use, self.client.get(f"/api/devices/{self.phone}/usage").get_json())
         self.assertEqual(sorted(d["name"] for d in app_dev), ["Car", "Phone"])  # not Bob's
@@ -8291,11 +12474,88 @@ class AppApiDashboardTests(_RouteTestBase):
     def _app(self, method, path, **kw):
         return self.client.open(path, method=method, headers={"Authorization": f"Bearer {self.token}"}, **kw)
 
+    def _playlist(self, title, track_ids, **columns):
+        names = ", ".join(["title", *columns])
+        marks = ", ".join("?" * (len(columns) + 1))
+        cur = self.conn.execute(f"INSERT INTO playlists ({names}) VALUES ({marks})", (title, *columns.values()))
+        playlist = sync_state._new_id(cur)
+        for position, track in enumerate(track_ids):
+            self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, artist, title, matched_track_id) "
+                              "VALUES (?, ?, 'A', 'T', ?)", (playlist, position, track))
+        self.conn.commit()
+        return playlist
+
+    def _tracks(self):
+        return [r["id"] for r in self.conn.execute("SELECT id FROM tracks ORDER BY id")]
+
+    def _to_sync(self, query=""):
+        return self._app("GET", f"/api/app/dashboard/playlists?device_id={self.phone}{query}")
+
+    def test_playlists_widget_ranks_by_what_is_left_for_this_device(self):
+        one, two = self._tracks()
+        self._playlist("Done", [one])
+        self._playlist("Both", [one, two, None])
+        self.conn.execute("INSERT INTO device_track_state (device_id, track_id, status) VALUES (?, ?, 'downloaded')",
+                          (self.phone, one))
+        self._playlist("Other", [two])
+        self.conn.execute("DELETE FROM device_track_state WHERE track_id = ? AND status != 'downloaded'", (two,))
+        self.conn.commit()
+        rows = self._to_sync().get_json()
+        self.assertEqual([(r["title"], r["to_sync"]) for r in rows], [("Both", 1), ("Other", 1)])
+        self.assertEqual({k: rows[0][k] for k in ("track_count", "matched_count")},
+                         {"track_count": 3, "matched_count": 2})
+
+    def test_a_track_twice_in_a_playlist_is_one_left_to_sync(self):
+        one, two = self._tracks()
+        self._playlist("Twice", [one, one])
+        self._playlist("Pair", [one, two])
+        rows = self._to_sync().get_json()
+        self.assertEqual([(r["title"], r["to_sync"]) for r in rows], [("Pair", 2), ("Twice", 1)])
+
+    def test_playlists_widget_counts_nothing_excluded_or_gone(self):
+        one, two = self._tracks()
+        self._playlist("P", [one, two])
+        self.conn.execute("INSERT INTO device_track_state (device_id, track_id, status) VALUES (?, ?, 'excluded')",
+                          (self.phone, one))
+        self.conn.execute("UPDATE tracks SET deleted_at = datetime('now') WHERE id = ?", (two,))
+        self.conn.commit()
+        self.assertEqual(self._to_sync().get_json(), [])
+
+    def test_playlists_widget_respects_its_limit_and_the_order_of_a_tie(self):
+        one, two = self._tracks()
+        self._playlist("Zebra", [one])
+        self._playlist("apple", [one])
+        self._playlist("Most", [one, two])
+        self.assertEqual([r["title"] for r in self._to_sync("&limit=2").get_json()], ["Most", "apple"])
+
+    def test_playlists_widget_hides_another_users_private_playlist(self):
+        one, _two = self._tracks()
+        self._playlist("Theirs", [one], owner_user_id=self.other, shared=0)
+        self.assertEqual(self._to_sync().get_json(), [])
+
+    def test_playlists_widget_refuses_another_users_device_and_no_device(self):
+        theirs, _ = sync_state.create_device(self.conn, self.other, "Theirs", "phone")
+        self.conn.commit()
+        self.assertEqual(self._app("GET", f"/api/app/dashboard/playlists?device_id={theirs}").status_code, 403)
+        self.assertEqual(self._app("GET", "/api/app/dashboard/playlists").status_code, 400)
+
+    def test_the_playlists_row_count_is_a_device_setting(self):
+        path = "/api/app/dashboard/widgets"
+        self.assertEqual(self._app("GET", path).get_json()["settings"]["playlists"], {"limit": 3})
+        done = self._app("PATCH", path, json={"settings": {"playlists": {"limit": 5}}})
+        self.assertEqual(done.get_json()["settings"]["playlists"], {"limit": 5})
+        for bad in ({"limit": 0}, {"limit": 11}, {"limit": True}, {"other": 1}, 3):
+            with self.subTest(bad=bad):
+                resp = self._app("PATCH", path, json={"settings": {"playlists": bad}})
+                self.assertEqual(resp.status_code, 400)
+
     def test_catalog_is_one_list_served_to_both_clients_and_labelled(self):
         via_app = self._app("GET", "/api/app/dashboard/catalog").get_json()
         _login(self.client, self.owner)
         via_session = self.client.get("/api/dashboard/catalog").get_json()
-        self.assertEqual(via_app, via_session)
+        # The app has one more, at the end; the browser never sees it.
+        self.assertEqual(via_app, [*via_session, {"id": "playlists", "admin_only": False}])
+        via_app = via_session
         self.assertEqual([w["id"] for w in via_app if w["admin_only"]], ["administration"])
         self.assertEqual(via_app[0], {"id": "library", "admin_only": False})
         # The labels the web renders are keyed by the same ids, in the same
@@ -8321,7 +12581,10 @@ class AppApiDashboardTests(_RouteTestBase):
         self.assertFalse(body["configured"])
         self.assertEqual(body["items"], self.client.get("/api/suggestions?period=6month").get_json())
         self.assertEqual(self._app("GET", "/api/app/suggestions/most-played").get_json(),
-                         {"configured": False, "items": []})
+                         {"configured": False, "items": [], "sources": {
+                             "lastfm": "unconfigured", "listenbrainz": "unconfigured",
+                             "maloja": "unconfigured",
+                             "device_plays": "unconfigured"}})
         self.conn.execute("UPDATE users SET lastfm_username = 'alice' WHERE id = ?", (self.owner,))
         self.conn.commit()
         ranked = [{"artist": "Alpha", "album": "X", "playcount": 5}, {"artist": "Beta", "album": "Z", "playcount": 9}]
@@ -8347,7 +12610,7 @@ class AppApiDashboardTests(_RouteTestBase):
 
     def test_widget_preferences_read_and_patch_under_the_prefix(self):
         stored = self._app("GET", "/api/app/dashboard/widgets").get_json()
-        self.assertEqual(stored, {"disabled": [], "order": [], "settings": {"suggestions": {"cover_limit": 15}, "recently_added": {"cover_limit": 15}, "recently_released": {"cover_limit": 15}, "cover_limit": 15}})
+        self.assertEqual(stored, {"disabled": [], "order": [], "settings": {"playlists": {"limit": 3}, "suggestions": {"cover_limit": 15}, "recently_added": {"cover_limit": 15}, "recently_released": {"cover_limit": 15}, "cover_limit": 15}})
         resp = self._app("PATCH", "/api/app/dashboard/widgets",
                          json={"disabled": ["devices"], "settings": {"recently_added": {"months": 6}}})
         self.assertEqual(resp.status_code, 200)
@@ -8359,7 +12622,7 @@ class AppApiDashboardTests(_RouteTestBase):
         # The device's own set: the browser's is untouched.
         _login(self.client, self.owner)
         self.assertEqual(self.client.get("/api/profile").get_json()["dashboard_widgets"],
-                         {"disabled": [], "order": [], "settings": {"suggestions": {"cover_limit": 15}, "recently_added": {"cover_limit": 15}, "recently_released": {"cover_limit": 15}, "cover_limit": 15}})
+                         {"disabled": [], "order": [], "settings": {"playlists": {"limit": 3}, "suggestions": {"cover_limit": 15}, "recently_added": {"cover_limit": 15}, "recently_released": {"cover_limit": 15}, "cover_limit": 15}})
         self.assertEqual(self._app("PATCH", "/api/app/dashboard/widgets", json={"settings": {"cover_limit": 7}}).status_code, 400)
         self.assertEqual(self._app("PATCH", "/api/app/dashboard/widgets", data="[]",
                                    content_type="application/json").status_code, 400)
@@ -8533,7 +12796,7 @@ class AppApiPlaylistTests(_RouteTestBase):
             self.assertEqual(set(app), set(browser), f"user {user_id}")
             for pid, row in app.items():
                 shown = {k: v for k, v in browser[pid].items()
-                         if not k.startswith(main._APP_PLAYLIST_OMITTED_PREFIXES)}
+                         if not k.startswith(app_api._APP_PLAYLIST_OMITTED_PREFIXES)}
                 self.assertEqual({k: v for k, v in row.items() if k != "can_share"}, shown, f"user {user_id}, playlist {pid}")
 
     # --- what the phone is and is not given --------------------------------
@@ -8549,7 +12812,7 @@ class AppApiPlaylistTests(_RouteTestBase):
         self.assertIs(admin[self.shared]["can_share"], True)
         self.assertIs(owner[self.unowned]["can_share"], False)  # no owner to share for
 
-    def test_no_app_route_can_change_a_mirror(self):
+    def test_no_app_route_toggles_a_mirror(self):
         rules = [r.rule for r in main.app.url_map.iter_rules() if r.rule.startswith("/api/app/")]
         self.assertTrue(any("playlists" in r for r in rules), "the control: the playlist routes are there")
         self.assertEqual([r for r in rules if "mirror" in r], [])
@@ -8577,12 +12840,245 @@ class AppApiPlaylistTests(_RouteTestBase):
         self.conn.commit()
         resp = self._app(self.owner_token, "GET", f"/api/app/playlists/{self.private}/tracks")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.get_json(), [
-            {"position": 1, "artist": "A", "title": "One", "album": "B", "matched": True},
-            {"position": 2, "artist": "C", "title": "Three", "album": None, "matched": False},
+        rows = resp.get_json()
+        self.assertEqual([{k: v for k, v in r.items() if k != "entry_id"} for r in rows], [
+            {"position": 1, "artist": "A", "title": "One", "album": "B", "matched": True, "track_id": track,
+             "library_artist": "A", "library_album": "B"},
+            {"position": 2, "artist": "C", "title": "Three", "album": None, "matched": False, "track_id": None,
+             "library_artist": None, "library_album": None},
         ])
+        self.assertEqual(len({r["entry_id"] for r in rows}), 2)
         self.assertEqual(self._app(self.other_token, "GET", f"/api/app/playlists/{self.private}/tracks").status_code, 403)
         self.assertEqual(self._app(self.owner_token, "GET", "/api/app/playlists/999999/tracks").status_code, 404)
+
+    def _selected(self, user, device, target="A"):
+        sync_state.toggle_selection_device(self.conn, user, "artist", target, device, True)
+        self.conn.commit()
+
+    def _on(self, device, target="A"):
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM selections s JOIN selection_devices sd ON sd.selection_id = s.id "
+            "WHERE s.type = 'artist' AND s.target = ? AND sd.device_id = ?", (target, device)).fetchone()[0]
+
+    def _failed_sync(self):
+        self.conn.execute(
+            "INSERT INTO jobs (type, state, result) VALUES (?, 'done', ?)",
+            (playlist_sync.JOB_TYPE, json.dumps({"status": "ok", "source_failures": [
+                {"provider": "tidal", "user_id": self.owner, "reason": "http_403"}]})))
+        self.conn.commit()
+
+    def _failures(self, resp):
+        self.assertEqual(resp.status_code, 200)
+        return resp.get_json()["last_result"]["source_failures"]
+
+    def test_app_status_shows_a_failed_link_to_its_owner_and_an_admin_only(self):
+        self._failed_sync()
+        path = "/api/app/playlists/sync/status"
+        owner = self._failures(self._app(self.owner_token, "GET", path))
+        admin = self._failures(self._app(self.admin_token, "GET", path))
+        self.assertEqual([(f["reason"], f["username"]) for f in owner], [("http_403", "owner")])
+        self.assertEqual([(f["reason"], f["username"]) for f in admin], [("http_403", "owner")])
+        self.assertEqual(self._failures(self._app(self.other_token, "GET", path)), [])
+
+    def test_browser_status_shows_a_failed_link_to_its_owner_and_an_admin_only(self):
+        self._failed_sync()
+        path = "/api/provider/playlists/sync/status"
+        _login(self.client, self.other)
+        self.assertEqual(self._failures(self.client.get(path)), [])
+        _login(self.client, self.owner)
+        self.assertEqual([f["username"] for f in self._failures(self.client.get(path))], ["owner"])
+        _login(self.client, self.admin)
+        self.assertEqual([f["username"] for f in self._failures(self.client.get(path))], ["owner"])
+
+    def test_a_selection_says_what_to_show_for_it(self):
+        here, _ = sync_state.create_device(self.conn, self.owner, "here")
+        cur = self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                                "VALUES ('a/b/1.flac', 'A', 'B', 'One', 1, 0)")
+        track = sync_state._new_id(cur)
+        self.conn.commit()
+        for sel_type, target in (("artist", "A"), ("album", "A||B"), ("track", str(track)),
+                                 ("playlist", str(self.private)), ("playlist", "999999")):
+            sync_state.toggle_selection_device(self.conn, self.owner, sel_type, target, here, True)
+        self.conn.commit()
+        rows = self._app(self.owner_token, "GET", "/api/app/selections").get_json()
+        self.assertEqual({(r["type"], r["target"]): r["title"] for r in rows}, {
+            ("artist", "A"): "A", ("album", "A||B"): "B", ("track", str(track)): "One",
+            ("playlist", str(self.private)): "Private", ("playlist", "999999"): None})
+
+    def test_removing_a_selection_leaves_it_on_the_owners_other_devices(self):
+        here, _ = sync_state.create_device(self.conn, self.owner, "here")
+        there, _ = sync_state.create_device(self.conn, self.owner, "there")
+        self._selected(self.owner, here)
+        self._selected(self.owner, there)
+        resp = self._app(self.owner_token, "POST", "/api/app/selections/remove",
+                         json={"device_id": here, "type": "artist", "target": "A"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual((self._on(here), self._on(there)), (0, 1))
+
+    def test_a_numeric_target_finds_a_playlist_selection(self):
+        here, _ = sync_state.create_device(self.conn, self.owner, "here")
+        sync_state.toggle_selection_device(self.conn, self.owner, "playlist", str(self.private), here, True)
+        self.conn.commit()
+        resp = self._app(self.owner_token, "POST", "/api/app/selections/remove",
+                         json={"device_id": here, "type": "playlist", "target": self.private})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM selection_devices WHERE device_id = ?", (here,)).fetchone()[0], 0)
+
+    def test_the_removal_count_is_what_the_device_would_lose(self):
+        here, _ = sync_state.create_device(self.conn, self.owner, "here")
+        cur = self.conn.execute("INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+                                "VALUES ('a/b/1.flac', 'A', 'B', 'One', 1, 0)")
+        self._selected(self.owner, here)
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded' WHERE device_id = ? AND track_id = ?",
+                          (here, sync_state._new_id(cur)))
+        self.conn.commit()
+        resp = self._app(self.owner_token, "POST", "/api/app/selections/removal-count",
+                         json={"device_id": here, "type": "artist", "target": "A"})
+        self.assertEqual(resp.get_json(), {"tracks": 1})
+
+    def test_someone_elses_selection_stays_and_says_whose(self):
+        here, _ = sync_state.create_device(self.conn, self.owner, "here")
+        self._selected(self.other, here)
+        resp = self._app(self.owner_token, "POST", "/api/app/selections/remove",
+                         json={"device_id": here, "type": "artist", "target": "A"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(len(resp.get_json()["selected_by"]), 1)
+        self.assertEqual(self._on(here), 1)
+
+    def test_a_device_someone_else_owns_is_refused(self):
+        theirs, _ = sync_state.create_device(self.conn, self.other, "theirs")
+        self._selected(self.other, theirs)
+        for route in ("remove", "removal-count"):
+            resp = self._app(self.owner_token, "POST", f"/api/app/selections/{route}",
+                             json={"device_id": theirs, "type": "artist", "target": "A"})
+            self.assertEqual(resp.status_code, 403, route)
+        self.assertEqual(self._on(theirs), 1)
+
+    def test_autofit_is_not_removed_here(self):
+        here, _ = sync_state.create_device(self.conn, self.owner, "here")
+        resp = self._app(self.owner_token, "POST", "/api/app/selections/remove",
+                         json={"device_id": here, "type": "autofit", "target": "x"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_entry_names_where_its_track_sits_in_the_library(self):
+        # A guest on a compilation: the library lists it under the album artist.
+        cur = self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album_artist, album, title, size, mtime) "
+            "VALUES ('v/c/1.flac', 'Guest', 'Various Artists', 'Compilation', 'One', 1, 0)")
+        self.conn.execute(
+            "INSERT INTO playlist_tracks (playlist_id, position, artist, title, album, matched_track_id) "
+            "VALUES (?, 1, 'Guest feat. Someone', 'One', 'Single', ?)",
+            (self.private, sync_state._new_id(cur)))
+        self.conn.commit()
+        row = self._app(self.owner_token, "GET", f"/api/app/playlists/{self.private}/tracks").get_json()[0]
+        self.assertEqual((row["artist"], row["library_artist"], row["library_album"]),
+                         ("Guest feat. Someone", "Various Artists", "Compilation"))
+
+    # --- level 3: authoring a playlist made in Trobar ----------------------
+
+    def _tracks(self, *titles):
+        ids = []
+        for i, title in enumerate(titles):
+            cur = self.conn.execute(
+                "INSERT INTO tracks (relative_path, artist, album, title, track_no, size, mtime) "
+                "VALUES (?, 'A', 'B', ?, ?, 1, 0.0)", (f"a/b/{title}.flac", title, i + 1))
+            ids.append(sync_state._new_id(cur))
+        self.conn.commit()
+        return ids
+
+    def _create(self, token, title="Mine"):
+        resp = self._app(token, "POST", "/api/app/playlists", json={"title": title})
+        self.assertEqual(resp.status_code, 201)
+        return resp.get_json()["id"]
+
+    def test_a_playlist_made_on_the_phone_is_the_owners_and_private(self):
+        pid = self._create(self.owner_token, "  Phone mix  ")
+        row = self.conn.execute("SELECT title, owner_user_id, shared, source_provider FROM playlists WHERE id = ?",
+                                (pid,)).fetchone()
+        self.assertEqual(tuple(row), ("Phone mix", self.owner, 0, playlist_sync.TROBAR_SOURCE))
+        self.assertIn(pid, self._list(self.owner_token))
+        self.assertNotIn(pid, self._list(self.other_token))
+        self.assertEqual(self._app(self.owner_token, "POST", "/api/app/playlists", json={"title": " "}).status_code, 400)
+
+    def test_entries_are_set_appended_and_kept_by_entry_id(self):
+        one, two, three = self._tracks("One", "Two", "Three")
+        pid = self._create(self.owner_token)
+        path = f"/api/app/playlists/{pid}/tracks"
+        resp = self._app(self.owner_token, "PUT", path, json={"track_ids": [two, one]})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual((body["tracks"], body["added"]), (2, 2))
+        self.assertEqual([e["track_id"] for e in body["entries"]], [two, one])
+        # The response's entries are the GET's own shape.
+        self.assertEqual(body["entries"], self._app(self.owner_token, "GET", path).get_json())
+        appended = self._app(self.owner_token, "POST", path, json={"track_ids": [three]}).get_json()
+        self.assertEqual([e["title"] for e in appended["entries"]], ["Two", "One", "Three"])
+        # Reorder by entry id, dropping "Two": the PUT is the whole list.
+        kept = [{"entry_id": e["entry_id"]} for e in appended["entries"][1:]][::-1]
+        resp = self._app(self.owner_token, "PUT", path, json={"items": kept})
+        self.assertEqual([e["title"] for e in resp.get_json()["entries"]], ["Three", "One"])
+        # Idempotent: the same full list again changes nothing.
+        again = [{"entry_id": e["entry_id"]} for e in resp.get_json()["entries"]]
+        resp = self._app(self.owner_token, "PUT", path, json={"items": again})
+        self.assertEqual([e["title"] for e in resp.get_json()["entries"]], ["Three", "One"])
+
+    def test_an_entry_whose_track_left_the_library_has_no_track_id(self):
+        one, two = self._tracks("One", "Two")
+        pid = self._create(self.owner_token)
+        path = f"/api/app/playlists/{pid}/tracks"
+        self._app(self.owner_token, "PUT", path, json={"track_ids": [one, two]})
+        self.conn.execute("UPDATE tracks SET deleted_at = datetime('now') WHERE id = ?", (one,))
+        self.conn.commit()
+        rows = self._app(self.owner_token, "GET", path).get_json()
+        self.assertEqual([(r["title"], r["track_id"]) for r in rows], [("One", None), ("Two", two)])
+        # Kept by its entry id, it stays in place; re-sent as a track id, it is refused.
+        keep = [{"entry_id": r["entry_id"]} for r in rows]
+        self.assertEqual(self._app(self.owner_token, "PUT", path, json={"items": keep}).status_code, 200)
+        self.assertEqual(self._app(self.owner_token, "PUT", path, json={"track_ids": [one, two]}).status_code, 400)
+
+    def test_whole_albums_append_in_track_order(self):
+        self._tracks("One", "Two")
+        pid = self._create(self.owner_token)
+        resp = self._app(self.owner_token, "POST", f"/api/app/playlists/{pid}/tracks",
+                         json={"albums": [{"artist": "A", "album": "B"}]})
+        self.assertEqual([e["title"] for e in resp.get_json()["entries"]], ["One", "Two"])
+
+    def test_unknown_tracks_and_foreign_entries_are_refused(self):
+        (one,) = self._tracks("One")
+        pid, theirs = self._create(self.owner_token), self._create(self.other_token)
+        foreign = self._app(self.other_token, "PUT", f"/api/app/playlists/{theirs}/tracks",
+                            json={"track_ids": [one]}).get_json()["entries"][0]["entry_id"]
+        path = f"/api/app/playlists/{pid}/tracks"
+        resp = self._app(self.owner_token, "PUT", path, json={"track_ids": [999999]})
+        self.assertEqual((resp.status_code, resp.get_json()["unknown"]), (400, [999999]))
+        resp = self._app(self.owner_token, "PUT", path, json={"items": [{"entry_id": foreign}]})
+        self.assertEqual((resp.status_code, resp.get_json()["unknown_entries"]), (400, [foreign]))
+        self.assertEqual(self._app(self.owner_token, "PUT", path, json={"items": "x"}).status_code, 400)
+
+    def test_rename_and_delete_follow_the_owner_or_admin_rule(self):
+        pid = self._create(self.owner_token)
+        self.assertEqual(self._app(self.other_token, "PATCH", f"/api/app/playlists/{pid}",
+                                   json={"title": "Theirs"}).status_code, 403)
+        self.assertEqual(self._app(self.admin_token, "PATCH", f"/api/app/playlists/{pid}",
+                                   json={"title": "Renamed"}).status_code, 200)
+        self.assertEqual(self.conn.execute("SELECT title FROM playlists WHERE id = ?", (pid,)).fetchone()[0], "Renamed")
+        self.assertEqual(self._app(self.other_token, "DELETE", f"/api/app/playlists/{pid}").status_code, 403)
+        self.assertEqual(self._app(self.other_token, "PUT", f"/api/app/playlists/{pid}/tracks",
+                                   json={"track_ids": []}).status_code, 403)
+        self.assertEqual(self._app(self.owner_token, "DELETE", f"/api/app/playlists/{pid}").status_code, 200)
+        self.assertIsNone(self.conn.execute("SELECT id FROM playlists WHERE id = ?", (pid,)).fetchone())
+        self.assertEqual(self._app(self.owner_token, "DELETE", f"/api/app/playlists/{pid}").status_code, 404)
+
+    def test_a_provider_playlist_is_not_authored_here(self):
+        # The owner's own Tidal playlist: theirs to share, not to rename, fill or delete.
+        for method, path, body in (("PATCH", f"/api/app/playlists/{self.tidal}", {"title": "X"}),
+                                   ("PUT", f"/api/app/playlists/{self.tidal}/tracks", {"track_ids": []}),
+                                   ("POST", f"/api/app/playlists/{self.tidal}/tracks", {"track_ids": []}),
+                                   ("DELETE", f"/api/app/playlists/{self.tidal}", None)):
+            with self.subTest(method=method, path=path):
+                self.assertEqual(self._app(self.owner_token, method, path, json=body).status_code, 400)
+        self.assertIsNotNone(self.conn.execute("SELECT id FROM playlists WHERE id = ?", (self.tidal,)).fetchone())
 
     def test_unresolved_review_follows_the_playlists_visibility(self):
         self.conn.execute("INSERT INTO unresolved_playlist_tracks (playlist_id, position, artist, title, album) "
@@ -8627,3 +13123,219 @@ class AppApiPlaylistTests(_RouteTestBase):
         with mock.patch.object(playlist_sync, "start_sync", return_value={"already_running": True}):
             self.assertEqual(self._app(self.owner_token, "POST", "/api/app/playlists/sync").status_code, 409)
         self.assertEqual(self._app(self.owner_token, "GET", "/api/app/playlists/sync/status").status_code, 200)
+
+
+class AuthInvariantTests(_RouteTestBase):
+    """The session gate exempts /api/device/, /api/integrations/ and /api/app/
+    wholesale: each handler there must check its own Bearer token, or it is
+    open to anyone. Every /api/admin/ handler must refuse a non-admin. This
+    walks the live url_map, so a route added later is covered without being
+    named here."""
+
+    BEARER_PREFIXES = ("/api/device/", "/api/integrations/", "/api/app/")
+    # Public by design, under those prefixes. Empty today: every route there
+    # takes a token. A route added here needs a reason beside it.
+    PUBLIC: set[str] = set()
+    # Admin-only routes outside /api/admin/, named because the prefix walk
+    # can't find them. The last test keeps this list complete.
+    ADMIN_ELSEWHERE = {
+        "/api/integration-tokens", "/api/integration-tokens/<int:token_id>",
+        "/api/provider/pair",
+        "/api/setup/complete", "/api/setup/music-root", "/api/setup/status",
+    }
+
+    def _calls(self, prefixes=(), rules=()):
+        for rule in main.app.url_map.iter_rules():
+            wanted = (prefixes and rule.rule.startswith(prefixes)) or rule.rule in rules
+            if not wanted or rule.rule in self.PUBLIC:
+                continue
+            url = rule.rule
+            for name in rule.arguments:
+                value = "1" if type(rule._converters[name]).__name__ == "IntegerConverter" else "x"
+                url = url.replace(f"<int:{name}>", value).replace(f"<path:{name}>", value).replace(f"<{name}>", value)
+            for method in sorted((rule.methods or set()) - {"HEAD", "OPTIONS"}):
+                yield rule.rule, method, url
+
+    def test_every_bearer_route_refuses_a_request_without_a_token(self):
+        seen = set()
+        for rule, method, url in self._calls(self.BEARER_PREFIXES):
+            seen.add(next(p for p in self.BEARER_PREFIXES if rule.startswith(p)))
+            with self.subTest(route=rule, method=method):
+                status = self.client.open(url, method=method, json={}).status_code
+                self.assertIn(status, (401, 403), f"{method} {rule} answered {status} without a token")
+        # The walk has to reach every prefix, or this passes having checked nothing.
+        self.assertEqual(seen, set(self.BEARER_PREFIXES))
+
+    def test_every_admin_route_refuses_a_signed_in_non_admin(self):
+        _login(self.client, self.owner)
+        calls = list(self._calls(("/api/admin/",), self.ADMIN_ELSEWHERE))
+        self.assertGreater(len(calls), 0)
+        self.assertEqual({rule for rule, _, _ in calls if not rule.startswith("/api/admin/")},
+                         self.ADMIN_ELSEWHERE, "a listed admin route no longer exists")
+        for rule, method, url in calls:
+            with self.subTest(route=rule, method=method):
+                status = self.client.open(url, method=method, json={}).status_code
+                self.assertEqual(status, 403, f"{method} {rule} answered {status} to a non-admin")
+
+    def test_every_admin_check_outside_api_admin_is_listed(self):
+        import inspect
+        found = {rule.rule for rule in main.app.url_map.iter_rules()
+                 if not rule.rule.startswith("/api/admin/")
+                 and "require_admin(" in inspect.getsource(main.app.view_functions[rule.endpoint])}
+        self.assertEqual(found, self.ADMIN_ELSEWHERE,
+                         "an admin-only route outside /api/admin/ must be added to ADMIN_ELSEWHERE")
+
+
+class HealthzTests(_RouteTestBase):
+    """GET /healthz: the container's HEALTHCHECK. No session, and nothing in
+    the answer beyond whether the database does."""
+
+    def test_answers_ok_without_a_session(self):
+        resp = self.client.get("/healthz")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"status": "ok"})
+
+    def test_answers_503_when_the_database_does_not(self):
+        with mock.patch.object(ops.db, "connection", side_effect=sqlite3.OperationalError("unable to open")):
+            resp = self.client.get("/healthz")
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.get_json(), {"status": "unavailable"})
+
+    def test_the_exemption_is_this_path_only(self):
+        # Exempted by exact name, like /login: nothing under or beside it.
+        # The gate itself must answer them (a redirect to the login page);
+        # a 404 would mean they got past it.
+        for path in ("/healthz/", "/healthz/x", "/healthzx"):
+            with self.subTest(path=path):
+                resp = self.client.get(path)
+                self.assertEqual(resp.status_code, 302)
+                self.assertTrue(resp.headers["Location"].endswith("/login"), resp.headers["Location"])
+        self.assertEqual(self.client.get("/api/profile").status_code, 401)
+
+
+class ThanksCardTests(_RouteTestBase):
+    """The web UI's thank-you card: shown to an admin once the server has
+    counted THANKS_CARD_SYNCS successful device syncs, across every
+    account, until that admin dismisses it. The count comes only from
+    POST /api/device/sync-completed."""
+
+    def setUp(self):
+        super().setUp()
+        self.second_admin = self._make_user("admin2", is_admin=True)
+        _, self.owner_token = sync_state.create_device(self.conn, self.owner, "phone")
+        _, self.bob_token = sync_state.create_device(self.conn, self.other, "sdcard")
+        self.conn.commit()
+
+    def _report(self, token):
+        return self.client.post("/api/device/sync-completed",
+                                headers={"Authorization": f"Bearer {token}"})
+
+    def _set_count(self, n: int) -> None:
+        db.set_config(self.conn, db.DEVICE_SYNCS_KEY, str(n))
+        self.conn.commit()
+
+    def _card(self, user_id: int) -> bool:
+        _login(self.client, user_id)
+        return self.client.get("/api/profile").get_json()["thanks_card"]
+
+    def test_every_account_s_devices_add_to_one_count(self):
+        self.assertEqual(self._report(self.owner_token).status_code, 200)
+        self._report(self.owner_token)
+        self._report(self.bob_token)
+        self.assertEqual(db.device_syncs_completed(self.conn), 3)
+
+    def test_a_report_needs_a_device_token(self):
+        self.assertEqual(self.client.post("/api/device/sync-completed").status_code, 401)
+        self.assertEqual(self._report("not-a-token").status_code, 401)
+        self.assertEqual(db.device_syncs_completed(self.conn), 0)
+
+    def test_an_admin_sees_it_from_the_milestone_on(self):
+        self._set_count(user_profile.THANKS_CARD_SYNCS - 1)
+        self.assertFalse(self._card(self.admin))
+        self._report(self.owner_token)
+        self.assertTrue(self._card(self.admin))
+
+    def test_a_user_who_is_not_an_admin_never_does(self):
+        self._set_count(user_profile.THANKS_CARD_SYNCS * 10)
+        self.assertFalse(self._card(self.owner))
+
+    def test_the_page_carries_the_card_with_the_milestone_in_its_text(self):
+        # Rendered for everyone; profile.thanks_card decides whether it shows.
+        db.set_config(self.conn, "setup_completed", "1")
+        self.conn.commit()
+        _login(self.client, self.admin)
+        html = self.client.get("/").get_data(as_text=True)
+        i = html.index("data-thanks-card")
+        self.assertIn('x-show="profile.thanks_card"', html[i - 200:i])
+        self.assertIn(f"Trobar has synced {user_profile.THANKS_CARD_SYNCS} times on this server.", html[i:i + 2500])
+
+    def test_dismissing_it_hides_it_for_that_admin_only(self):
+        self._set_count(user_profile.THANKS_CARD_SYNCS)
+        _login(self.client, self.admin)
+        response = self.client.delete("/api/profile/thanks-card")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()["thanks_card"])
+        self._set_count(user_profile.THANKS_CARD_SYNCS * 2)
+        self.assertFalse(self._card(self.admin))  # for good, not until the next milestone
+        self.assertTrue(self._card(self.second_admin))
+
+
+class SupportLinkRenderTests(_RouteTestBase):
+    """The About page's support link goes to Ko-fi, and no Liberapay link is
+    left anywhere on the page."""
+
+    def setUp(self):
+        super().setUp()
+        db.set_config(self.conn, "setup_completed", "1")  # else / redirects to the wizard
+        self.conn.commit()
+
+    def test_the_support_link_opens_ko_fi(self):
+        _login(self.client, self.admin)
+        html = self.client.get("/").get_data(as_text=True)
+        # Two Ko-fi links, About's and the thank-you card's, and each is the
+        # support one.
+        starts = [m.start() for m in re.finditer(re.escape('href="https://ko-fi.com/missingfoss"'), html)]
+        self.assertEqual(len(starts), 2)
+        for i in starts:
+            self.assertIn("Support on Ko-fi", html[i:i + 300])
+        self.assertNotIn("liberapay", html.lower())
+
+    def test_the_support_note_says_what_the_money_pays_for(self):
+        _login(self.client, self.admin)
+        html = self.client.get("/").get_data(as_text=True)
+        i = html.index('href="https://ko-fi.com/missingfoss"')
+        j = html.index("data-support-note")
+        self.assertGreater(j, i)  # under the button
+        self.assertIn("Support pays for test devices, infrastructure and Claude.", html[j:j + 300])
+
+
+class CoverEpochRenderTests(_RouteTestBase):
+    """The page puts the scan's covers_epoch into every cover URL it builds."""
+
+    def setUp(self):
+        super().setUp()
+        db.set_config(self.conn, "setup_completed", "1")  # else / redirects to the wizard
+        self.conn.commit()
+
+    def test_the_cover_url_carries_the_epoch(self):
+        db.set_config(self.conn, "covers_epoch", "1234567890")
+        self.conn.commit()
+        _login(self.client, self.admin)
+        html = self.client.get("/").get_data(as_text=True)
+        self.assertIn("'&v=1234567890'", html)
+
+    def test_the_thumbnails_ask_for_the_small_variant_and_the_grids_do_not(self):
+        _login(self.client, self.admin)
+        html = self.client.get("/").get_data(as_text=True)
+        self.assertIn("+ (size ? '&size=' + size : '')", html)
+        # The basket, an artist's album list, "appears on", the selections
+        # table: the 24-40 px slots. Every other coverUrl() call is a grid tile
+        # or the album dialog's larger cover.
+        self.assertEqual(html.count(", 'small')\""), 4)
+        self.assertEqual(html.count('coverUrl('), 14)
+
+    def test_before_any_scan_it_is_zero(self):
+        _login(self.client, self.admin)
+        html = self.client.get("/").get_data(as_text=True)
+        self.assertIn("encodeURIComponent(album)\n        + '&v=0'", html)
+

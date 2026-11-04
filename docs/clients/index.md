@@ -13,10 +13,10 @@ cross-platform [Desktop app](desktop.md), and the [Garmin watch app](garmin.md)
 ## Device tokens
 
 Every device gets its own API token, which the client receives by redeeming
-a short **pairing code**: 8 characters, shown with a QR code, valid for an
-hour and only once. The token itself is never shown.
+a short **pairing code**: 8 characters, shown with a QR code, valid for 20
+minutes and only once. The token itself is never shown.
 
-- **A phone, tablet or watch:** **Profile → Devices → Add device**, choose
+- **A phone, tablet or watch:** **Devices → Add device**, choose
   the type, then **Generate pairing code**. The app scans the QR code or
   takes the typed code, and creates its device. The Garmin watch can't scan:
   the server URL and code reach it as app settings, see

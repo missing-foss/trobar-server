@@ -30,12 +30,12 @@ def _make_conn() -> sqlite3.Connection:
 
 
 def _add_track(conn, artist, title, *, relative_path=None, isrc=None,
-               acoustid_isrc=None, deleted=False) -> int:
+               acoustid_isrc=None, deleted=False, mbid=None, acoustid_mbid=None) -> int:
     relative_path = relative_path or f"{artist}/{title}.flac"
     cur = conn.execute(
         "INSERT INTO tracks (relative_path, artist, album, title, size, mtime, isrc, "
-        "acoustid_isrc, deleted_at) VALUES (?, ?, '', ?, 1, 0.0, ?, ?, ?)",
-        (relative_path, artist, title, isrc, acoustid_isrc, "now" if deleted else None),
+        "acoustid_isrc, deleted_at, mbid, acoustid_mbid) VALUES (?, ?, '', ?, 1, 0.0, ?, ?, ?, ?, ?)",
+        (relative_path, artist, title, isrc, acoustid_isrc, "now" if deleted else None, mbid, acoustid_mbid),
     )
     conn.commit()
     return cur.lastrowid
@@ -112,6 +112,83 @@ class FingerprintBackfilledIsrcTierTests(unittest.TestCase):
         self.assertEqual(matched, direct_id)
 
 
+_MBID = "8f3471b5-7e6a-48da-86a9-c1c07a0f47ae"
+
+
+class RecordingIdTierTests(unittest.TestCase):
+    """The provider's MusicBrainz recording id, after the ISRC tiers."""
+
+    def setUp(self):
+        self.conn = _make_conn()
+
+    def test_matches_the_files_own_recording_id_whatever_the_metadata(self):
+        tid = _add_track(self.conn, "Glass Meridian", "Latitude", mbid=_MBID)
+        self.assertEqual(identity.resolve_playlist_track(
+            self.conn, artist="GM", title="Latitude (Live)", mbid=_MBID.upper()), tid)
+
+    def test_falls_back_to_the_recording_acoustid_resolved(self):
+        tid = _add_track(self.conn, "Glass Meridian", "Latitude", acoustid_mbid=_MBID)
+        self.assertEqual(identity.resolve_playlist_track(
+            self.conn, artist="x", title="y", mbid=_MBID), tid)
+
+    def test_the_files_own_id_is_tried_before_acoustids(self):
+        own = _add_track(self.conn, "A", "Own", mbid=_MBID)
+        _add_track(self.conn, "B", "Backfilled", acoustid_mbid=_MBID)
+        self.assertEqual(identity.resolve_playlist_track(self.conn, artist="x", title="y", mbid=_MBID), own)
+
+    def test_an_isrc_match_still_comes_first(self):
+        by_isrc = _add_track(self.conn, "A", "By Isrc", isrc="USRC17607839")
+        _add_track(self.conn, "B", "By Mbid", mbid=_MBID)
+        self.assertEqual(identity.resolve_playlist_track(
+            self.conn, artist="x", title="y", isrc="USRC17607839", mbid=_MBID), by_isrc)
+
+    def test_a_deleted_track_is_not_matched_and_an_unknown_id_falls_through(self):
+        _add_track(self.conn, "A", "Gone", mbid=_MBID, deleted=True)
+        live = _add_track(self.conn, "Glass Meridian", "Latitude")
+        self.assertEqual(identity.resolve_playlist_track(
+            self.conn, artist="Glass Meridian", title="Latitude", mbid=_MBID), live)
+
+
+class SharedIdTieBreakTests(unittest.TestCase):
+    """The same recording on an album and on a compilation: two tracks with
+    one recording id (and one ISRC). The id tier must pick the copy the
+    entry names, not whichever row comes first."""
+
+    def setUp(self):
+        self.conn = _make_conn()
+        self.studio = _add_track(self.conn, "Ada Vale", "Paper Kites",
+                                 relative_path="Ada Vale/Studio/01 Paper Kites.flac", mbid=_MBID,
+                                 isrc="USRC17607839")
+        self.comp = _add_track(self.conn, "Ada Vale", "Paper Kites",
+                               relative_path="Various/Best Of/07 Paper Kites.flac", mbid=_MBID,
+                               isrc="USRC17607839")
+        self.conn.execute("UPDATE tracks SET album = 'Studio' WHERE id = ?", (self.studio,))
+        self.conn.execute("UPDATE tracks SET album = 'Best Of' WHERE id = ?", (self.comp,))
+        self.conn.commit()
+
+    def resolve(self, **kw):
+        return identity.resolve_playlist_track(self.conn, artist="Ada Vale", title="Paper Kites", **kw)
+
+    def test_the_entrys_path_picks_the_copy(self):
+        # The path alone, naming the copy with the higher id, so neither the
+        # album nor the lowest-id fallback can be what picks it.
+        self.assertEqual(self.resolve(path="Various/Best Of/07 Paper Kites.flac", mbid=_MBID), self.comp)
+        self.assertEqual(self.resolve(path="Ada Vale/Studio/01 Paper Kites.flac", album="Best Of", mbid=_MBID),
+                         self.studio, "the path outranks the album")
+
+    def test_without_a_path_the_entrys_album_picks_it(self):
+        self.assertEqual(self.resolve(album="Best Of", mbid=_MBID), self.comp)
+        self.assertEqual(self.resolve(album="studio", mbid=_MBID), self.studio)
+
+    def test_with_neither_the_answer_is_the_lowest_id_whatever_the_row_order(self):
+        self.assertEqual(self.resolve(mbid=_MBID), min(self.studio, self.comp))
+
+    def test_the_isrc_tier_breaks_the_same_tie(self):
+        self.assertEqual(self.resolve(path="Various/Best Of/07 Paper Kites.flac", isrc="USRC17607839"),
+                         self.comp)
+        self.assertEqual(self.resolve(album="Best Of", isrc="USRC17607839"), self.comp)
+
+
 class MatcherFallbackTierTests(unittest.TestCase):
     """Tier 3 is matching.py, completely unchanged — these just confirm the
     resolver actually delegates to it rather than reimplementing it."""
@@ -151,6 +228,34 @@ class MatcherFallbackTierTests(unittest.TestCase):
             self.conn, artist="Nobody", title="Nothing", isrc="USRC99999999",
         )
         self.assertIsNone(matched)
+
+
+
+class AlbumPassedThroughTests(unittest.TestCase):
+    """The resolver hands the entry's album to both matcher tiers, where it
+    breaks a tie between versions of the same title."""
+
+    def setUp(self):
+        self.conn = _make_conn()
+        rows = [("Glass Meridian/The Best Of/01 Latitude.flac", "The Best Of"),
+                ("Glass Meridian/Live at the Harbour/01 Latitude.flac", "Live at the Harbour")]
+        self.ids = [self.conn.execute(
+            "INSERT INTO tracks (relative_path, artist, album, title, size, mtime) "
+            "VALUES (?, 'Glass Meridian', ?, 'Latitude', 1, 0.0)", (path, album)).lastrowid
+            for path, album in rows]
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_artist_title_tier(self):
+        self.assertEqual(identity.resolve_playlist_track(
+            self.conn, artist="Glass Meridian", title="Latitude"), self.ids[0])
+        self.assertEqual(identity.resolve_playlist_track(
+            self.conn, artist="Glass Meridian", title="Latitude", album="Live at the Harbour"), self.ids[1])
+
+    def test_path_tier(self):
+        self.assertEqual(identity.resolve_playlist_track(
+            self.conn, artist="x", title="y", path="01 Latitude.flac", album="Live at the Harbour"), self.ids[1])
 
 
 if __name__ == "__main__":

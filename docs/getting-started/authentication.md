@@ -36,6 +36,12 @@ as a **break-glass fallback** for when the IdP is down — under `oidc` mode thi
 is an admin-only operational control, set from Administration → Configuration,
 not from a regular user's Profile.
 
+If the IdP can't be reached, **Sign in with SSO** says so on the login page,
+instead of failing with an error page, and that an administrator can still sign
+in with their local password (the break-glass fallback above).
+Logging out still works: the Trobar session ends, and only the IdP's own session
+(`OIDC_LOGOUT`) is left open until it's reachable again.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `OIDC_ISSUER` | *(unset)* | Your IdP's issuer URL (discovery at `{issuer}/.well-known/openid-configuration`) |
@@ -54,6 +60,22 @@ not from a regular user's Profile.
 
  Set `FORWARD_AUTH_SECRET` — a shared secret your proxy injects as
  `X-Forward-Auth-Secret` — so a stray direct request fails closed.
+
+A request that arrives **without** the identity header is refused (401), and
+the refusal is logged with the path it asked for. That's a proxy that isn't
+setting the header, or a request that reached the app's port directly. Only a
+local development server (`TROBAR_DEV_SERVER`) lets it in, as `DEV_USER`.
+
+Accounts are matched **by username**. A user the proxy names is the Trobar
+account with that username, created on first visit. So switching an existing
+install to `forward` (or to `oidc`, which does the same with the username
+claim) links each existing account to the identity of the same name, with no
+other check. Make sure the usernames agree before you switch.
+
+The profile menu has no **Log out** in this mode: the proxy signs users in, and
+would sign them straight back in. Sign out at the proxy or your identity
+provider instead. On the emergency port, where Trobar signs the admin in
+itself, **Log out** is there.
 
 ### `EMERGENCY_PORT` (forward mode only)
 

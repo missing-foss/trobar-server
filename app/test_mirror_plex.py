@@ -15,6 +15,7 @@ Payload shapes are the recorded ones.
 """
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -29,6 +30,7 @@ import db  # noqa: E402
 db.DATA_DIR = Path(_TMP)
 
 import mirror_plex  # noqa: E402
+import mirror_runs  # noqa: E402
 import playlist_sync  # noqa: E402
 import plex_client  # noqa: E402
 import sync_state  # noqa: E402
@@ -525,6 +527,61 @@ class StatusTests(_Base):
         db.set_config(self.conn, "mirror_plex_url", None)
         self.conn.commit()
         self.assertEqual(plex_client.mirror_status(), {"state": "disconnected", "url": "", "provider": "plex"})
+
+
+
+class CoverageRunTests(_Base):
+    """Each write that gets as far as matching records a mirror_runs row,
+    including what Plex refused after accepting it."""
+
+    def _run(self, pid):
+        return mirror_runs.missing(self.conn, pid, "plex")
+
+    def test_a_track_plex_drops_after_the_write_is_recorded_as_refused(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0), self._local(1)]))
+        real_add = self.fake._add
+        with mock.patch.object(self.fake, "_add", side_effect=lambda playlist, keys: real_add(playlist, keys[:1])):
+            self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["total"], run["on_target"], run["lacked"], run["refused"]), (2, 1, 0, 1))
+        _path, artist, _album, title, _no = self._local(1)
+        self.assertEqual(run["missing"], [{"artist": artist, "title": title, "reason": "refused"}])
+
+    def test_a_track_plex_lacks_is_recorded_as_not_on_target(self):
+        ids = self._tracks([self._local(0), ("Library/Nobody/None/01 Nothing.flac", "Nobody", "None", "Nothing", 1)])
+        pid = self._playlist("Mix", ids)
+        row = self._write(pid)
+        self.assertIsNone(row["plex_mirror_last_error_code"])
+        run = self._run(pid)
+        self.assertEqual((run["total"], run["on_target"], run["lacked"], run["refused"]), (2, 1, 1, 0))
+        self.assertEqual(run["missing"], [{"artist": "Nobody", "title": "Nothing", "reason": "not_on_target"}])
+
+    def test_a_repeated_track_is_counted_once(self):
+        tid = self._tracks([self._local(0)])[0]
+        pid = self._playlist("Mix", [tid, tid])
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["total"], run["on_target"], run["lacked"]), (1, 1, 0))
+
+    def test_a_write_that_changes_nothing_still_records_a_run(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        self._write(pid)
+        self.assertEqual(mirror_runs.latest(self.conn, [pid])[(pid, "plex")]["history"], [1, 1])
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

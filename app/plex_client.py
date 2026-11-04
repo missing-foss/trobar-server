@@ -46,12 +46,15 @@ explicitly scopes Plex artist images as an "(optional follow-up)", not
 part of this provider's initial acceptance criteria.
 """
 
+import logging
 import requests
 
 import db
 import matching
 import provider_config
 from mirror import MIRROR_SUFFIX
+
+_log = logging.getLogger(__name__)
 
 _MUSIC_PLAYLIST_TYPE = "audio"
 

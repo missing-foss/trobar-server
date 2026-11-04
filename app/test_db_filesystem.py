@@ -40,6 +40,14 @@ db.DB_PATH = Path(_TMP) / "music-sync.db"
 import main  # noqa: E402 — must follow the DATA_DIR setup above
 
 
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
 def tearDownModule():
     shutil.rmtree(_TMP, ignore_errors=True)
 

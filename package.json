@@ -8,10 +8,13 @@
     "lint:inline-js": "python3 dev/check_inline_js.py"
   },
   "devDependencies": {
-    "@axe-core/playwright": "4.12.1",
+    "@axe-core/playwright": "4.13.0",
     "@eslint/js": "10.0.1",
-    "@playwright/test": "1.62.1",
-    "eslint": "10.8.0",
-    "globals": "17.8.0"
+    "@playwright/test": "1.64.1",
+    "eslint": "10.14.0",
+    "globals": "17.13.0"
+  },
+  "overrides": {
+    "minimatch": "11.0.3"
   }
 }

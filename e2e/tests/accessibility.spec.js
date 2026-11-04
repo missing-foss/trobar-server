@@ -4,6 +4,7 @@
 
 // @ts-check
 const { test, expect } = require("@playwright/test");
+const { trackFetches, settled } = require("../support/settle");
 const AxeBuilder = require("@axe-core/playwright").default;
 
 // #42/#101/#109: automated accessibility checks. axe-core runs against the
@@ -29,10 +30,22 @@ const AUTH_VIEWS = ["library", "playlists", "selections", "lastfm", "about"];
 const ADMIN_SUBTABS = ["config", "health", "users"];
 // The config sub-tab shows a different form per selected library-source provider.
 const PROVIDERS = ["roon", "subsonic", "jellyfin", "emby", "plex", "lms", "filesystem"];
-// #234/#235: devices is the one with the per-device cards; prefs/account are
-// included too since a shared regression (e.g. a bad panel-b token) would
-// otherwise only be caught on whichever sub-tab happens to get visited.
-const PROFILE_SUBTABS = ["prefs", "account", "devices"];
+// #234/#235: prefs/account are scanned since a shared regression (e.g. a bad
+// panel-b token) would otherwise only be caught on whichever sub-tab happens
+// to get visited. Devices, with the per-device cards, has been a tab of its
+// own since #266 and is scanned below.
+const PROFILE_SUBTABS = ["prefs", "account"];
+
+// The admin tab is scanned one page at a time: each sub-tab, and the config
+// sub-tab once per provider form.
+const ADMIN_PAGES = ADMIN_SUBTABS.flatMap(
+  (s) => (s === "config" ? PROVIDERS.map((p) => [s, p]) : [[s, null]]));
+
+// This file holds most of the suite's scans, and Playwright runs a file on
+// one worker unless told otherwise, so it would set the whole run's length.
+// Its tests can run in any order: the only server state any of them writes
+// is the device the devices test adds, and no test here counts devices.
+test.describe.configure({ mode: "parallel" });
 
 // Every brand theme in every variant it has (trobar-server#141): contrast
 // depends on the active theme's tokens, so each one is scanned. Nuèch and
@@ -80,13 +93,14 @@ for (const variant of VARIANTS) {
   // #281: home gets its own test (pulled out of the AUTH_VIEWS loop below)
   // because, when the harness seeded a mock Last.fm username (global-setup,
   // LASTFM_MOCK_USERNAME), it's the one view that needs to wait for a real
-  // async fetch (Most Played, #267) rather than the flat settle-timeout the
-  // other views use — otherwise this would scan whatever happened to have
-  // rendered in 800ms, which #280 already found doesn't reliably include a
-  // chart behind its own data fetch (the same class of gap the Health-tab
-  // fix below closed for that chart). Falls back to the flat timeout alone
-  // when the env var is unset, so the suite doesn't hard-depend on the mock.
+  // async fetch (Most Played, #267) as well as the generic settle the other
+  // views use — a scan of whatever had rendered after a fixed sleep (#280)
+  // didn't reliably include a chart behind its own data fetch. settled()
+  // (#259) now waits for the page's fetches and on-demand scripts (Chart.js)
+  // anyway; the Most Played wait stays as the explicit claim. Without the
+  // env var only settled() runs, so the suite doesn't hard-depend on the mock.
   test(`home tab has no WCAG A/AA violations (${theme})`, async ({ page }) => {
+    await trackFetches(page);
     await page.goto("/#/home");
     await setTheme(page, variant);
     if (process.env.LASTFM_MOCK_USERNAME) {
@@ -100,20 +114,21 @@ for (const variant of VARIANTS) {
         return window.Alpine?.$data(document.querySelector("[x-data]"))?.mostPlayed?.length > 0;
       }, { timeout: 10000 });
     }
-    await page.waitForTimeout(800);
+    await settled(page);
     const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(summarize(results.violations)).toEqual([]);
   });
 
   for (const view of AUTH_VIEWS) {
     test(`${view} tab has no WCAG A/AA violations (${theme})`, async ({ page }) => {
+      await trackFetches(page);
       await page.goto("/#/home");
       await setTheme(page, variant);
       // SPA navigation — goToTab() flows through applyHistoryState like a real
       // click; hidden tabs are display:none, which axe skips.
       await page.evaluate((v) => window.Alpine.$data(document.querySelector("[x-data]")).goToTab(v), view);
       // Let the tab's widgets / lazily-loaded charts / covers settle.
-      await page.waitForTimeout(800);
+      await settled(page);
       const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
       expect(summarize(results.violations)).toEqual([]);
     });
@@ -126,6 +141,7 @@ for (const variant of VARIANTS) {
   // actually on. Same "seed real state, then scan" pattern as the profile
   // tab's device fixture and the admin tab's health-panel load above.
   test(`playlists mirror picker has no WCAG A/AA violations (${theme})`, async ({ page }) => {
+    await trackFetches(page);
     await page.goto("/#/home");
     await setTheme(page, variant);
     // Two separate evaluate() calls, not one: the seeded array raced a
@@ -151,7 +167,7 @@ for (const variant of VARIANTS) {
     await page.evaluate(() => {
       window.Alpine.$data(document.querySelector("[x-data]")).goToTab("playlists");
     });
-    await page.waitForTimeout(400);
+    await settled(page);
     await page.evaluate(() => {
       const app = window.Alpine.$data(document.querySelector("[x-data]"));
       app.playlists = [{
@@ -170,15 +186,16 @@ for (const variant of VARIANTS) {
         track_count: 10, matched_count: 5, unresolved_count: 0,
       }];
     });
-    await page.waitForTimeout(400);
+    await settled(page);
     let results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(summarize(results.violations)).toEqual([]);
 
     // Open the picker too — it's a distinct piece of DOM (greyed/checked
     // rows, indigo "not yet on" rows, and the per-row error line) that the
     // closed-row scan above never renders.
-    await page.getByRole("button", { name: "Mirror…" }).click();
-    await page.waitForTimeout(200);
+    await page.getByRole("button", { name: "Actions" }).first().click();
+    await page.getByRole("menuitem", { name: "Mirror…" }).first().click();
+    await settled(page);
     results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(summarize(results.violations)).toEqual([]);
   });
@@ -191,16 +208,17 @@ for (const variant of VARIANTS) {
   // quiz.spec.js — there's no way to get a real {available: true} pair out
   // of an empty seeded library).
   test(`duel-the-bard quiz has no WCAG A/AA violations (${theme})`, async ({ page }) => {
+    await trackFetches(page);
     await page.goto("/#/home");
     await setTheme(page, variant);
     await page.evaluate(() => {
       window.Alpine.$data(document.querySelector("[x-data]")).goToTab("about");
     });
-    await page.waitForTimeout(200);
+    await settled(page);
     await page.evaluate(() => {
       window.Alpine.$data(document.querySelector("[x-data]")).openQuiz();
     });
-    await page.waitForTimeout(200);
+    await settled(page);
     let results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(summarize(results.violations)).toEqual([]);
 
@@ -211,99 +229,100 @@ for (const variant of VARIANTS) {
       app.quiz.a = { artist: "Small Artist", album_count: 3 };
       app.quiz.b = { artist: "Big Artist", album_count: 20 };
     });
-    await page.waitForTimeout(200);
+    await settled(page);
     results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(summarize(results.violations)).toEqual([]);
 
     // The reveal state (post-guess) is its own distinct DOM — the album
     // counts and win/lose text only render once quiz.guess is set.
     await page.getByRole("button", { name: "Small Artist" }).click();
-    await page.waitForTimeout(200);
+    await settled(page);
     results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(summarize(results.violations)).toEqual([]);
   });
 
-  // Profile: every sub-tab in one test per theme. global-setup doesn't seed
-  // any device, and the 'devices' sub-tab's per-device cards (#234) need at
-  // least one to actually render — an empty list wouldn't exercise that
-  // markup at all — so create one via the same API the UI itself calls,
-  // then force a reload (loadDevices() isn't triggered by tab/sub-tab
-  // navigation, and the periodic poll is 20s, far longer than this test
-  // waits).
-  test(`profile tab has no WCAG A/AA violations (${theme})`, async ({ page }) => {
+  // Profile: each sub-tab, one test each per theme. Then the Devices tab and
+  // the Add Device modal in each of its two branches (enrollment vs.
+  // direct-token, picked by device type). global-setup doesn't seed any
+  // device.
+  for (const sub of PROFILE_SUBTABS) {
+    test(`profile ${sub} has no WCAG A/AA violations (${theme})`, async ({ page }) => {
+      await trackFetches(page);
+      await page.goto("/#/home");
+      await setTheme(page, variant);
+      await page.evaluate(async (s) => {
+        const d = window.Alpine.$data(document.querySelector("[x-data]"));
+        d.goToTab("profile");
+        d.setSubTab("profile", s);
+      }, sub);
+      await settled(page);
+      const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+      expect(results.violations.map((v) => `${sub}: ${v.id} x${v.nodes.length}`)).toEqual([]);
+    });
+  }
+  // The Devices tab's per-device cards need at least one device to render,
+  // so this creates one through the UI's own API and reloads the list
+  // (loadDevices() isn't run by navigation, and the poll is every 20 s).
+  test(`devices tab has no WCAG A/AA violations (${theme})`, async ({ page }) => {
+    await trackFetches(page);
     await page.goto("/#/home");
     await setTheme(page, variant);
     await page.request.post("/api/devices", { data: { name: "a11y-test-device" } });
     await page.evaluate(async () => {
       const d = window.Alpine.$data(document.querySelector("[x-data]"));
-      d.goToTab("profile");
+      d.goToTab("devices");
       await d.loadDevices();
     });
-    const found = [];
-    for (const sub of PROFILE_SUBTABS) {
-      await page.evaluate((s) => {
-        window.Alpine.$data(document.querySelector("[x-data]")).setSubTab("profile", s);
-      }, sub);
-      await page.waitForTimeout(400);
-      const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
-      for (const v of results.violations) {
-        found.push(`${sub}: ${v.id} x${v.nodes.length}`);
-      }
-    }
-    // #233: the Add Device modal branches its content on device type
-    // (enrollment vs. direct-token) — check one of each rather than just
-    // whichever branch happens to be selected by default.
-    for (const deviceType of ["phone", "folder"]) {
+    await settled(page);
+    const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(results.violations.map((v) => `devices: ${v.id} x${v.nodes.length}`)).toEqual([]);
+  });
+  for (const deviceType of ["phone", "folder"]) {
+    test(`add-device modal (${deviceType}) has no WCAG A/AA violations (${theme})`, async ({ page }) => {
+      await trackFetches(page);
+      await page.goto("/#/home");
+      await setTheme(page, variant);
       await page.evaluate((dt) => {
         const d = window.Alpine.$data(document.querySelector("[x-data]"));
+        d.goToTab("profile");
         d.openAddDeviceModal();
         d.newDevice.device_type = dt;
       }, deviceType);
-      await page.waitForTimeout(200);
+      await settled(page);
       const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
-      for (const v of results.violations) {
-        found.push(`add-device-modal/${deviceType}: ${v.id} x${v.nodes.length}`);
-      }
-      await page.evaluate(() => {
-        window.Alpine.$data(document.querySelector("[x-data]")).addDeviceModal.open = false;
-      });
-    }
-    expect(found).toEqual([]);
-  });
+      expect(results.violations.map((v) => `add-device-modal/${deviceType}: ${v.id} x${v.nodes.length}`)).toEqual([]);
+    });
+  }
 
-  // Administration: every sub-tab, and every per-provider config form, in one
-  // test per theme. Switching adminConfig.provider is a display-only Alpine
-  // state change (not saved), so no server state is touched.
-  test(`admin tab has no WCAG A/AA violations (${theme})`, async ({ page }) => {
-    await page.goto("/#/home");
-    await setTheme(page, variant);
-    await page.evaluate(() => window.Alpine.$data(document.querySelector("[x-data]")).goToTab("admin"));
-    const found = [];
-    for (const sub of ADMIN_SUBTABS) {
-      const provs = sub === "config" ? PROVIDERS : [null];
-      for (const prov of provs) {
-        await page.evaluate(async ([s, p]) => {
-          const d = window.Alpine.$data(document.querySelector("[x-data]"));
-          d.setSubTab("admin", s);
-          // Configuration is grouped into collapsible sections; open them all
-          // so the scan covers every card, as it did before the grouping.
-          if (s === "config") d.setAllSections('config', true);
-          if (s === "users") d.setAllSections('users', true);
-          if (p) d.adminConfig.provider = p;
-          // #266: health's issue-count chart lives behind x-if="health",
-          // which stays null until "Check" is clicked — without this, the
-          // scan below would never actually render the chart's canvas at
-          // all (same "at least one to actually render" reasoning as the
-          // profile tab test's device fixture below).
-          if (s === "health" && !d.health) await d.loadHealth();
-        }, [sub, prov]);
-        await page.waitForTimeout(400);
-        const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
-        for (const v of results.violations) {
-          found.push(`${sub}${prov ? "/" + prov : ""}: ${v.id} x${v.nodes.length}`);
-        }
-      }
-    }
-    expect(found).toEqual([]);
-  });
+  // Administration: every sub-tab, and every per-provider config form, one
+  // test each per theme, so no single test carries the whole tab's scans
+  // against one timeout. Switching adminConfig.provider is a display-only
+  // Alpine state change (not saved), so no server state is touched.
+  for (const [sub, prov] of ADMIN_PAGES) {
+    const where = `${sub}${prov ? "/" + prov : ""}`;
+    test(`admin ${where} has no WCAG A/AA violations (${theme})`, async ({ page }) => {
+      await trackFetches(page);
+      await page.goto("/#/home");
+      await setTheme(page, variant);
+      await page.evaluate(() => window.Alpine.$data(document.querySelector("[x-data]")).goToTab("admin"));
+      await page.evaluate(async ([s, p]) => {
+        const d = window.Alpine.$data(document.querySelector("[x-data]"));
+        d.setSubTab("admin", s);
+        // Configuration is grouped into collapsible sections; open them all
+        // so the scan covers every card, as it did before the grouping.
+        if (s === "config") d.setAllSections('config', true);
+        if (s === "users") d.setAllSections('users', true);
+        if (p) d.adminConfig.provider = p;
+        // #266: health's issue-count chart lives behind x-if="health",
+        // which stays null until "Check" is clicked — without this, the
+        // scan below would never actually render the chart's canvas at
+        // all (same "at least one to actually render" reasoning as the
+        // profile tab test's device fixture below).
+        if (s === "health" && !d.health) await d.loadHealth();
+      }, [sub, prov]);
+      await settled(page);
+      const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+      expect(results.violations.map((v) => `${where}: ${v.id} x${v.nodes.length}`)).toEqual([]);
+    });
+  }
 }

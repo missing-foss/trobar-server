@@ -24,6 +24,8 @@ on:
       - docs/**
       - mkdocs.yml
       - docs/requirements.txt
+      - dev/mkdocs_fonts.py
+      - app/static/fonts/**
       - .github/workflows/docs.yml
   pull_request:
     branches: [main]
@@ -31,6 +33,8 @@ on:
       - docs/**
       - mkdocs.yml
       - docs/requirements.txt
+      - dev/mkdocs_fonts.py
+      - app/static/fonts/**
       - .github/workflows/docs.yml
   workflow_dispatch:
 
@@ -50,7 +54,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.x"
       - run: pip install -r docs/requirements.txt
@@ -76,4 +80,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

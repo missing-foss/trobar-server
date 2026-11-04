@@ -136,7 +136,7 @@ what an admin session already sees):
 | `foreign_bytes_reported_at` | string or `null` | Timestamp of the last such report — the only way to tell a current figure from a stale one. `null` alongside the field above. |
 | `created_at` | string | |
 | `last_seen_at` | string or `null` | |
-| `source_of_truth` | string | `"server"` or `"device"` — which side's manifest wins on a mismatch. |
+| `source_of_truth` | string | `"server"` (the default) or `"device"`. `"device"` is the web UI's *Keep device content*: the server still adds what is selected but never marks a track on the device for removal. Nothing else changes. |
 | `transcode_format` | string or `null` | `null` means **sync originals**, not "unset". Otherwise one of `mp3_320`, `mp3_256`, `mp3_192`, `mp3_128`. |
 | `artist_images` | string or `null` | `null` means off. Otherwise `"small"` or `"full"`. |
 | `unknown_track_count` | integer or `null` | `null` ≠ `0` — see below. |
@@ -158,15 +158,18 @@ infers it.
 {
   "enabled": true,
   "percent": 80,
-  "period": "6_months",
+  "period": "6month",
   "albums": 42,
   "tracks": 511,
   "bytes": 2147483648
 }
 ```
 
-`percent`, `period`, `albums`, `tracks`, and `bytes` only mean something
-when `enabled` is `true` — while disabled, the object is just the two
+`period` is the listening-history window the albums are ranked over:
+`6month` unless the caller sends one of `7day`, `1month`, `3month`,
+`6month`, `12month` or `overall`. The web UI never sends one, and a
+refresh without `period` sets it back to `6month`. `percent`, `period`, `albums`,
+`tracks`, and `bytes` only mean something when `enabled` is `true` — while disabled, the object is just the two
 fields above, not the full shape with zeros filled in.
 
 ### Null semantics
@@ -283,9 +286,17 @@ above, not scoped to the calling token's owner:
 | Field | Type | Notes |
 |---|---|---|
 | `mirrors_failing` | integer | Total currently-failing playlist × sink pairs, across every sink. Exact — never affected by `failing`'s cap below. The simplest possible alert: `> 0`. |
-| `by_sink` | object | One entry per sink — `filesystem`, `subsonic`, `jellyfin`, `emby`, `music_assistant`, `plex` — each `{"enabled": integer, "failing": integer}`. Counts playlist × sink **pairs**, not playlists: a playlist mirrored to both Subsonic and Jellyfin counts once in each. `by_sink.*.failing` summed across all sinks always equals `mirrors_failing`. |
+| `by_sink` | object | One entry per sink — `filesystem`, `subsonic`, `jellyfin`, `emby`, `music_assistant`, `plex` — each `{"enabled": integer, "failing": integer, "short": integer}`. Counts playlist × sink **pairs**, not playlists: a playlist mirrored to both Subsonic and Jellyfin counts once in each. `by_sink.*.failing` summed across all sinks always equals `mirrors_failing`, and `by_sink.*.short` equals `mirrors_short`. |
 | `failing` | array | One entry per currently-failing pair — a worklist, not an inventory, capped at 50 entries (see `failing_truncated`). Each entry: `{"playlist_id": integer, "title": string, "sink": string, "error_code": string, "last_written_at": string or null}`. |
 | `failing_truncated` | boolean | `true` if more pairs are failing than `failing` has room for — `mirrors_failing`/`by_sink` are still exact in that case, only the array is short. A single dead mirror target can fail every playlist pointed at it, so this can happen on a real install, not just synthetically. |
+| `mirrors_short` | integer | Enabled playlist × sink pairs whose last write left tracks off the target: tracks the target doesn't have, or ones it refused after the write. Exact, like `mirrors_failing`. Never counts the filesystem mirror, which has no target. |
+| `short` | array | One entry per short pair, capped at 50 (see `short_truncated`): `{"playlist_id": integer, "title": string, "sink": string, "on_target": integer, "total": integer, "lacked": integer, "refused": integer, "run_at": string}`. `total` is the tracks Trobar sent (the ones it matched locally, a repeated track counted once on Music Assistant and Plex), `on_target` how many the copy holds, `lacked` how many the target doesn't have, `refused` how many it dropped after accepting the write (Music Assistant and Plex only; always 0 elsewhere). |
+| `short_truncated` | boolean | `true` if more pairs are short than `short` has room for. |
+
+A short pair is not a failing one: a partial copy is the normal state of
+a target with a different library. `mirrors_short` exists so a monitor can
+show coverage or watch it change, not as a second alarm. The tracks
+themselves are listed per pair in **Administration → Playlist mirrors**.
 
 `error_code` is the raw machine-readable code, the same one
 `GET /api/admin/mirrors` exposes alongside its own rendered message — this
@@ -327,7 +338,8 @@ shape:
 | `409` | `{"error": "..."}` | A scan is already running — this call did not start a second one. |
 
 `force` (optional, default `false`) is read from the JSON body: `false`
-skips files whose mtime hasn't changed since the last scan, `true`
+skips files whose size and modification time haven't changed since the
+last scan, `true`
 re-reads everything. Same meaning as the web UI's own force-rescan option.
 
 There is currently no other action — provider-playlist refresh was

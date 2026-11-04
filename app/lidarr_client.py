@@ -72,11 +72,14 @@ monitor that id directly — the artist is provably already fully settled
 in this case (that's why the stub exists), so no RefreshArtist wait is
 needed on this path."""
 
+import logging
 import time
 
 import requests
 
 import db
+
+_log = logging.getLogger(__name__)
 
 _TIMEOUT_SECONDS = 10
 # Empirically: RefreshArtist for a newly-created artist completed in ~1s

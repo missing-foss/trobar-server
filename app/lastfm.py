@@ -3,15 +3,22 @@
 # SPDX-FileCopyrightText: 2026 missing-foss
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Last.fm suggestions — uses the public API (just an api_key + the user's
-Last.fm username, no OAuth)."""
+"""Last.fm: suggestions read through the public API (an api_key and the user's
+Last.fm username), and the signed calls that link an account and send plays
+(api_signature, auth_url, get_session; play_forward sends)."""
 
+import hashlib
+import logging
 import os
 import random
+from urllib.parse import urlencode
 
 import requests
 
+import history_cache
 import suggestions as suggestions_mod
+
+_log = logging.getLogger(__name__)
 
 LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
 # Base URL for the Last.fm API. Deployment-time default (env var, e.g. a dev
@@ -20,14 +27,21 @@ LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
 # "lastfm_api_base") to point at a self-hosted alternative such as Libre.fm
 # — that override is threaded through as the api_base param on every
 # function below rather than read here, since it can change per-request.
-# Defaults to the real endpoint.
-API_BASE = os.environ.get("LASTFM_API_BASE", "http://ws.audioscrobbler.com/2.0/")
+# Defaults to the real endpoint, over HTTPS: every call carries the API key
+# and most carry the username.
+API_BASE = os.environ.get("LASTFM_API_BASE", "https://ws.audioscrobbler.com/2.0/")
 
 # Last.fm returns this same image (a plain gray "no cover" square) for every
 # album it has no real art for, keyed by this fixed hash regardless of size —
 # well-documented Last.fm API quirk. Treat it as "no image" rather than
 # showing the placeholder as if it were real art.
 _LASTFM_PLACEHOLDER_HASH = "2a96cbd8b46e442fc41c2b86b821562f"
+
+
+def _log_failure(method: str, error: Exception, key: str) -> None:
+    """Log a failed call without the API key. A requests error's text holds
+    the request URL, and the key is in its query string."""
+    _log.warning("Last.fm %s failed: %s", method, str(error).replace(key, "[key]"))
 
 
 def _album_image_url(image_list: list[dict]) -> str | None:
@@ -40,11 +54,11 @@ def _album_image_url(image_list: list[dict]) -> str | None:
 
 def check_connection(username: str, api_key: str = "", api_base: str = "") -> bool:
     """Lightweight reachability/validity check for the header status dot —
-    True iff Last.fm actually answered for this username+key. Deliberately
-    independent of top_albums()/suggestions(): those silently return [] both
-    when the account is fine but nothing currently qualifies, and when the
-    request itself failed — this is the one place that distinguishes the
-    two, using the cheapest call the API offers (no track/album list)."""
+    True iff Last.fm actually answered for this username+key, using the
+    cheapest call the API offers (no track/album list). top_albums() and the
+    functions above it also tell a failure (None) from an empty answer ([]),
+    but they fetch whole lists; this is the check the status dot can afford
+    to run on every page load."""
     key = api_key or LASTFM_API_KEY
     if not key or not username:
         return False
@@ -61,10 +75,12 @@ def check_connection(username: str, api_key: str = "", api_base: str = "") -> bo
         return False
 
 
+@history_cache.cached("lastfm.top_albums")
 def top_albums(username: str, api_key: str = "", period: str = "6month", limit: int = 50,
-                api_base: str = "") -> list[dict]:
-    """Raw Last.fm top-albums for a username. [] on any failure or missing
-    config. `api_key` is the per-user key set in Profil; falls back to the
+                api_base: str = "") -> list[dict] | None:
+    """Raw Last.fm top-albums for a username. [] when there are none or the
+    config is missing; None when Last.fm didn't answer (any failure), so a
+    caller can tell an outage from "nothing played". `api_key` is the per-user key set in Profil; falls back to the
     LASTFM_API_KEY env var if the user hasn't set one (so a single
     app-wide key, if provisioned, still works without every user having to
     paste it themselves — Last.fm keys are tied to the registered
@@ -82,8 +98,8 @@ def top_albums(username: str, api_key: str = "", period: str = "6month", limit: 
         resp.raise_for_status()
         return resp.json().get("topalbums", {}).get("album", [])
     except Exception as e:
-        print(f"[lastfm] error: {e}")
-        return []
+        _log_failure("user.getTopAlbums", e, key)
+        return None
 
 
 def similar_artists(artist: str, api_key: str = "", limit: int = 30, api_base: str = "") -> list[str]:
@@ -106,12 +122,12 @@ def similar_artists(artist: str, api_key: str = "", limit: int = 30, api_base: s
         similar = resp.json().get("similarartists", {}).get("artist", [])
         return [a["name"] for a in similar if a.get("name")]
     except Exception as e:
-        print(f"[lastfm] error: {e}")
+        _log_failure("artist.getSimilar", e, key)
         return []
 
 
 def suggestions(conn, username: str, api_key: str = "", period: str = "6month", limit: int = 50,
-                 user_device_ids: set[int] | None = None, api_base: str = "") -> list[dict]:
+                 user_device_ids: set[int] | None = None, api_base: str = "") -> list[dict] | None:
     """Top albums already in the local catalog (under MUSIC_ROOT) but not yet
     synced to every device the caller manages — "you listen to this a lot,
     sync it" suggestions. Albums Last.fm reports that aren't in the library
@@ -121,6 +137,8 @@ def suggestions(conn, username: str, api_key: str = "", period: str = "6month", 
     *every* device `user_device_ids` covers — partially-synced (e.g. only on
     one of two devices) still surfaces, since there's still something to do."""
     albums = top_albums(username, api_key, period, limit, api_base=api_base)
+    if albums is None:
+        return None  # Last.fm didn't answer
     if not albums:
         return []
 
@@ -157,7 +175,7 @@ def suggestions(conn, username: str, api_key: str = "", period: str = "6month", 
 
 
 def most_played(username: str, api_key: str = "", period: str = "6month", limit: int = 10,
-                 api_base: str = "") -> list[dict]:
+                 api_base: str = "") -> list[dict] | None:
     """#267: ranked top albums by playcount — the user's actual Last.fm
     listening, unlike suggestions() above which intersects with the local
     catalog (dropping anything not ripped) and shuffles the result. No
@@ -165,6 +183,8 @@ def most_played(username: str, api_key: str = "", period: str = "6month", limit:
     listen to, not what you have. Already in Last.fm's own
     playcount-descending order, so no re-sort needed."""
     albums = top_albums(username, api_key, period, limit, api_base=api_base)
+    if albums is None:
+        return None  # Last.fm didn't answer
     out = []
     for a in albums:
         artist = a.get("artist", {}).get("name", "")
@@ -180,9 +200,11 @@ def most_played(username: str, api_key: str = "", period: str = "6month", limit:
     return out
 
 
-def recent_tracks(username: str, api_key: str = "", limit: int = 50, api_base: str = "") -> list[dict]:
-    """Raw Last.fm recent-tracks for a username. [] on any failure or missing
-    config, same contract as top_albums()."""
+@history_cache.cached("lastfm.recent_tracks")
+def recent_tracks(username: str, api_key: str = "", limit: int = 50,
+                  api_base: str = "") -> list[dict] | None:
+    """Raw Last.fm recent-tracks for a username. Same contract as
+    top_albums(): [] for none or missing config, None on any failure."""
     key = api_key or LASTFM_API_KEY
     if not key or not username:
         return []
@@ -195,18 +217,21 @@ def recent_tracks(username: str, api_key: str = "", limit: int = 50, api_base: s
         resp.raise_for_status()
         return resp.json().get("recenttracks", {}).get("track", [])
     except Exception as e:
-        print(f"[lastfm] error: {e}")
-        return []
+        _log_failure("user.getRecentTracks", e, key)
+        return None
 
 
 def recently_played_suggestions(conn, username: str, api_key: str = "", limit: int = 50,
-                                 user_device_ids: set[int] | None = None, api_base: str = "") -> list[dict]:
+                                 user_device_ids: set[int] | None = None,
+                                 api_base: str = "") -> list[dict] | None:
     """Distinct albums from the user's most recent scrobbles — 's
     "recently played" half. Roon itself doesn't expose play history via
     Browse at all (verified live — see discussion), so this reuses
     the Last.fm connection the app already has instead. Same locally-
     available + not-fully-synced-everywhere filter as suggestions() above."""
     tracks = recent_tracks(username, api_key, limit, api_base=api_base)
+    if tracks is None:
+        return None  # Last.fm didn't answer
     if not tracks:
         return []
 
@@ -240,3 +265,32 @@ def recently_played_suggestions(conn, username: str, api_key: str = "", limit: i
             "source": "lastfm-recent",
         })
     return out
+
+
+def api_signature(params: dict, secret: str) -> str:
+    """Last.fm's request signature: every parameter but `format`, sorted by
+    name in ASCII order, joined as namevalue, then the shared secret, as MD5.
+    The API requires MD5; the secret itself is never sent."""
+    joined = "".join(f"{k}{params[k]}" for k in sorted(params) if k != "format")
+    return hashlib.md5((joined + secret).encode("utf-8")).hexdigest()  # noqa: S324
+
+
+def auth_url(api_key: str, callback: str) -> str:
+    """Where to send someone to grant this install access to their account."""
+    return "https://www.last.fm/api/auth/?" + urlencode({"api_key": api_key, "cb": callback})
+
+
+def get_session(api_key: str, secret: str, token: str, api_base: str = "") -> dict | None:
+    """The session for a token from the auth redirect: {"name", "key"}, or None
+    if Last.fm didn't give one."""
+    params = {"method": "auth.getSession", "api_key": api_key, "token": token}
+    try:
+        resp = requests.post(api_base or API_BASE, timeout=15,
+                             data={**params, "api_sig": api_signature(params, secret), "format": "json"})
+        session = resp.json().get("session") or {}
+    except (requests.RequestException, ValueError) as e:
+        _log.warning("Last.fm session request failed: %s", type(e).__name__)
+        return None
+    if not session.get("key") or not session.get("name"):
+        return None
+    return {"name": session["name"], "key": session["key"]}

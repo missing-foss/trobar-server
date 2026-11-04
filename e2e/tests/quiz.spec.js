@@ -4,6 +4,7 @@
 
 // @ts-check
 const { test, expect } = require("@playwright/test");
+const { trackFetches, settled } = require("../support/settle");
 
 // #508: the "duel the bard" Easter egg. global-setup seeds an empty library
 // (see e2e/README.md) — genuinely zero tracks, no provider connected — so
@@ -17,10 +18,11 @@ const { test, expect } = require("@playwright/test");
 // app/test_library_quiz.py — nothing here re-tests that.
 
 async function gotoAbout(page) {
+  await trackFetches(page);
   await page.goto("/#/about");
   await page.evaluate(() =>
     window.Alpine.$data(document.querySelector("[x-data]")).goToTab("about"));
-  await page.waitForTimeout(200);
+  await settled(page);
 }
 
 test.describe("duel-the-bard trigger (#508)", () => {
@@ -39,12 +41,13 @@ test.describe("duel-the-bard trigger (#508)", () => {
   });
 
   test("a gap longer than the tap window resets the count instead of accumulating forever", async ({ page }) => {
+    await page.clock.install();
     await gotoAbout(page);
     const bard = page.getByRole("button", { name: "Trobar rosette mark" });
     await bard.click();
     await bard.click();
-    // Longer than tapBard()'s own 1500ms reset window.
-    await page.waitForTimeout(1800);
+    // Past tapBard()'s own 1500ms reset window, without sleeping through it.
+    await page.clock.runFor(1600);
     await bard.click();
     await bard.click();
     await bard.click();
@@ -79,7 +82,7 @@ test.describe("duel-the-bard guess/reveal (#508)", () => {
       app.quiz.a = { artist: "Small Artist", album_count: 3 };
       app.quiz.b = { artist: "Big Artist", album_count: 20 };
     });
-    await page.waitForTimeout(100);
+    await settled(page);
   }
 
   test("guessing the artist with fewer albums reveals the correct answer", async ({ page }) => {

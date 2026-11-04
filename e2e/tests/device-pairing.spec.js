@@ -17,8 +17,7 @@ async function gotoDevices(page) {
     () => window.Alpine && !!window.Alpine.$data(document.querySelector("[x-data]")));
   await page.evaluate(async () => {
     const a = window.Alpine.$data(document.querySelector("[x-data]"));
-    a.goToTab("profile");
-    a.setSubTab("profile", "devices");
+    a.goToTab("devices");
     await a.loadDevices();
   });
 }
@@ -62,7 +61,9 @@ test.describe("device pairing", () => {
     await gotoDevices(page);
 
     await expect(page.getByRole("button", { name: "Regenerate + QR" })).toHaveCount(0);
-    const row = page.locator("div").filter({ hasText: name }).filter({ has: page.getByRole("button", { name: "Re-pair in app" }) }).last();
+    // By id: the last div holding the name and a Re-pair button can be another
+    // device's card while other specs add devices.
+    const row = page.locator(`[data-testid="device-card"][data-device-id="${device.id}"]`);
     page.once("dialog", (d) => d.accept());
     await row.getByRole("button", { name: "Re-pair in app" }).click();
 

@@ -9,6 +9,18 @@ const { test, expect } = require("@playwright/test");
 // and desktop apps do, shows in the Playlists list with that device's icon
 // and "From <device>" as its tooltip. Deleting the device removes it.
 
+// playlists.spec.js toggles the shared e2e user's "Hide playlists with no
+// local tracks", saved server-side, and the playlist here matches no track.
+// Serve this page the real profile with that filter off, whatever another
+// spec running alongside has left saved.
+async function showZeroMatchPlaylists(page) {
+  await page.route("**/api/profile", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    const resp = await route.fetch();
+    return route.fulfill({ response: resp, json: { ...(await resp.json()), hide_zero_match_playlists: false } });
+  });
+}
+
 test.describe("Playlists made on a device", () => {
   let device;
   test.beforeEach(async ({ request }) => {
@@ -28,6 +40,7 @@ test.describe("Playlists made on a device", () => {
     expect(uploaded.ok()).toBeTruthy();
     expect((await uploaded.json()).playlists).toBe(1);
 
+    await showZeroMatchPlaylists(page);
     await page.goto("/#/playlists");
     await page.waitForFunction(() => window.Alpine && !!window.Alpine.$data(document.querySelector("[x-data]")));
     await page.evaluate(async () => {

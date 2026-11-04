@@ -105,7 +105,7 @@ def _error_reason(exc: Exception) -> str:
     caller/UI can tell a rate-limit from a not-found from a parse error."""
     if isinstance(exc, requests.HTTPError):
         status = getattr(exc.response, "status_code", None)
-        return "rate_limited" if status == 429 else "http_error"
+        return "rate_limited" if status == 429 else f"http_{status}"
     if isinstance(exc, requests.RequestException):
         return "network"
     return "parse_error"
@@ -227,11 +227,16 @@ def get_playlist_tracks(title: str, source_playlist_id: str | None = None,
                 if not artist and not track_title:
                     continue
                 album = track.get("album") or {}
+                # The Web API's track object documents external_ids.isrc;
+                # read defensively, as the live shape is still unconfirmed.
+                external = track.get("external_ids") or {}
+                isrc = external.get("isrc") if isinstance(external, dict) else None
                 tracks.append({
                     "position": position,
                     "artist": artist,
                     "title": track_title,
                     "album": album.get("name") if isinstance(album, dict) else None,
+                    "isrc": isrc if isinstance(isrc, str) and isrc else None,
                 })
                 position += 1
             nxt = body.get("next")

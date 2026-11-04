@@ -18,8 +18,12 @@ In-memory SQLite (db.SCHEMA + db._run_migrations()), no Flask — same
 harness pattern as test_selections.py / test_playlist_sync.py.
 """
 import json
+import shutil
 import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import db
 import sync_state
@@ -74,11 +78,63 @@ class RequiredTrackIdsTests(unittest.TestCase):
         sync_state.create_selection(self.conn, "artist", "Aphelion", self.user, [self.device])
         self.assertEqual(sync_state.required_track_ids_for_device(self.conn, self.device), {t1, t2})
 
+    def test_an_artist_selection_takes_the_albums_it_is_the_album_artist_of(self):
+        # "Various Artists" selects every compilation; an artist's guest track
+        # on their own album joins.
+        comp = _make_track(self.conn, "Performer A", "Now 42", "One", "now/1.flac")
+        guest = _make_track(self.conn, "Aphelion feat. Cinder", "Event Horizon", "B", "a/2.flac")
+        own = _make_track(self.conn, "Aphelion", "Event Horizon", "A", "a/1.flac")
+        self.conn.execute("UPDATE tracks SET album_artist = 'Various Artists' WHERE id = ?", (comp,))
+        self.conn.execute("UPDATE tracks SET album_artist = 'Aphelion' WHERE id IN (?, ?)", (guest, own))
+        self.conn.commit()
+        sync_state.create_selection(self.conn, "artist", "Various Artists", self.user, [self.device])
+        self.assertEqual(sync_state.required_track_ids_for_device(self.conn, self.device), {comp})
+        other, _ = sync_state.create_device(self.conn, self.user, "player")
+        sync_state.create_selection(self.conn, "artist", "Aphelion", self.user, [other])
+        self.assertEqual(sync_state.required_track_ids_for_device(self.conn, other), {own, guest})
+
     def test_album_selection_resolves_only_that_album(self):
         t1 = _make_track(self.conn, "Aphelion", "Event Horizon", "Singularity", "a/1.flac")
         _make_track(self.conn, "Aphelion", "Parallax", "Redshift", "a/2.flac")  # other album
         sync_state.create_selection(self.conn, "album", "Aphelion||Event Horizon", self.user, [self.device])
         self.assertEqual(sync_state.required_track_ids_for_device(self.conn, self.device), {t1})
+
+    def _compilation(self):
+        a = _make_track(self.conn, "Performer A", "Now 42", "One", "now/1.flac")
+        b = _make_track(self.conn, "Performer B", "Now 42", "Two", "now/2.flac")
+        self.conn.execute("UPDATE tracks SET album_artist = 'Various Artists' WHERE album = 'Now 42'")
+        self.conn.commit()
+        return a, b
+
+    def test_an_album_selected_by_its_album_artist_is_the_whole_album(self):
+        a, b = self._compilation()
+        sync_state.create_selection(self.conn, "album", "Various Artists||Now 42", self.user, [self.device])
+        self.assertEqual(sync_state.required_track_ids_for_device(self.conn, self.device), {a, b})
+
+    def test_an_album_selected_by_a_track_artist_is_that_artists_tracks_on_it(self):
+        # What every selection made before the album-artist grouping is, kept
+        # exactly: no migration.
+        a, _b = self._compilation()
+        sync_state.create_selection(self.conn, "album", "Performer A||Now 42", self.user, [self.device])
+        self.assertEqual(sync_state.required_track_ids_for_device(self.conn, self.device), {a})
+
+    def test_a_track_whose_album_artist_is_not_read_yet_counts_as_its_artists(self):
+        a, _b = self._compilation()
+        self.conn.execute("UPDATE tracks SET album_artist = NULL")
+        sync_state.create_selection(self.conn, "album", "Various Artists||Now 42", self.user, [self.device])
+        self.assertEqual(sync_state.required_track_ids_for_device(self.conn, self.device), set())
+        sync_state.create_selection(self.conn, "album", "Performer A||Now 42", self.user, [self.device])
+        self.assertEqual(sync_state.required_track_ids_for_device(self.conn, self.device), {a})
+
+    def test_a_guest_track_joins_its_albums_selection(self):
+        # The one change for an existing selection: a track crediting another
+        # artist but tagged with the album's artist belongs to the album.
+        own = _make_track(self.conn, "Aphelion", "Event Horizon", "A", "a/1.flac")
+        guest = _make_track(self.conn, "Aphelion feat. Cinder", "Event Horizon", "B", "a/2.flac")
+        self.conn.execute("UPDATE tracks SET album_artist = 'Aphelion'")
+        self.conn.commit()
+        sync_state.create_selection(self.conn, "album", "Aphelion||Event Horizon", self.user, [self.device])
+        self.assertEqual(sync_state.required_track_ids_for_device(self.conn, self.device), {own, guest})
 
     def test_deleted_tracks_are_excluded(self):
         live = _make_track(self.conn, "Aphelion", "Event Horizon", "A", "a/1.flac")
@@ -255,6 +311,248 @@ class RecomputeDeviceStateTests(unittest.TestCase):
         self.assertEqual(after["status"], "removed")
         self.assertEqual(after["updated_at"], before)  # skipped, not re-marked
 
+
+class AckTests(unittest.TestCase):
+    """An ack applies only to the state the device was told about, and a
+    deletion names the file the device was actually given."""
+
+    def setUp(self):
+        self.conn = _make_conn()
+        self.user = _make_user(self.conn)
+        self.device, _ = sync_state.create_device(self.conn, self.user, "phone")
+        self.track = _make_track(self.conn, "Aphelion", "Event Horizon", "Perihelion",
+                                 "Aphelion/Event Horizon/01.flac", track_no=1)
+        self.selection = sync_state.create_selection(
+            self.conn, "artist", "Aphelion", self.user, [self.device])
+
+    def _to_delete(self):
+        return [t["relative_path"] for t in sync_state.get_changes(self.conn, self.device)["to_delete"]]
+
+    def test_a_removed_ack_after_the_track_was_selected_again_is_ignored(self):
+        self.assertTrue(sync_state.ack(self.conn, self.device, self.track, "downloaded"))
+        sync_state.delete_selection(self.conn, self.selection)
+        self.assertEqual(_status(self.conn, self.device, self.track), "removed")
+        # The device fetched to_delete; before its ack, the track is selected again.
+        sync_state.create_selection(self.conn, "artist", "Aphelion", self.user, [self.device])
+        with self.assertLogs("device_store", level="INFO"):
+            self.assertFalse(sync_state.ack(self.conn, self.device, self.track, "removed"))
+        self.assertEqual(_status(self.conn, self.device, self.track), "pending")
+
+    def test_a_downloaded_ack_after_the_track_was_deselected_is_ignored(self):
+        # The device fetched to_download; before its ack, the track is deselected.
+        sync_state.delete_selection(self.conn, self.selection)
+        with self.assertLogs("device_store", level="INFO"):
+            self.assertFalse(sync_state.ack(self.conn, self.device, self.track, "downloaded", 900))
+        self.assertEqual(_status(self.conn, self.device, self.track), "removed")
+
+    def test_acks_in_the_expected_state_apply(self):
+        self.assertTrue(sync_state.ack(self.conn, self.device, self.track, "downloaded", 900))
+        self.assertTrue(sync_state.ack(self.conn, self.device, self.track, "downloaded", 901))
+        sync_state.delete_selection(self.conn, self.selection)
+        self.assertTrue(sync_state.ack(self.conn, self.device, self.track, "removed"))
+        self.assertIsNone(_status(self.conn, self.device, self.track))
+
+    def test_a_deletion_after_a_format_change_names_the_delivered_file(self):
+        sync_state.ack(self.conn, self.device, self.track, "downloaded")
+        # What PATCH /api/devices/<id> does on a format change.
+        self.conn.execute("UPDATE devices SET transcode_format = 'mp3_320' WHERE id = ?", (self.device,))
+        self.conn.execute("UPDATE device_track_state SET status = 'pending' "
+                          "WHERE device_id = ? AND status = 'downloaded'", (self.device,))
+        self.conn.commit()
+        sync_state.delete_selection(self.conn, self.selection)
+        self.assertEqual(self._to_delete(), ["Aphelion/Event Horizon/01 - Perihelion.flac"])
+
+    def _change_format(self, device_id, fmt):
+        # What PATCH /api/devices/<id> does on a format change.
+        self.conn.execute("UPDATE devices SET transcode_format = ? WHERE id = ?", (fmt, device_id))
+        self.conn.execute("UPDATE device_track_state SET status = 'pending' "
+                          "WHERE device_id = ? AND status = 'downloaded'", (device_id,))
+        self.conn.commit()
+
+    def test_a_manifest_after_a_format_change_names_the_file_it_reported(self):
+        # The device acked the .flac, the format changed, and the device's
+        # manifest then reports the .mp3 it holds now (its ack was lost).
+        sync_state.ack(self.conn, self.device, self.track, "downloaded")
+        self._change_format(self.device, "mp3_320")
+        self.assertEqual(sync_state.record_device_manifest(
+            self.conn, self.device, ["Aphelion/Event Horizon/01 - Perihelion.mp3"]),
+            {"matched": 1, "unmatched": 0})
+        sync_state.delete_selection(self.conn, self.selection)
+        self.assertEqual(self._to_delete(), ["Aphelion/Event Horizon/01 - Perihelion.mp3"])
+
+    def test_a_transfer_keeps_the_delivered_name(self):
+        sync_state.ack(self.conn, self.device, self.track, "downloaded")
+        self._change_format(self.device, "mp3_320")
+        sync_state.delete_selection(self.conn, self.selection)
+        new_device, _ = sync_state.create_device(self.conn, self.user, "new phone")
+        sync_state.transfer_device(self.conn, self.device, new_device)
+        changes = sync_state.get_changes(self.conn, new_device)
+        self.assertEqual([t["relative_path"] for t in changes["to_delete"]],
+                         ["Aphelion/Event Horizon/01 - Perihelion.flac"])
+
+    def test_a_row_without_a_delivered_path_still_gets_the_computed_name(self):
+        sync_state.ack(self.conn, self.device, self.track, "downloaded")
+        self.conn.execute("UPDATE device_track_state SET delivered_path = NULL")
+        self.conn.commit()
+        sync_state.delete_selection(self.conn, self.selection)
+        self.assertEqual(self._to_delete(), ["Aphelion/Event Horizon/01 - Perihelion.flac"])
+
+
+class BackfillDeliveredPathTests(unittest.TestCase):
+    """Rows delivered before deliveries recorded a name get the name they were
+    delivered under, so a later layout change can't make a deletion miss."""
+
+    def setUp(self):
+        self.conn = _make_conn()
+        self.user = _make_user(self.conn)
+        self.mp3, _ = sync_state.create_device(self.conn, self.user, "player", transcode_format="mp3_320")
+        self.flac, _ = sync_state.create_device(self.conn, self.user, "phone")
+        self.track = _make_track(self.conn, "Aphelion", "Event Horizon", "Perihelion",
+                                 "Aphelion/Event Horizon/01.flac", track_no=1)
+        self.other = _make_track(self.conn, "Aphelion", "Event Horizon", "Aphelion Rising",
+                                 "Aphelion/Event Horizon/02.flac", track_no=2)
+        self.conn.execute("UPDATE tracks SET lossless = 1")
+        rows = [(self.mp3, self.track, "downloaded", None), (self.flac, self.track, "downloaded", None),
+                (self.flac, self.other, "removed", None),
+                (self.mp3, self.other, "downloaded", "Old Name/Elsewhere/02.mp3")]
+        self.conn.executemany(
+            "INSERT INTO device_track_state (device_id, track_id, status, delivered_path) VALUES (?, ?, ?, ?)", rows)
+        self.conn.commit()
+
+    def _paths(self):
+        return {(r["device_id"], r["track_id"]): r["delivered_path"] for r in self.conn.execute(
+            "SELECT device_id, track_id, delivered_path FROM device_track_state")}
+
+    def test_downloaded_rows_get_their_devices_name_and_nothing_else_changes(self):
+        with self.assertLogs("device_store", level="INFO"):
+            self.assertEqual(sync_state.backfill_delivered_paths(self.conn), 2)
+        self.assertEqual(self._paths(), {
+            (self.mp3, self.track): "Aphelion/Event Horizon/01 - Perihelion.mp3",
+            (self.flac, self.track): "Aphelion/Event Horizon/01 - Perihelion.flac",
+            (self.flac, self.other): None,  # removed: may never have been delivered
+            (self.mp3, self.other): "Old Name/Elsewhere/02.mp3",  # recorded: kept
+        })
+
+    def test_a_second_run_finds_nothing(self):
+        sync_state.backfill_delivered_paths(self.conn)
+        self.assertEqual(sync_state.backfill_delivered_paths(self.conn), 0)
+
+    def test_init_db_runs_it(self):
+        tmp = tempfile.mkdtemp(prefix="trobar-test-backfill-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        for name, value in (("DATA_DIR", Path(tmp)), ("DB_PATH", Path(tmp) / "music-sync.db")):
+            patcher = mock.patch.object(db, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with mock.patch.object(db, "_backfill_delivered_paths") as backfill:
+            db.init_db()
+        backfill.assert_called_once()
+
+    def test_init_db_runs_it_only_when_something_is_missing(self):
+        with mock.patch.object(sync_state, "backfill_delivered_paths") as backfill:
+            db._backfill_delivered_paths(self.conn)
+            backfill.assert_called_once()
+            self.conn.execute("UPDATE device_track_state SET delivered_path = 'x' WHERE status = 'downloaded'")
+            backfill.reset_mock()
+            db._backfill_delivered_paths(self.conn)
+            backfill.assert_not_called()
+
+class AlbumArtistLayoutTests(unittest.TestCase):
+    """A new delivery goes under the album artist's folder; a track already on
+    a device keeps the name it has, in everything the server tells the
+    device: the clients match files by path only and can't rename them."""
+
+    LEGACY = "Performer A/Now 42/01 - One.flac"
+    NEW = "Various Artists/Now 42/01 - One.flac"
+
+    def setUp(self):
+        self.conn = _make_conn()
+        self.user = _make_user(self.conn)
+        self.device, _ = sync_state.create_device(self.conn, self.user, "phone")
+        self.track = _make_track(self.conn, "Performer A", "Now 42", "One", "now/01.flac", track_no=1)
+        self.conn.execute("UPDATE tracks SET album_artist = 'Various Artists'")
+        self.conn.commit()
+
+    def _state(self, status, delivered_path=None):
+        self.conn.execute(
+            "INSERT INTO device_track_state (device_id, track_id, status, delivered_path) VALUES (?, ?, ?, ?)",
+            (self.device, self.track, status, delivered_path))
+        self.conn.commit()
+
+    def _changes(self, key):
+        return [t["relative_path"] for t in sync_state.get_changes(self.conn, self.device)[key]]
+
+    def test_a_new_delivery_goes_under_the_album_artist(self):
+        self._state("pending")
+        self.assertEqual(self._changes("to_download"), [self.NEW])
+
+    def test_a_delivered_track_keeps_its_name_in_the_downloaded_list(self):
+        self._state("downloaded", self.LEGACY)
+        self.assertEqual(self._changes("downloaded"), [self.LEGACY])
+
+    def test_a_removed_track_without_a_recorded_name_is_deleted_by_its_legacy_name(self):
+        self._state("removed")
+        self.assertEqual(self._changes("to_delete"), [self.LEGACY])
+
+    def test_a_playlist_names_a_delivered_track_as_it_is_on_the_device(self):
+        self._state("downloaded", self.LEGACY)
+        playlist = sync_state._new_id(self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, last_synced_at) VALUES ('Mix', 'roon', datetime('now'))"))
+        self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, matched_track_id) VALUES (?, 0, ?)",
+                          (playlist, self.track))
+        sync_state.create_selection(self.conn, "playlist", str(playlist), self.user, [self.device])
+        self.conn.execute("UPDATE device_track_state SET status = 'downloaded', delivered_path = ?", (self.LEGACY,))
+        self.conn.commit()
+        [pl] = sync_state.get_changes(self.conn, self.device)["playlists"]
+        self.assertIn(self.LEGACY, pl["content"].splitlines())
+        self.assertNotIn(self.NEW, pl["content"].splitlines())
+
+    def test_a_track_queued_again_is_named_by_its_new_delivery(self):
+        # A format change or a re-download sets a delivered row back to
+        # pending and keeps its old delivered_path: the playlist must name the
+        # file the device is about to get, not the one it had.
+        playlist = sync_state._new_id(self.conn.execute(
+            "INSERT INTO playlists (title, source_provider, last_synced_at) VALUES ('Mix', 'roon', datetime('now'))"))
+        self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, matched_track_id) VALUES (?, 0, ?)",
+                          (playlist, self.track))
+        sync_state.create_selection(self.conn, "playlist", str(playlist), self.user, [self.device])
+        self.conn.execute("UPDATE device_track_state SET status = 'pending', delivered_path = ?", (self.LEGACY,))
+        self.conn.commit()
+        [pl] = sync_state.get_changes(self.conn, self.device)["playlists"]
+        self.assertIn(self.NEW, pl["content"].splitlines())
+        self.assertEqual(self._changes("to_download"), [self.NEW])
+
+    def test_an_ack_records_the_new_name_and_a_repeat_keeps_the_old_one(self):
+        self._state("pending")
+        sync_state.ack(self.conn, self.device, self.track, "downloaded")
+        self.assertEqual(self._changes("downloaded"), [self.NEW])
+        self.conn.execute("UPDATE device_track_state SET delivered_path = ?", (self.LEGACY,))
+        self.conn.commit()
+        sync_state.ack(self.conn, self.device, self.track, "downloaded")
+        self.assertEqual(self._changes("downloaded"), [self.LEGACY], "already on the device: kept")
+
+    def test_a_manifest_matches_either_layout(self):
+        for path in (self.LEGACY, self.NEW):
+            with self.subTest(path=path):
+                self.conn.execute("DELETE FROM device_track_state")
+                result = sync_state.record_device_manifest(self.conn, self.device, [path])
+                self.assertEqual(result, {"matched": 1, "unmatched": 0})
+                self.assertEqual(self._changes("downloaded"), [path], "recorded as the name it has")
+
+    def test_a_current_name_wins_over_another_tracks_legacy_name(self):
+        # Another track whose current name is this track's legacy one, listed
+        # first, so a later legacy entry would overwrite it.
+        other = sync_state._new_id(self.conn.execute(
+            "INSERT INTO tracks (id, relative_path, artist, album_artist, album, title, track_no, size, mtime) "
+            "VALUES (0, 'elsewhere/01.flac', 'Performer A', 'Performer A', 'Now 42', 'One', 1, 1, 0)"))
+        index = sync_state.device_path_index(self.conn, self.device)
+        self.assertEqual(index[self.LEGACY]["id"], other)
+        self.assertEqual(index[self.NEW]["id"], self.track)
+
+    def test_the_backfill_records_the_legacy_name(self):
+        self._state("downloaded")
+        sync_state.backfill_delivered_paths(self.conn)
+        self.assertEqual(self._changes("downloaded"), [self.LEGACY])
 
 class DeleteSelectionTests(unittest.TestCase):
     def setUp(self):
@@ -701,14 +999,12 @@ class EnrollmentGrantTests(unittest.TestCase):
         self.assertIsNone(
             sync_state.redeem_enrollment_grant(self.conn, "BOGUS123", "A", "phone", None))
 
-    def test_a_code_lasts_an_hour(self):
-        """While the Garmin app is sideloaded, a code reaches the watch in a
-        settings file and is redeemed only at its next Wi-Fi sync."""
+    def test_a_code_lasts_its_ttl(self):
         code = sync_state.create_enrollment_grant(self.conn, self.user)
         left = self.conn.execute(
             "SELECT (julianday(expires_at) - julianday('now')) * 86400 AS s "
             "FROM enrollment_grants WHERE code_hash = ?", (sync_state.hash_token(code),)).fetchone()["s"]
-        self.assertAlmostEqual(left, 3600, delta=5)
+        self.assertAlmostEqual(left, sync_state.ENROLLMENT_TTL_SECONDS, delta=5)
 
     def test_expired_code_returns_none(self):
         code = sync_state.create_enrollment_grant(self.conn, self.user)
@@ -733,6 +1029,12 @@ def _make_track_sd(conn: sqlite3.Connection, artist: str, album: str, title: str
     return sync_state._new_id(cur)
 
 
+def _est_row(size, relative_path, duration, lossless=None):
+    """A track as _device_size_estimate reads it. lossless None: not yet known
+    (decided by the extension), as a row from before tracks.lossless."""
+    return {"size": size, "relative_path": relative_path, "duration": duration, "lossless": lossless}
+
+
 class DeviceSizeEstimateTests(unittest.TestCase):
     """_device_size_estimate: what a track will actually occupy on a device.
     A transcoding device stores lossless sources as CBR MP3 (bitrate/8 per
@@ -741,28 +1043,34 @@ class DeviceSizeEstimateTests(unittest.TestCase):
 
     def test_non_transcoding_device_uses_original_size(self):
         self.assertEqual(
-            sync_state._device_size_estimate(5_000_000, "a/x.flac", 60.0, None), 5_000_000)
+            sync_state._device_size_estimate(_est_row(5_000_000, "a/x.flac", 60.0), None), 5_000_000)
 
     def test_transcoding_lossless_uses_bitrate_estimate(self):
         # mp3_320 = 40_000 B/s; 60s -> 2_400_000 + 262_144 slack.
         self.assertEqual(
-            sync_state._device_size_estimate(5_000_000, "a/x.flac", 60.0, "mp3_320"),
+            sync_state._device_size_estimate(_est_row(5_000_000, "a/x.flac", 60.0), "mp3_320"),
             60 * 40_000 + 256 * 1024)
 
     def test_estimate_never_exceeds_the_original(self):
         # A suspiciously long duration must not inflate the estimate past the
         # real file — the min() cap.
         self.assertEqual(
-            sync_state._device_size_estimate(100_000, "a/x.flac", 600.0, "mp3_320"), 100_000)
+            sync_state._device_size_estimate(_est_row(100_000, "a/x.flac", 600.0), "mp3_320"), 100_000)
 
     def test_non_lossless_source_is_not_estimated(self):
         # An mp3 source is copied, not transcoded — original size.
         self.assertEqual(
-            sync_state._device_size_estimate(3_000_000, "a/x.mp3", 60.0, "mp3_320"), 3_000_000)
+            sync_state._device_size_estimate(_est_row(3_000_000, "a/x.mp3", 60.0), "mp3_320"), 3_000_000)
+
+    def test_an_alac_m4a_is_estimated_and_an_aac_one_is_not(self):
+        self.assertEqual(sync_state._device_size_estimate(_est_row(5_000_000, "a/x.m4a", 60.0, 1), "mp3_320"),
+                         60 * 40_000 + 256 * 1024)
+        self.assertEqual(sync_state._device_size_estimate(_est_row(5_000_000, "a/x.m4a", 60.0, 0), "mp3_320"),
+                         5_000_000)
 
     def test_missing_duration_falls_back_to_original(self):
         self.assertEqual(
-            sync_state._device_size_estimate(5_000_000, "a/x.flac", None, "mp3_320"), 5_000_000)
+            sync_state._device_size_estimate(_est_row(5_000_000, "a/x.flac", None), "mp3_320"), 5_000_000)
 
 
 class SumDeviceBytesTests(unittest.TestCase):
@@ -1128,6 +1436,52 @@ class AutofitFillBasisTests(unittest.TestCase):
         transcoded = sync_state.autofit_fill_basis(self.conn, mp3_device)
         assert original is not None and transcoded is not None
         self.assertGreater(original["avg_track_bytes"], transcoded["avg_track_bytes"])
+
+
+class AutofitAlbumArtistTests(unittest.TestCase):
+    """Last.fm ranks a compilation under its album artist ("Various Artists")
+    or under a performer on it: auto-fit matches either."""
+
+    def setUp(self):
+        self.conn = _make_conn()
+        self.user = _make_user(self.conn)
+        self.device, _ = sync_state.create_device(self.conn, self.user, "phone", max_size_bytes=100_000)
+        self.sel = sync_state.create_autofit_selection(self.conn, self.device, self.user)
+        self.a = _make_track_sd(self.conn, "Performer A", "Now 42", "1", "now/1.flac", size=1000)
+        self.b = _make_track_sd(self.conn, "Performer B", "Now 42", "2", "now/2.flac", size=1000)
+        self.conn.execute("UPDATE tracks SET album_artist = 'Various Artists'")
+        self.conn.commit()
+
+    def _fitted(self):
+        return {r["track_id"] for r in self.conn.execute(
+            "SELECT track_id FROM autofit_tracks WHERE selection_id = ?", (self.sel,))}
+
+    def test_a_compilation_ranked_under_its_album_artist_is_fitted_whole(self):
+        summary = sync_state.refresh_autofit(self.conn, self.sel, [("various artists", "now 42")])
+        self.assertEqual(self._fitted(), {self.a, self.b})
+        self.assertEqual((summary["albums"], summary["tracks"], summary["bytes"]), (1, 2, 2000))
+
+    def test_one_ranked_under_a_performer_still_fits_that_performers_tracks(self):
+        sync_state.refresh_autofit(self.conn, self.sel, [("performer a", "now 42")])
+        self.assertEqual(self._fitted(), {self.a})
+
+    def test_ranked_under_both_its_tracks_count_once(self):
+        summary = sync_state.refresh_autofit(
+            self.conn, self.sel, [("performer a", "now 42"), ("various artists", "now 42")])
+        self.assertEqual(self._fitted(), {self.a, self.b})
+        self.assertEqual((summary["albums"], summary["tracks"], summary["bytes"]), (1, 2, 2000))
+
+    def test_a_track_without_an_album_artist_yet_counts_as_its_artists(self):
+        # Before the first scan after the upgrade has read it.
+        self.conn.execute("UPDATE tracks SET album_artist = NULL")
+        summary = sync_state.refresh_autofit(
+            self.conn, self.sel, [("performer b", "now 42"), ("performer a", "now 42")])
+        self.assertEqual(self._fitted(), {self.a, self.b})
+        self.assertEqual(summary["albums"], 2, "two artists' albums until the album artist is read")
+
+    def test_the_status_counts_a_compilation_as_one_album(self):
+        sync_state.refresh_autofit(self.conn, self.sel, [("various artists", "now 42")])
+        self.assertEqual(sync_state.autofit_status(self.conn, self.device)["albums"], 1)
 
 
 class AutofitStatusTests(unittest.TestCase):
@@ -1637,6 +1991,34 @@ class TransferDeviceTests(unittest.TestCase):
         linked = [r["device_id"] for r in self.conn.execute(
             "SELECT device_id FROM selection_devices WHERE selection_id = ?", (sel,))]
         self.assertEqual(linked, [new])
+
+    def _stage(self, device_ids, target="Album"):
+        item = self.conn.execute(
+            "INSERT INTO basket_items (user_id, type, target) VALUES (?, 'album', ?)",
+            (self.user, target)).lastrowid
+        for device_id in device_ids:
+            self.conn.execute("INSERT INTO basket_item_devices (basket_item_id, device_id) "
+                              "VALUES (?, ?)", (item, device_id))
+        self.conn.commit()
+        return item
+
+    def _links(self, item):
+        return sorted(r["device_id"] for r in self.conn.execute(
+            "SELECT device_id FROM basket_item_devices WHERE basket_item_id = ?", (item,)))
+
+    def test_a_basket_item_staged_for_the_old_device_is_staged_for_the_new_one(self):
+        old, _ = sync_state.create_device(self.conn, self.user, "Old", "phone")
+        new, _ = sync_state.create_device(self.conn, self.user, "New", "phone")
+        item = self._stage([old])
+        sync_state.transfer_device(self.conn, old, new)
+        self.assertEqual(self._links(item), [new])
+
+    def test_a_basket_item_staged_for_both_devices_keeps_one_link(self):
+        old, _ = sync_state.create_device(self.conn, self.user, "Old", "phone")
+        new, _ = sync_state.create_device(self.conn, self.user, "New", "phone")
+        item = self._stage([old, new])
+        sync_state.transfer_device(self.conn, old, new)
+        self.assertEqual(self._links(item), [new])
 
     def test_a_selection_already_linked_to_both_devices_collapses_without_error(self):
         old, _ = sync_state.create_device(self.conn, self.user, "Old", "phone")

@@ -7,6 +7,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 # Trobar
 
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/missing-foss/trobar-server/badge)](https://securityscorecards.dev/viewer/?uri=github.com/missing-foss/trobar-server)
+[![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/missingfoss)
 
 A self-hosted, multi-user music library sync: pick artists, albums, or playlists and keep them offline on Android phones, tablets, watches, dedicated audio players (DAPs), or any mass-storage device — an SD card, a USB drive, a laptop's own folder. Files are copied as-is by default — byte-for-byte, no quality loss — with optional per-device MP3 transcoding for space-limited cards.
 
@@ -91,6 +92,12 @@ Full documentation is published at
 - [Clients](https://missing-foss.github.io/trobar-server/clients/) — Android, desktop, and Garmin
 - [Administration](https://missing-foss.github.io/trobar-server/administration/) · [Operations](https://missing-foss.github.io/trobar-server/operations/networking/) · [Troubleshooting](https://missing-foss.github.io/trobar-server/troubleshooting/) · [Reference](https://missing-foss.github.io/trobar-server/reference/environment/)
 - Contributing a translation? See [Translating Trobar](https://missing-foss.github.io/trobar-server/project/translations/)
+
+## Support
+
+Trobar is free software with no ads, no tracking and no paid tier. If it keeps your music where you want it, you can [support it on Ko-fi](https://ko-fi.com/missingfoss).
+
+Support pays for test devices, infrastructure and Claude. Mostly, it buys a good coffee and keeps the motivation going for the next projects.
 
 ## License
 

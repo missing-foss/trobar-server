@@ -17,7 +17,8 @@ function sub(overrides) {
   };
 }
 
-async function gotoWithSubscriptions(page, subscriptions) {
+async function gotoWithSubscriptions(page, subscriptions, playlists) {
+  if (playlists) await page.route("**/api/provider/playlists", (route) => route.fulfill({ json: playlists }));
   await page.route("**/api/playlist-subscriptions", (route) => {
     if (route.request().method() !== "GET") return route.continue();
     return route.fulfill({ json: { subscriptions } });
@@ -59,5 +60,38 @@ test.describe("Public playlists by link", () => {
     await expect(page.getByText(
       "Couldn't reach YouTube Music. Nothing already imported was changed.")).toBeVisible();
     await expect(page.getByText(AT_LIMIT).locator("visible=true")).toHaveCount(0);
+  });
+
+  test("each link's row shows its provider's icon", async ({ page }) => {
+    await gotoWithSubscriptions(page, [
+      sub({ id: 6, title: "E2E Spotify Icon" }),
+      sub({ id: 7, title: "E2E YouTube Icon", provider: "ytmusic", track_limit: null }),
+    ]);
+    for (const [title, name] of [["E2E Spotify Icon", "Spotify"], ["E2E YouTube Icon", "YouTube Music"]]) {
+      const row = page.getByText(title, { exact: true }).locator("xpath=..");
+      const icon = row.getByRole("img", { name, exact: true });
+      await expect(icon).toBeVisible();
+      // A glyph, not an empty frame: the provider has a drawing.
+      await expect(icon.locator("svg > *")).not.toHaveCount(0);
+    }
+  });
+
+  test("a playlist from a public link carries the link badge; others don't", async ({ page }) => {
+    const playlist = (id, title, source_provider) => ({
+      id, title, source_provider, is_own: true, track_count: 4, matched_count: 2,
+      created_at: "2026-01-01 00:00:00",
+    });
+    await gotoWithSubscriptions(page, [], [
+      playlist(911, "E2E From YouTube", "ytmusic"),
+      playlist(912, "E2E From Spotify Link", "spotify_public"),
+      playlist(913, "E2E From Tidal", "tidal"),
+      playlist(914, "E2E Made Here", "trobar"),
+    ]);
+    const badge = (title) => page.locator("[data-playlist-row]").filter({ hasText: title })
+      .getByRole("img", { name: "Added by public link" });
+    await expect(badge("E2E From YouTube")).toBeVisible();
+    await expect(badge("E2E From Spotify Link")).toBeVisible();
+    await expect(badge("E2E From Tidal")).toBeHidden();
+    await expect(badge("E2E Made Here")).toBeHidden();
   });
 });

@@ -75,6 +75,9 @@ LANE_SHORT = "short"
 LANE_LONG = "long"
 _LANES = (LANE_SHORT, LANE_LONG)
 _LANE_BY_TYPE: dict[str, str] = {}
+# A job type's payload transform for an automatic second run (a retry after a
+# failure, a requeue after a restart): see register(on_retry=).
+_ON_RETRY: dict = {}
 
 
 def _long_types() -> list:
@@ -119,6 +122,64 @@ _wakes = {lane: threading.Event() for lane in _LANES}
 _IDLE_POLL_SECONDS = 30.0
 
 _worker_started = threading.Lock()
+
+# Why a running job was asked to stop. An admin's cancel ends it `cancelled`;
+# a shutdown puts it back in the queue, since stopping the server is not a
+# decision to drop the work.
+CANCEL_ADMIN = "admin"
+CANCEL_SHUTDOWN = "shutdown"
+
+# {job id: reason} for running jobs asked to stop. In memory, not a column: the
+# worker that has to see it is in this process, and a restart before the job's
+# next safe point leaves it `running`, which requeue_interrupted already handles.
+_cancel_requests: dict[int, str] = {}
+_cancel_lock = threading.Lock()
+# Job types an admin has cancelled since this process started, for an idle
+# hook that would otherwise queue the same work again (see cancelled_this_run).
+_cancelled_types: set[str] = set()
+
+
+class JobCancelled(BaseException):
+    """Raised by a running job's `report` once the job has been asked to stop.
+
+    A BaseException, like asyncio.CancelledError, so a handler's own
+    `except Exception` (several keep going past a per-item failure) can't
+    swallow it and carry on. run_one catches it by name. `report` may only be
+    called between the handler's own commits (see set_progress), so where it
+    raises is a point the handler can stop at without leaving half a write."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def request_cancel(job_id: int, reason: str = CANCEL_ADMIN) -> None:
+    """Ask a running job to stop at its next `report`. A second request keeps
+    the first one's reason, so a shutdown can't turn an admin's cancel into a
+    requeue."""
+    with _cancel_lock:
+        _cancel_requests.setdefault(job_id, reason)
+
+
+def cancel_requested(job_id: int) -> bool:
+    with _cancel_lock:
+        return job_id in _cancel_requests
+
+
+def cancelled_this_run(job_type: str) -> bool:
+    """Whether an admin has cancelled a job of this type since the server
+    started. For an on_idle hook that queues its work whenever it is
+    missing: without this, a cancel would be undone at the next idle check.
+    A restart clears it, so cancelled work still runs eventually."""
+    with _cancel_lock:
+        return job_type in _cancelled_types
+
+
+def _check_cancelled(job_id: int) -> None:
+    with _cancel_lock:
+        reason = _cancel_requests.get(job_id)
+    if reason is not None:
+        raise JobCancelled(reason)
 
 # Set to bring the worker loop down. Only the test suite uses it in practice —
 # in production the loop runs for the process's lifetime and the daemon thread
@@ -168,7 +229,7 @@ def wake() -> None:
         event.set()
 
 
-def register(job_type: str, handler, lane: str = LANE_SHORT) -> None:
+def register(job_type: str, handler, lane: str = LANE_SHORT, on_retry=None) -> None:
     """Wire a job type to the function that performs it. Called at import
     time by the owning module (or by main.py for cross-module wiring).
 
@@ -192,11 +253,32 @@ def register(job_type: str, handler, lane: str = LANE_SHORT) -> None:
     since #334) is still LANE_LONG: it loops until nothing claimable
     remains, which on a large library is legitimately hours. See
     _LANE_BY_TYPE, and the registration site in main.py for the specific
-    per-type reasoning."""
+    per-type reasoning.
+
+    `on_retry(payload) -> payload`, when given, rewrites the payload each time
+    the job goes back to the queue on its own (a retry after a failure, a
+    requeue after a restart), for work that should be cheaper the second
+    time. An admin's explicit retry keeps the payload as it is."""
     if lane not in _LANES:
         raise ValueError(f"unknown lane {lane!r}")
     _HANDLERS[job_type] = handler
     _LANE_BY_TYPE[job_type] = lane
+    if on_retry is not None:
+        _ON_RETRY[job_type] = on_retry
+    else:
+        _ON_RETRY.pop(job_type, None)
+
+
+def _apply_on_retry(conn, where: str, params: tuple = ()) -> None:
+    """Rewrite, per its type's on_retry, the payload of every job matching
+    `where` that is about to go back to the queue."""
+    for row in conn.execute(f"SELECT id, type, payload FROM jobs WHERE {where}", params).fetchall():
+        transform = _ON_RETRY.get(row["type"])
+        if transform is None:
+            continue
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+        conn.execute("UPDATE jobs SET payload = ? WHERE id = ?",
+                     (json.dumps(transform(payload)), row["id"]))
 
 
 def enqueue(conn, job_type: str, payload: dict | None = None,
@@ -253,7 +335,7 @@ def _prune_finished(conn) -> None:
     days = _job_retention_days(conn)
     conn.execute(
         "DELETE FROM jobs WHERE id IN ("
-        " SELECT j.id FROM jobs j WHERE j.state IN ('done', 'failed')"
+        " SELECT j.id FROM jobs j WHERE j.state IN ('done', 'failed', 'cancelled')"
         " AND j.finished_at < datetime('now', CASE j.state WHEN 'failed' THEN ? ELSE ? END)"
         " AND j.id != ("
         "   SELECT id FROM jobs j2 WHERE j2.type = j.type AND j2.state = j.state"
@@ -326,6 +408,7 @@ def requeue_interrupted(conn) -> int:
             "WHERE state = 'running' AND attempts >= ?",
             (_MAX_ATTEMPTS, _MAX_ATTEMPTS),
         )
+        _apply_on_retry(conn, "state = 'running'")
         conn.execute(
             "UPDATE jobs SET state = 'queued', started_at = NULL, "
             "last_error = 'the server stopped while this job was running; "
@@ -389,7 +472,7 @@ def set_progress(job_id: int, done: int, total: int | None = None,
 
     MUST be called between the caller's own commits, not inside one — two
     concurrent writers under WAL is how you get SQLITE_BUSY. scanner._scan_library
-    commits every _COMMIT_EVERY files and reports right after, which is that safe
+    commits each file and reports right after, which is that safe
     point.
 
     Failure here is swallowed: progress is a display detail, and losing a
@@ -400,13 +483,9 @@ def set_progress(job_id: int, done: int, total: int | None = None,
     if label is not None:
         payload["label"] = label
     try:
-        conn = db.get_conn()
-        try:
+        with db.write() as conn:
             conn.execute("UPDATE jobs SET progress = ? WHERE id = ?",
                          (json.dumps(payload), job_id))
-            conn.commit()
-        finally:
-            conn.close()
     except Exception:
         _log.debug("could not record progress for job %s", job_id, exc_info=True)
 
@@ -422,10 +501,35 @@ def _finish(conn, job_id: int, result) -> None:
     conn.commit()
 
 
+def _stop_cancelled(conn, job_id: int, reason: str) -> None:
+    """A job that stopped at a `report` because it was asked to. An admin's
+    cancel ends it `cancelled`, which nothing retries. A shutdown queues it
+    again and gives back the attempt its claim charged: it didn't fail, so it
+    mustn't use up the retry budget. Progress is kept either way, so the panel
+    still says where it stopped."""
+    if reason == CANCEL_SHUTDOWN:
+        _apply_on_retry(conn, "id = ?", (job_id,))
+        conn.execute(
+            "UPDATE jobs SET state = 'queued', started_at = NULL, "
+            "attempts = MAX(attempts - 1, 0), "
+            "last_error = 'the server shut down while this job was running; "
+            "it has been queued again' WHERE id = ?",
+            (job_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE jobs SET state = 'cancelled', finished_at = datetime('now') "
+            "WHERE id = ?",
+            (job_id,),
+        )
+    conn.commit()
+
+
 def _fail(conn, job_id: int, attempts: int, error: str) -> None:
     """Back to `queued` with a delay while retries remain, else `failed`."""
     if attempts < _MAX_ATTEMPTS:
         delay = _BACKOFF_SECONDS[min(attempts, len(_BACKOFF_SECONDS)) - 1]
+        _apply_on_retry(conn, "id = ?", (job_id,))
         conn.execute(
             "UPDATE jobs SET state = 'queued', last_error = ?, "
             "run_after = datetime('now', ?) WHERE id = ?",
@@ -456,6 +560,15 @@ def run_one(lane: str = LANE_SHORT) -> bool:
     if job is None:
         return False
 
+    try:
+        _run_claimed(job)
+    finally:
+        with _cancel_lock:
+            _cancel_requests.pop(job["id"], None)
+    return True
+
+
+def _run_claimed(job) -> None:
     handler = _HANDLERS.get(job["type"])
     payload = json.loads(job["payload"]) if job["payload"] else {}
     try:
@@ -466,9 +579,22 @@ def run_one(lane: str = LANE_SHORT) -> bool:
             raise LookupError(f"no handler registered for job type {job['type']!r}")
         def report(done: int, total: int | None = None,
                    label: str | None = None) -> None:
+            _check_cancelled(job["id"])
             set_progress(job["id"], done, total, label)
 
         result = handler(payload, report)
+    except JobCancelled as exc:
+        _log.warning("job %s (%s) stopped: %s", job["id"], job["type"],
+                     "cancelled by an admin" if exc.reason == CANCEL_ADMIN else "server shutting down")
+        if exc.reason == CANCEL_ADMIN:
+            with _cancel_lock:
+                _cancelled_types.add(job["type"])
+        conn = db.get_conn()
+        try:
+            _stop_cancelled(conn, job["id"], exc.reason)
+        finally:
+            conn.close()
+        return
     except Exception as exc:
         _log.exception("job %s (%s) failed", job["id"], job["type"])
         conn = db.get_conn()
@@ -477,14 +603,13 @@ def run_one(lane: str = LANE_SHORT) -> bool:
             _fail(conn, job["id"], attempts, f"{type(exc).__name__}: {exc}")
         finally:
             conn.close()
-        return True
+        return
 
     conn = db.get_conn()
     try:
         _finish(conn, job["id"], result)
     finally:
         conn.close()
-    return True
 
 
 def _worker_loop(lane: str) -> None:
@@ -492,8 +617,9 @@ def _worker_loop(lane: str) -> None:
     while not _stop.is_set():
         try:
             # Drain rather than one-per-wake, so a burst doesn't sit behind
-            # the idle timeout.
-            while run_one(lane):
+            # the idle timeout. Not past a stop: a shutdown has just queued
+            # the stopped job again, and would otherwise watch it be claimed.
+            while not _stop.is_set() and run_one(lane):
                 pass
             # #361: the other prune trigger (enqueue) never fires on an
             # instance where nothing is being queued, so a quiet instance's
@@ -558,20 +684,52 @@ def stop_worker(timeout: float = 5.0) -> bool:
     Exists for tests: a real worker left running polls for the remainder of the
     suite and will claim jobs another test enqueued, executing them against
     whatever db.DB_PATH points at by then — cross-test mutation, not just log
-    noise. Production never needs it (the daemon thread dies with the process),
-    though it's the hook a graceful shutdown would use."""
+    noise. In production, shutdown() calls it on SIGTERM.
+
+    A thread still alive at the deadline stays in _worker_threads, and the
+    worker stays started: a later stop_worker joins it, and start_worker
+    can't start a second worker beside it, which would run with the stop
+    cleared and take requests meant for the new one."""
     global _worker_threads
     _stop.set()
     for event in _wakes.values():  # don't wait out the idle poll
         event.set()
-    threads, _worker_threads = _worker_threads, []
+    threads = _worker_threads
+    # One deadline for all the lanes, so the whole stop takes at most `timeout`.
+    deadline = time.monotonic() + timeout
     for thread in threads:
-        thread.join(timeout)
-    if any(thread.is_alive() for thread in threads):
+        thread.join(max(0.0, deadline - time.monotonic()))
+    _worker_threads = [thread for thread in threads if thread.is_alive()]
+    if _worker_threads:
         return False
     if _worker_started.locked():
         _worker_started.release()
     return True
+
+
+def shutdown(timeout: float = 5.0) -> bool:
+    """The graceful stop for SIGTERM: ask every running job to stop at its next
+    `report`, then stop the worker. A job that stops in time goes back in the
+    queue (see _stop_cancelled); one that doesn't, because its handler is
+    between reports or never reports, is still `running` when the process
+    exits, and requeue_interrupted picks it up at the next start, as after a
+    crash. Returns True if the worker stopped within `timeout`.
+
+    `timeout` stays under docker stop's default of 10 seconds, so the process
+    exits on its own instead of being killed."""
+    # The stop first: a job asked to stop is queued again as soon as it
+    # reaches a report, and the worker must not claim it back before the stop
+    # is in place, or it would run to its end with no request left to stop it.
+    _stop.set()
+    conn = db.get_conn()
+    try:
+        running = [row["id"] for row in
+                   conn.execute("SELECT id FROM jobs WHERE state = 'running'")]
+    finally:
+        conn.close()
+    for job_id in running:
+        request_cancel(job_id, CANCEL_SHUTDOWN)
+    return stop_worker(timeout)
 
 
 def status(conn) -> dict:
@@ -584,6 +742,7 @@ def status(conn) -> dict:
         "running": counts.get("running", 0),
         "done": counts.get("done", 0),
         "failed": counts.get("failed", 0),
+        "cancelled": counts.get("cancelled", 0),
     }
 
 
@@ -597,23 +756,9 @@ def recent(conn, limit: int = 50) -> list:
     return [
         {**dict(row),
          "result": json.loads(row["result"]) if row["result"] else None,
-         "progress": json.loads(row["progress"]) if row["progress"] else None}
+         "progress": json.loads(row["progress"]) if row["progress"] else None,
+         # True from an admin's cancel until the job reaches its next `report`,
+         # so the panel can say "Cancelling…" rather than look ignored.
+         "cancelling": row["state"] == "running" and cancel_requested(row["id"])}
         for row in rows
     ]
-
-
-def wait_until_idle(timeout: float = 5.0) -> bool:
-    """Test/CLI helper: block until nothing is queued or running. Returns
-    False on timeout rather than raising, so a caller decides how loudly to
-    complain."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        conn = db.get_conn()
-        try:
-            st = status(conn)
-        finally:
-            conn.close()
-        if st["queued"] == 0 and st["running"] == 0:
-            return True
-        time.sleep(0.02)
-    return False

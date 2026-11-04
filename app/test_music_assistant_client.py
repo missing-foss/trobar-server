@@ -13,6 +13,7 @@ persistence goes through a real temp-file SQLite DB, as in test_lms_client.
     python3 -m unittest test_music_assistant_client -v
 """
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -165,18 +166,29 @@ class StatusTests(_Base):
 
 
 class ListPlaylistsTests(_Base):
+    def test_says_which_service_a_playlist_came_from(self):
+        copy = dict(PLAYLISTS[3], item_id="12", name="Road Trip", provider_mappings=[
+            {"item_id": "abc", "provider_domain": "tidal"},
+            {"provider_item_id": "abc2", "provider_domain": "tidal"},
+            {"item_id": "x", "provider_domain": "library"},
+            {"item_id": "", "provider_domain": "tidal"}])
+        self._configure()
+        with mock.patch("requests.post", return_value=_resp(json_body=[copy])):
+            self.assertEqual(ma.list_playlists()["playlists"][0]["source_ids"],
+                             [("tidal", "abc"), ("tidal", "abc2")])
+
     def test_skips_the_generated_playlists(self):
         self._configure()
         with mock.patch("requests.post", return_value=_resp(json_body=PLAYLISTS)):
             self.assertEqual(ma.list_playlists(),
-                             {"status": "ok", "playlists": [{"id": "9", "title": "Probe mix"}]})
+                             {"status": "ok", "playlists": [{"id": "9", "title": "Probe mix", "source_ids": []}]})
 
     def test_keeps_a_read_only_playlist_from_another_provider(self):
         synced = dict(PLAYLISTS[3], item_id="12", name="Discover Weekly", is_editable=False,
                       provider_mappings=[{"item_id": "37i9", "provider_domain": "spotify"}])
         self._configure()
         with mock.patch("requests.post", return_value=_resp(json_body=[synced])):
-            self.assertEqual(ma.list_playlists()["playlists"], [{"id": "12", "title": "Discover Weekly"}])
+            self.assertEqual(ma.list_playlists()["playlists"], [{"id": "12", "title": "Discover Weekly", "source_ids": [("spotify", "37i9")]}])
 
     def test_pages_until_a_short_page(self):
         self._configure()
@@ -185,7 +197,7 @@ class ListPlaylistsTests(_Base):
                 mock.patch("requests.post", side_effect=[_resp(json_body=pages[0]), _resp(json_body=pages[1]),
                                                         _resp(json_body=[])]) as post:
             result = ma.list_playlists()
-        self.assertEqual(result["playlists"], [{"id": "9", "title": "Probe mix"}])
+        self.assertEqual(result["playlists"], [{"id": "9", "title": "Probe mix", "source_ids": []}])
         offsets = [c.kwargs["json"]["args"]["offset"] for c in post.call_args_list]
         self.assertEqual(offsets, [0, 2, 4])
 
@@ -306,6 +318,20 @@ class ActiveProviderInterfaceTests(_Base):
         self._configure()
         with mock.patch("requests.post", return_value=_resp(json_body=3)):
             self.assertEqual(ma.retry_pairing()["state"], "paired")
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

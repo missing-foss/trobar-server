@@ -10,12 +10,16 @@ Last.fm: reads need no API key at all (just the username), and album art
 comes from the Cover Art Archive via the MBIDs the stats endpoint already
 returns — no separate art lookup."""
 
+import logging
 import os
 import random
 
 import requests
 
+import history_cache
 import suggestions as suggestions_mod
+
+_log = logging.getLogger(__name__)
 
 # Deployment-time default; overridable live via Administration
 # (app_config key "listenbrainz_api_base") for a self-hosted ListenBrainz
@@ -52,10 +56,12 @@ def check_connection(username: str, api_base: str = "") -> bool:
         return False
 
 
+@history_cache.cached("listenbrainz.top_release_groups")
 def top_release_groups(username: str, range_: str = "half_yearly", limit: int = 50,
-                        api_base: str = "") -> list[dict]:
-    """Raw ListenBrainz top release-groups (albums) for a username. [] on any
-    failure or missing config, same contract as lastfm.top_albums().
+                        api_base: str = "") -> list[dict] | None:
+    """Raw ListenBrainz top release-groups (albums) for a username. Same
+    contract as lastfm.top_albums(): [] for none or missing config, None on
+    any failure.
     `half_yearly` mirrors the Last.fm default period of 6month."""
     if not username:
         return []
@@ -68,16 +74,18 @@ def top_release_groups(username: str, range_: str = "half_yearly", limit: int = 
         resp.raise_for_status()
         return resp.json().get("payload", {}).get("release_groups", [])
     except Exception as e:
-        print(f"[listenbrainz] error: {e}")
-        return []
+        _log.warning("error: %s", e)
+        return None
 
 
 def suggestions(conn, username: str, range_: str = "half_yearly", limit: int = 50,
-                user_device_ids: set[int] | None = None, api_base: str = "") -> list[dict]:
+                user_device_ids: set[int] | None = None, api_base: str = "") -> list[dict] | None:
     """Top-played albums already in the local catalog but not yet synced to
     every device the caller manages — the ListenBrainz counterpart of
     lastfm.suggestions(), same library-match + coverage filter + shuffle."""
     albums = top_release_groups(username, range_, limit, api_base=api_base)
+    if albums is None:
+        return None  # ListenBrainz didn't answer
     if not albums:
         return []
 
@@ -108,10 +116,12 @@ def suggestions(conn, username: str, range_: str = "half_yearly", limit: int = 5
 
 
 def most_played(username: str, range_: str = "half_yearly", limit: int = 10,
-                 api_base: str = "") -> list[dict]:
+                 api_base: str = "") -> list[dict] | None:
     """ListenBrainz counterpart of lastfm.most_played() — same contract:
     ranked by listen count, no local-library filter, no shuffle."""
     albums = top_release_groups(username, range_, limit, api_base=api_base)
+    if albums is None:
+        return None  # ListenBrainz didn't answer
     out = []
     for a in albums:
         artist = a.get("artist_name", "")
@@ -127,9 +137,11 @@ def most_played(username: str, range_: str = "half_yearly", limit: int = 10,
     return out
 
 
-def recent_listens(username: str, limit: int = 50, api_base: str = "") -> list[dict]:
-    """Raw recent listens for a username. [] on any failure, same contract
-    as lastfm.recent_tracks()."""
+@history_cache.cached("listenbrainz.recent_listens")
+def recent_listens(username: str, limit: int = 50, api_base: str = "") -> list[dict] | None:
+    """Raw recent listens for a username. Same contract as
+    lastfm.recent_tracks(): [] for none or missing config, None on any
+    failure."""
     if not username:
         return []
     try:
@@ -140,15 +152,18 @@ def recent_listens(username: str, limit: int = 50, api_base: str = "") -> list[d
         resp.raise_for_status()
         return resp.json().get("payload", {}).get("listens", [])
     except Exception as e:
-        print(f"[listenbrainz] error: {e}")
-        return []
+        _log.warning("error: %s", e)
+        return None
 
 
 def recently_played_suggestions(conn, username: str, limit: int = 50,
-                                 user_device_ids: set[int] | None = None, api_base: str = "") -> list[dict]:
+                                 user_device_ids: set[int] | None = None,
+                                 api_base: str = "") -> list[dict] | None:
     """Distinct albums from the user's most recent listens — ListenBrainz
     counterpart of lastfm.recently_played_suggestions()."""
     listens = recent_listens(username, limit, api_base=api_base)
+    if listens is None:
+        return None  # ListenBrainz didn't answer
     if not listens:
         return []
 

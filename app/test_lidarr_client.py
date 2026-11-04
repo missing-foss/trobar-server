@@ -15,6 +15,7 @@ never-raises contract.
     python3 -m unittest test_lidarr_client -v      # from app/
 """
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -467,6 +468,20 @@ class AddAndMonitorAlbumTests(_LidarrClientTestBase):
             result = lidarr_client.add_and_monitor_album("fa1", "fa-artist1")
         self.assertEqual(result["status"], "ok")
         self.assertEqual(len(req.call_args_list), len(responses))
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

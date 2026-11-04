@@ -166,3 +166,20 @@ library doesn't have.
 - The `trobar` image here is built with `AUTH_MODE=local` and
   `SESSION_COOKIE_SECURE=0` (plain-http dev); production uses the root
   `docker-compose.yaml` instead.
+
+## Writing to the database
+
+New code writes through `db.write()`. It commits when the block ends and rolls
+back if the block raises. It holds the write lock for the whole block, so read
+files and call servers before it, never inside it.
+
+`dev/verify.sh` and CI run the unit tests through `dev/run_unittests.py`, which
+fails when app code holds a write transaction across a file read, a network
+connection, a subprocess or a sleep, writes on a second connection beside it,
+or holds it for more than two seconds. A transaction that only reads is fine. Offences that predate the guard are listed in
+`dev/write-guard-known.txt`. A new one fails the run, and so does a listed one
+that no longer happens. To check one test file, use plain `python -m unittest`:
+the runner's comparison only means something on the whole suite.
+
+The guard can't see what a test has mocked, `os.stat`, or a connection a test
+opened itself and passed in.

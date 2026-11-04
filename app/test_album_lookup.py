@@ -11,7 +11,9 @@ album makes a gap requestable. MusicBrainz is mocked at the HTTP call.
 
     python3 -m unittest test_album_lookup -v      # from app/
 """
+import json
 import shutil
+import sqlite3
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -175,6 +177,24 @@ class RunJobTests(unittest.TestCase):
         assert cur.lastrowid is not None
         return cur.lastrowid
 
+    def test_a_cached_key_with_no_album_takes_no_write_lock(self):
+        self._gap(self._playlist())
+        self.conn.execute("INSERT INTO musicbrainz_album_lookups (lookup_key, album) VALUES (?, NULL)",
+                          (album_lookup.lookup_key("Band", "Song", None),))
+        self.conn.commit()
+        holder = sqlite3.connect(db.DB_PATH, timeout=0)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")
+        real_get_conn = db.get_conn
+
+        def impatient():
+            conn = real_get_conn()
+            conn.execute("PRAGMA busy_timeout = 0")
+            return conn
+        with mock.patch.object(db, "get_conn", impatient):
+            result = album_lookup.run_job()  # raises if it asks for the lock
+        self.assertEqual(result["asked"], 0)
+
     def _inferred(self, gap_id):
         return self.conn.execute("SELECT inferred_album FROM unresolved_playlist_tracks WHERE id = ?",
                                  (gap_id,)).fetchone()[0]
@@ -226,12 +246,20 @@ class RunJobTests(unittest.TestCase):
         self.find.assert_not_called()
         self.assertIsNone(self._inferred(gap))
 
-    def test_a_found_album_is_requested_from_lidarr_at_once_where_requests_are_on(self):
+    def test_a_found_album_queues_the_lidarr_requests_where_they_are_on(self):
+        """Queued at once, as its own job, rather than run inside this one:
+        the requests job then asks Lidarr for the album just found."""
         p = self._playlist(enabled=True)
         self._gap(p, artist="Band")
+        with mock.patch.object(lidarr_requests, "_attempt_one") as attempt:
+            album_lookup.run_job()
+        attempt.assert_not_called()
+        queued = self.conn.execute(
+            "SELECT payload FROM jobs WHERE type = ?", (lidarr_requests.JOB_TYPE,)).fetchall()
+        self.assertEqual([json.loads(r["payload"]) for r in queued], [{"playlist_id": p}])
         with mock.patch.object(lidarr_requests, "_attempt_one",
                                return_value=("requested", None, 1, 2)) as attempt:
-            album_lookup.run_job()
+            lidarr_requests.run_job({"playlist_id": p})
         attempt.assert_called_once_with("Band", "Found Album")
 
     def test_a_playlist_with_requests_off_requests_nothing(self):

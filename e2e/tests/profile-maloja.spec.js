@@ -52,7 +52,7 @@ test.describe("Maloja on the Profile", () => {
   test("malformed and loopback URLs are refused; a saved one shows the badge and silences the hint", async () => {
     const page = await context.newPage();
     // The hint appears in several places; count the visible ones.
-    const hints = page.locator("p:visible", { hasText: "to also see your most-played tracks and albums" });
+    const hints = page.locator("p:visible", { hasText: "to also see your most-played albums" });
     const suggestionsTab = page.locator("section[x-show=\"tab==='lastfm'\"]");
     await page.goto("/#/lastfm");
     await page.waitForFunction(() => window.Alpine && !!window.Alpine.$data(document.querySelector("[x-data]")));

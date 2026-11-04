@@ -259,6 +259,11 @@ def pairs(key, mode, r, v):
         ("button label on metal", v["--c-on-metal"], v["--c-metal"], 4.5),
         ("button label on metal (hover)", v["--c-on-metal"], v["--c-metal-hi"], 4.5),
         ("metal button against its panel (WCAG 1.4.11)", v["--c-metal"], panel, 3.0),
+        # The :focus-visible ring (app.css) is the accent, drawn 2px outside the
+        # control, so it sits on whatever is behind that: a panel, a panel-b
+        # card or the canvas. WCAG 1.4.11 asks 3:1 against each.
+        ("focus ring (accent) on panel-b (WCAG 1.4.11)", r["accent"], v["--c-panel-b"], 3.0),
+        ("focus ring (accent) on canvas (WCAG 1.4.11)", r["accent"], bg, 3.0),
         # The sync toast is bg-gray-900: dark in light mode, near-white in dark
         # mode, as the grey scale inverts. Its text is gray-50, which inverts with it.
         ("sync toast text (gray-50) on gray-900", v["--c-gray-50"], v["--c-gray-900"], 4.5),

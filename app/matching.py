@@ -18,9 +18,18 @@ tag-based target index normalizes both sides of its (artist, album,
 title) lookup key the same way, rather than inventing a second scheme."""
 
 import difflib
+import logging
 import re
 import sqlite3
 import unicodedata
+
+_log = logging.getLogger(__name__)
+
+
+# Bump whenever normalize() changes: tracks.artist_norm/title_norm hold its
+# output, and db._refresh_norms recomputes every row when this differs from
+# the version they were computed with.
+NORM_VERSION = 1
 
 
 def normalize(s: str) -> str:
@@ -51,7 +60,7 @@ def _strip_annotations(title: str) -> str:
     but the locally-tagged title often doesn't. Confirmed directly: this was
     the single biggest remaining cause of misses after fixing the
     credits-list artist issue — exact title match fails, and even fuzzy
-    matching (0.85 cutoff) scores ~0.58 against the same song with a bare
+    matching (0.88 cutoff) scores ~0.58 against the same song with a bare
     title. Applied repeatedly in case of multiple trailing annotations."""
     prev = title
     while True:
@@ -76,7 +85,23 @@ def _artist_candidates(artist: str) -> list[str]:
     return candidates
 
 
-def match_playlist_track_by_path(conn: sqlite3.Connection, path: str) -> int | None:
+def _prefer_album(rows: list, album: str | None) -> int | None:
+    """The id of the first row whose album matches `album` (normalised), or
+    else of the first row: a tie-breaker between candidates that match
+    equally well, never a requirement, since many sources give no album
+    (Roon, .m3u files, link imports). None when `rows` is empty."""
+    if not rows:
+        return None
+    album_n = normalize(album) if album else ""
+    if album_n:
+        for row in rows:
+            if normalize(row["album"] or "") == album_n:
+                return row["id"]
+    return rows[0]["id"]
+
+
+def match_playlist_track_by_path(conn: sqlite3.Connection, path: str,
+                                 album: str | None = None) -> int | None:
     """Returns a `tracks.id` by matching a playlist entry's real file path
     against `tracks.relative_path`, or None if no match.
 
@@ -94,7 +119,10 @@ def match_playlist_track_by_path(conn: sqlite3.Connection, path: str) -> int | N
     write decomposed) names the same file as a library stored in the other.
     The SQL prefilter is a byte-level LIKE, so it is asked for both forms of
     the last segment; otherwise the candidate row would never reach the
-    comparison. A name mixing both forms within one segment is not covered."""
+    comparison. A name mixing both forms within one segment is not covered.
+
+    Several files can share the entry's trailing segments, when the entry
+    is just a file name. `album` then picks among them (_prefer_album)."""
     if not path:
         return None
     segments = tuple(unicodedata.normalize("NFC", p)
@@ -104,22 +132,29 @@ def match_playlist_track_by_path(conn: sqlite3.Connection, path: str) -> int | N
 
     last_forms = sorted({segments[-1], unicodedata.normalize("NFD", segments[-1])})
     rows = conn.execute(
-        "SELECT id, relative_path FROM tracks WHERE deleted_at IS NULL AND ("
+        "SELECT id, relative_path, album FROM tracks WHERE deleted_at IS NULL AND ("
         + " OR ".join("relative_path LIKE ?" for _ in last_forms) + ")",
         tuple(f"%{form}" for form in last_forms),
     ).fetchall()
+    hits = []
     for row in rows:
         row_segments = tuple(unicodedata.normalize("NFC", p)
                              for p in row["relative_path"].split("/") if p)
         n = min(len(segments), len(row_segments))
         if n and segments[-n:] == row_segments[-n:]:
-            return row["id"]
-    return None
+            hits.append(row)
+    return _prefer_album(hits, album)
 
 
-def match_playlist_track(conn: sqlite3.Connection, artist: str, title: str) -> int | None:
+def match_playlist_track(conn: sqlite3.Connection, artist: str, title: str,
+                         album: str | None = None) -> int | None:
     """Returns a `tracks.id`, or None if this track isn't in the local library
-    (e.g. it's a Tidal/Qobuz-only entry Roon streams but never downloads)."""
+    (e.g. it's a Tidal/Qobuz-only entry Roon streams but never downloads).
+
+    Each step takes every track that matches it, not the first: the same
+    title by the same artist can be on a studio album, a live album and a
+    compilation, and `album`, when the source gives one, picks among them
+    (_prefer_album). Without it, the first match wins, as before."""
     title_n = normalize(title)
     if not title_n:
         return None
@@ -130,29 +165,36 @@ def match_playlist_track(conn: sqlite3.Connection, artist: str, title: str) -> i
         if not artist_n:
             continue
 
+        # An index lookup on the stored artist_norm. A row nobody normalised
+        # (a writer other than the scanner) is still found, through the same
+        # index's NULL entries, by folding its artist here instead.
         rows = conn.execute(
-            "SELECT id, artist, title FROM tracks WHERE deleted_at IS NULL "
-            "AND pynorm(artist) = ?",
-            (artist_n,),
+            "SELECT id, artist, title, album, title_norm FROM tracks WHERE deleted_at IS NULL "
+            "AND (artist_norm = ? OR (artist_norm IS NULL AND pynorm(artist) = ?))",
+            (artist_n, artist_n),
         ).fetchall()
         if not rows:
             continue
 
-        for row in rows:
-            if normalize(row["title"]) == title_n:
-                return row["id"]
+        exact = [row for row in rows
+                 if (row["title_norm"] if row["title_norm"] is not None else normalize(row["title"])) == title_n]
+        if exact:
+            return _prefer_album(exact, album)
 
         title_stripped = normalize(_strip_annotations(title))
         if title_stripped != title_n:
-            for row in rows:
-                if normalize(_strip_annotations(row["title"])) == title_stripped:
-                    return row["id"]
+            stripped = [row for row in rows
+                        if normalize(_strip_annotations(row["title"])) == title_stripped]
+            if stripped:
+                return _prefer_album(stripped, album)
 
-        titles = [row["title"] for row in rows]
-        close = difflib.get_close_matches(title_stripped, [_strip_annotations(t) for t in titles],
-                                           n=1, cutoff=0.85)
+        # Both sides normalised, as in the two steps above: the query is,
+        # and comparing it with titles as stored penalised every
+        # capitalised or accented title before similarity was even judged.
+        # The cutoff favours precision: a wrong match puts the wrong song on
+        # a device or a mirror unseen, while a miss shows as unresolved.
+        stripped_n = [normalize(_strip_annotations(row["title"])) for row in rows]
+        close = difflib.get_close_matches(title_stripped, stripped_n, n=1, cutoff=0.88)
         if close:
-            for row in rows:
-                if _strip_annotations(row["title"]) == close[0]:
-                    return row["id"]
+            return _prefer_album([row for row, t in zip(rows, stripped_n) if t == close[0]], album)
     return None

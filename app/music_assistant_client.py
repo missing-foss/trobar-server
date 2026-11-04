@@ -94,6 +94,7 @@ Measured live for the provider and sink roles, against the same 2.9.9:
   {search}` finds an artist by name.
 """
 
+import logging
 import time
 
 import requests
@@ -101,6 +102,8 @@ import requests
 import db
 import matching
 import mirror
+
+_log = logging.getLogger(__name__)
 
 _PAGE = 500
 # A backstop against a server that ignores `offset` and returns the same
@@ -230,10 +233,26 @@ def _mirror_ids() -> set[str]:
         conn.close()
 
 
+# Services Trobar also links directly, so a copy of theirs has a golden row.
+_STREAMING_DOMAINS = ("tidal", "spotify")
+
+
+def _source_ids(playlist: dict) -> list[tuple[str, str]]:
+    """Where Music Assistant got this playlist: (service, the service's own
+    playlist id) for each streaming account that carries it, so a copy can be
+    tied to the same playlist synced directly. Empty for one made here."""
+    found = []
+    for m in playlist.get("provider_mappings") or []:
+        domain, item_id = m.get("provider_domain") or "", m.get("item_id") or m.get("provider_item_id")
+        if domain in _STREAMING_DOMAINS and item_id:
+            found.append((domain, str(item_id)))
+    return found
+
+
 def list_playlists() -> dict:
-    """Returns {"status": "ok", "playlists": [{"id", "title"}, ...]}, the
-    common shape every provider client returns, or an error when not
-    configured or unreachable — which the sync treats as "this source has
+    """Returns {"status": "ok", "playlists": [{"id", "title", "source_ids"}, ...]},
+    the common shape every provider client returns plus _source_ids(), or an
+    error when not configured or unreachable — which the sync treats as "this source has
     nothing this run", never as "every playlist was deleted". Leaves out
     the mirroring sink's own copies (is_mirror_copy)."""
     url, token = _current_config()
@@ -245,7 +264,7 @@ def list_playlists() -> dict:
         if not isinstance(items, list):
             return {"status": "error", "reason": "not_paired"}
         playlists += [
-            {"id": str(p["item_id"]), "title": p["name"]}
+            {"id": str(p["item_id"]), "title": p["name"], "source_ids": _source_ids(p)}
             for p in items
             if p.get("name") and p.get("item_id") is not None and not _is_generated(p)
             and not is_mirror_copy(p.get("name"), p.get("item_id"), mirror_ids)

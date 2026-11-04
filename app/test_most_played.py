@@ -18,8 +18,16 @@ Mocks requests.get — no network access needed.
 import unittest
 import unittest.mock as mock
 
+import history_cache
 import lastfm
 import listenbrainz
+
+
+def _answered(result):
+    """The result of a history call that's expected to have answered; narrows
+    `list | None` for the type checker and fails loudly on None."""
+    assert result is not None, "the service was expected to answer"
+    return result
 
 
 def _mock_response(json_body):
@@ -39,7 +47,7 @@ class LastfmMostPlayedTests(unittest.TestCase):
             {"artist": {"name": "Boards of Canada"}, "name": "Geogaddi", "playcount": "50"},
         ]}}
         with mock.patch("requests.get", return_value=_mock_response(body)):
-            result = lastfm.most_played("alice", api_key="k")
+            result = _answered(lastfm.most_played("alice", api_key="k"))
         self.assertEqual(result, [
             {"artist": "Boards of Canada", "album": "Geogaddi", "playcount": 50, "image_url": None},
         ])
@@ -50,7 +58,7 @@ class LastfmMostPlayedTests(unittest.TestCase):
             {"artist": {"name": "B"}, "name": "Second", "playcount": "40"},
         ]}}
         with mock.patch("requests.get", return_value=_mock_response(body)):
-            result = lastfm.most_played("alice", api_key="k")
+            result = _answered(lastfm.most_played("alice", api_key="k"))
         self.assertEqual([r["album"] for r in result], ["First", "Second"])
 
     def test_skips_entries_missing_artist_or_album(self):
@@ -60,7 +68,7 @@ class LastfmMostPlayedTests(unittest.TestCase):
             {"artist": {"name": "Real Artist"}, "name": "Real Album", "playcount": "10"},
         ]}}
         with mock.patch("requests.get", return_value=_mock_response(body)):
-            result = lastfm.most_played("alice", api_key="k")
+            result = _answered(lastfm.most_played("alice", api_key="k"))
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["album"], "Real Album")
 
@@ -75,7 +83,7 @@ class ListenBrainzMostPlayedTests(unittest.TestCase):
             {"artist_name": "Boards of Canada", "release_group_name": "Geogaddi", "listen_count": 50},
         ]}}
         with mock.patch("requests.get", return_value=_mock_response(body)):
-            result = listenbrainz.most_played("alice")
+            result = _answered(listenbrainz.most_played("alice"))
         self.assertEqual(result, [
             {"artist": "Boards of Canada", "album": "Geogaddi", "playcount": 50, "image_url": None},
         ])
@@ -86,12 +94,25 @@ class ListenBrainzMostPlayedTests(unittest.TestCase):
             {"artist_name": "Real Artist", "release_group_name": "Real Album", "listen_count": 10},
         ]}}
         with mock.patch("requests.get", return_value=_mock_response(body)):
-            result = listenbrainz.most_played("alice")
+            result = _answered(listenbrainz.most_played("alice"))
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["album"], "Real Album")
 
     def test_empty_without_username(self):
         self.assertEqual(listenbrainz.most_played(""), [])
+
+
+_NO_HISTORY_CACHE = mock.patch.object(history_cache, "TTL_SECONDS", 0)
+
+
+def setUpModule():
+    # Every test answers for the services itself: a cached answer from an
+    # earlier test must not stand in for its mock (history_cache).
+    _NO_HISTORY_CACHE.start()
+
+
+def tearDownModule():
+    _NO_HISTORY_CACHE.stop()
 
 
 if __name__ == "__main__":

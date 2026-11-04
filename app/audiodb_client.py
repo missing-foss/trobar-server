@@ -13,9 +13,12 @@ Only used when the admin has configured an API key (Administration panel,
 the earlier provider-first flow. Deliberately artist-search by exact-ish name,
 same philosophy as the provider path: a miss just means no picture."""
 
+import logging
 import urllib.parse
 
 import requests
+
+_log = logging.getLogger(__name__)
 
 _SEARCH_URL = "https://www.theaudiodb.com/api/v1/json/{key}/search.php?s={artist}"
 _TIMEOUT = 10

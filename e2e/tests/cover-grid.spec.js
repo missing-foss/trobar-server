@@ -4,6 +4,7 @@
 
 // @ts-check
 const { test, expect } = require("@playwright/test");
+const { trackFetches, settled } = require("../support/settle");
 const AxeBuilder = require("@axe-core/playwright").default;
 
 // #304: guards for the cover-grid extraction, and for the #284 widget-ordering
@@ -35,10 +36,20 @@ function appData(page, fn, arg) {
 }
 
 async function gotoHome(page) {
+  await trackFetches(page);
   await page.goto("/#/home");
   await page.evaluate(() =>
     window.Alpine.$data(document.querySelector("[x-data]")).goToTab("home"));
-  await page.waitForTimeout(800); // widgets + lazily-loaded covers settle
+  await settled(page); // widgets + lazily-loaded covers settle
+}
+
+// One album in Recently added, which the fixture library may have none of.
+async function seedRecentlyAdded(page) {
+  await page.evaluate(() => {
+    window.Alpine.$data(document.querySelector("[x-data]")).recentlyAdded = [{
+      artist: "E2E Home", album: "E2E Cover", library_artist: "E2E Home", library_album: "E2E Cover",
+    }];
+  });
 }
 
 test.describe("home dashboard cover grids (#304)", () => {
@@ -85,32 +96,48 @@ test.describe("home dashboard cover grids (#304)", () => {
   test("recently_added selection flows through Alpine.store('selection')",
     async ({ page }) => {
       await gotoHome(page);
-      const hasItems = await appData(page, "return (app.recentlyAdded || []).length > 0;");
-      test.skip(!hasItems, "no recently-added albums in this fixture library");
+      await seedRecentlyAdded(page);
 
       const bucket = () => page.evaluate(() =>
         [...window.Alpine.store("selection").buckets.recentlyAdded]);
 
       expect(await bucket()).toEqual([]);
 
-      // Click the first card in the Recently added grid.
+      // Tick the first card's checkbox in the Recently added grid.
       const heading = page.locator("h2", { hasText: /recently added/i }).first();
       const widget = heading.locator("xpath=ancestor::div[contains(@class,'bg-panel')][1]");
-      await widget.locator("button.group").first().click();
+      const box = widget.locator("div.group").getByRole("checkbox").first();
+      await box.check();
 
       const afterClick = await bucket();
       expect(afterClick).toHaveLength(1);
       expect(afterClick[0]).toContain("||"); // the artist||album key shape
 
-      // The checkmark badge is the visible consequence of store state.
-      await expect(widget.locator("button.group").first().locator("span.bg-indigo-600"))
-        .toBeVisible();
+      // The ticked box is the visible consequence of store state.
+      await expect(box).toBeChecked();
+      await expect(page.locator("[data-album-dialog]")).toBeHidden();
 
       // Clearing empties the bucket. Located by ACCESSIBLE NAME, not hasText:
       // the label sits on its own line in the template, so a /^Cancel$/ regex
       // never matches the untrimmed text content.
       await widget.getByRole("button", { name: /cancel/i }).first().click();
       expect(await bucket()).toEqual([]);
+    });
+
+  test("a click on a home cover opens the album, with that widget's picker surface",
+    async ({ page }) => {
+      await page.route("**/api/library/album-tracks?*", (route) => route.fulfill({ json: [
+        { id: 1, track_no: 1, title: "From home", artist: "X", duration: 60 },
+      ] }));
+      await gotoHome(page);
+      await seedRecentlyAdded(page);
+      const heading = page.locator("h2", { hasText: /recently added/i }).first();
+      const widget = heading.locator("xpath=ancestor::div[contains(@class,'bg-panel')][1]");
+      await widget.locator("[data-album-open]").first().click();
+      const dialog = page.locator("[data-album-dialog]");
+      await expect(dialog.getByText("From home")).toBeVisible();
+      expect(await page.evaluate(() => window.Alpine.$data(document.querySelector("[x-data]")).albumDialog.surface))
+        .toBe("recently_added");
     });
 
   test("all three dashboard grids are on the store, and only they are",
@@ -257,7 +284,7 @@ test.describe("home dashboard cover grids (#304)", () => {
 
 test.describe("background jobs panel (#333)", () => {
   /** Insert a job row directly, so the panel can be driven into a given state. */
-  async function seedJob(page, {type, state, attempts, lastError, progress}) {
+  async function seedJob(page, {type, state, attempts, lastError, progress, cancelling}) {
     return page.evaluate(async (j) => {
       const app = window.Alpine.$data(document.querySelector("[x-data]"));
       // No API for planting a row; the panel reads /api/admin/jobs, so stub the
@@ -265,7 +292,7 @@ test.describe("background jobs panel (#333)", () => {
       app.jobs = {counts: {running: 0, queued: 0, done: 0, failed: 0}, jobs: [j]};
     }, {id: 1, type, state, attempts, last_error: lastError, result: null,
         progress: progress || null, created_at: "2026-07-26 12:00:00",
-        started_at: null, finished_at: null});
+        started_at: null, finished_at: null, cancelling: !!cancelling});
   }
 
   async function gotoJobs(page) {
@@ -274,6 +301,7 @@ test.describe("background jobs panel (#333)", () => {
     // made-up property left the panel in the DOM but hidden, which is exactly how
     // the first run of these tests failed: the assertions found the right element
     // with the right text and it simply wasn't visible.
+    await trackFetches(page);
     await page.goto("/#/admin");
     await page.evaluate(() => {
       const app = window.Alpine.$data(document.querySelector("[x-data]"));
@@ -281,14 +309,14 @@ test.describe("background jobs panel (#333)", () => {
       app.setSubTab("admin", "jobs");
       app.jobsLoading = false;
     });
-    await page.waitForTimeout(400);
+    await settled(page);
   }
 
   test("a FAILED job shows its error in red", async ({ page }) => {
     await gotoJobs(page);
     await seedJob(page, {type: "library_scan", state: "failed", attempts: 3,
                          lastError: "the server died 3 times while this job was running"});
-    await page.waitForTimeout(200);
+    await settled(page);
     const red = page.locator(".text-red-600", {hasText: /the server died 3 times/});
     await expect(red).toBeVisible();
   });
@@ -301,7 +329,7 @@ test.describe("background jobs panel (#333)", () => {
       await gotoJobs(page);
       await seedJob(page, {type: "library_scan", state: "queued", attempts: 0,
                            lastError: "the server died 3 times while this job was running"});
-      await page.waitForTimeout(200);
+      await settled(page);
       // toBeHidden, NOT toHaveCount(0): Alpine's x-show sets display:none, so the
       // element stays in the DOM. Counting matches would always find it and the
       // assertion would fail even with the fix in place.
@@ -318,12 +346,52 @@ test.describe("background jobs panel (#333)", () => {
       await gotoJobs(page);
       await seedJob(page, {type: "fingerprint_backfill", state: "running", attempts: 1,
                            lastError: null, progress: {done: 3400}});
-      await page.waitForTimeout(200);
+      await settled(page);
       // #357: the same text also lives in a visually-hidden aria-live
       // announcement span now, so a bare text locator matches both —
       // scope to the visible one via the progressbar it's inside.
       await expect(page.getByRole("progressbar").getByText(/3,400 checked/)).toBeVisible();
     });
+
+  test("a running job can be cancelled, and says so until it has stopped",
+    async ({ page }) => {
+      await gotoJobs(page);
+      await seedJob(page, {type: "library_scan", state: "running", attempts: 1,
+                           lastError: null, progress: {done: 7, total: 15}});
+      await settled(page);
+      await expect(page.getByRole("button", {name: "Cancel", exact: true})).toBeEnabled();
+      await seedJob(page, {type: "library_scan", state: "running", attempts: 1,
+                           lastError: null, progress: {done: 7, total: 15}, cancelling: true});
+      await settled(page);
+      await expect(page.getByRole("button", {name: "Cancelling…", exact: true})).toBeDisabled();
+    });
+
+  test("a cancelled job is labelled cancelled and offers nothing to click",
+    async ({ page }) => {
+      await gotoJobs(page);
+      await seedJob(page, {type: "library_scan", state: "cancelled", attempts: 1,
+                           lastError: null, progress: {done: 7, total: 15}});
+      await settled(page);
+      await expect(page.getByText("Cancelled", {exact: true})).toBeVisible();
+      await expect(page.getByRole("button", {name: "Cancel", exact: true})).toBeHidden();
+      await expect(page.getByRole("button", {name: "Retry", exact: true})).toBeHidden();
+    });
+
+  test("progress names the unit each job counts", async ({ page }) => {
+    await gotoJobs(page);
+    await seedJob(page, {type: "playlist_sync", state: "running", attempts: 1,
+                         lastError: null, progress: {done: 3}});
+    await settled(page);
+    await expect(page.getByRole("progressbar").getByText("3 playlists synced", {exact: true})).toBeVisible();
+    await seedJob(page, {type: "lidarr_requests", state: "running", attempts: 1,
+                         lastError: null, progress: {done: 2, total: 5}});
+    await settled(page);
+    await expect(page.getByRole("progressbar").getByText("2 of 5 albums", {exact: true})).toBeVisible();
+    await seedJob(page, {type: "provenance_rematch", state: "running", attempts: 1,
+                         lastError: null, progress: {done: 2, total: 5}});
+    await settled(page);
+    await expect(page.getByRole("progressbar").getByText("2 of 5 tracks", {exact: true})).toBeVisible();
+  });
 
   test("a running job's progressbar has no WCAG A/AA violations (#357)",
     async ({ page }) => {
@@ -336,7 +404,7 @@ test.describe("background jobs panel (#333)", () => {
       await gotoJobs(page);
       await seedJob(page, {type: "library_scan", state: "running", attempts: 0,
                            lastError: null, progress: {done: 7, total: 15}});
-      await page.waitForTimeout(200);
+      await settled(page);
       await expect(page.getByRole("progressbar")).toBeVisible();
       const results = await new AxeBuilder({page}).withTags(
         ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]).analyze();
@@ -351,13 +419,14 @@ test.describe("Library tab scan progress (#317/#357)", () => {
       // progressbar only exists while x-show="scanProgress" is truthy, so
       // an idle-instance axe scan (every other run in this suite) never
       // reaches it.
+      await trackFetches(page);
       await page.goto("/#/library");
       await page.evaluate(() => {
         const app = window.Alpine.$data(document.querySelector("[x-data]"));
         app.goToTab("library");
         app.scanProgress = {done: 7, total: 15};
       });
-      await page.waitForTimeout(200);
+      await settled(page);
       await expect(page.getByRole("progressbar")).toBeVisible();
       const results = await new AxeBuilder({page}).withTags(
         ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]).analyze();
@@ -382,6 +451,7 @@ test.describe("Library health panel (#364/#365)", () => {
         item_limit: 200,
         data_dir_network_fs: null,
         last_scan_finished_at: null,
+        last_scan_from_folder: null,
         exposure_warning: null,
         exposure_peer_count: null,
       }, extra);
@@ -389,26 +459,39 @@ test.describe("Library health panel (#364/#365)", () => {
   }
 
   async function gotoHealth(page) {
+    await trackFetches(page);
     await page.goto("/#/admin");
     await page.evaluate(() => {
       const app = window.Alpine.$data(document.querySelector("[x-data]"));
       app.goToTab("admin");
       app.setSubTab("admin", "health");
     });
-    await page.waitForTimeout(200);
+    await settled(page);
   }
+
+  test("each category row is a button that says whether it is open", async ({page}) => {
+    await gotoHealth(page);
+    await seedHealth(page, {unknown_tags: {count: 1, items: [{relative_path: "A/B/x.flac", artist: "", album: "", title: ""}]}});
+    await settled(page);
+    const row = page.getByRole("button", {name: /^Tracks tagged Unknown Artist\/Album/});
+    await expect(row).toHaveAttribute("aria-expanded", "false");
+    await row.focus();
+    await page.keyboard.press("Enter");
+    await expect(row).toHaveAttribute("aria-expanded", "true");
+    await expect(page.getByText("A/B/x.flac")).toBeVisible();
+  });
 
   test("the DATA_DIR network-filesystem alert renders when flagged", async ({page}) => {
     await gotoHealth(page);
     await seedHealth(page, {data_dir_network_fs: "nfs4"});
-    await page.waitForTimeout(200);
+    await settled(page);
     await expect(page.getByText(/DATA_DIR is on a network filesystem \(nfs4\)/)).toBeVisible();
   });
 
   test("the exposure-warning alert renders when flagged (#389)", async ({page}) => {
     await gotoHealth(page);
     await seedHealth(page, {exposure_warning: 8});
-    await page.waitForTimeout(200);
+    await settled(page);
     await expect(page.getByText(/reached directly by 8 different addresses/)).toBeVisible();
   });
 
@@ -418,8 +501,31 @@ test.describe("Library health panel (#364/#365)", () => {
     // this neutral line is shown whenever the mechanism is active at all.
     await gotoHealth(page);
     await seedHealth(page, {exposure_peer_count: 2});
-    await page.waitForTimeout(200);
+    await settled(page);
     await expect(page.getByText(/2 distinct addresses have reached this instance/)).toBeVisible();
+  });
+
+  test("the last scan's folder-named files show beside its time", async ({page}) => {
+    await gotoHealth(page);
+    await seedHealth(page, {last_scan_finished_at: "2026-07-26 12:00:00", last_scan_from_folder: 3});
+    await settled(page);
+    await expect(page.getByText("3 files had no usable tags and were named from their folders.")).toBeVisible();
+  });
+
+  test("the scan result line names only the counts that happened", async ({page}) => {
+    await trackFetches(page);
+    await page.goto("/#/library");
+    await page.evaluate(() => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      app.goToTab("library");
+      app.scanResult = {added: 1, updated: 0, removed: 0, unchanged: 5, moved: 2, skipped_dirs: 0,
+                        unreadable_files: 1, vanished_files: 0, from_folder: 0};
+    });
+    await settled(page);
+    // The Library tab's copy; the home widget has a hidden one.
+    await expect(page.locator(`section[x-show="tab==='library'"]`).getByText(
+      "Last scan: 1 added, 0 updated, 0 removed (5 unchanged). 2 files moved and kept their tracks. " +
+      "1 file couldn't be read; its track was kept.", {exact: true})).toBeVisible();
   });
 
   test("population B renders as informational, not a problem pill", async ({page}) => {
@@ -430,7 +536,7 @@ test.describe("Library health panel (#364/#365)", () => {
       count: 1, items: [{artist: "Obscure Artist", title: "Unreleased Jam",
                           album: "Live Bootleg", relative_path: "Obscure/Bootleg.flac"}],
     }});
-    await page.waitForTimeout(200);
+    await settled(page);
     const pill = page.locator("span", {hasText: /^1$/}).last();
     await expect(pill).not.toHaveClass(/bg-yellow-100/);
   });
@@ -455,7 +561,7 @@ test.describe("Library health panel (#364/#365)", () => {
            relative_path: "Obscure/Bootleg.flac"}]},
         last_scan_finished_at: "2026-07-26 12:00:00",
       });
-      await page.waitForTimeout(200);
+      await settled(page);
       await expect(page.getByText(/DATA_DIR is on a network filesystem/)).toBeVisible();
       await expect(page.getByText(/reached directly by 8 different addresses/)).toBeVisible();
       await expect(page.getByText(/8 distinct addresses have reached this instance/)).toBeVisible();
@@ -483,7 +589,7 @@ test.describe("Suggestions empty state (#324)", () => {
                             library_artist: "A", library_album: "B"}];
         app.homeSuggestions = () => [];   // a source that mixes to nothing
       });
-      await page.waitForTimeout(300);
+      await settled(page);
       await expect(page.locator("p", {hasText: /No suggestions yet/i}).first())
         .toBeVisible();
     });
@@ -495,7 +601,7 @@ test.describe("Suggestions empty state (#324)", () => {
       app.suggestions = [{artist: "A", album: "B", source: "recent",
                           library_artist: "A", library_album: "B"}];
     });
-    await page.waitForTimeout(300);
+    await settled(page);
     await expect(page.locator("p", {hasText: /No suggestions yet/i}).first())
       .toBeHidden();
   });
@@ -561,10 +667,11 @@ test.describe("Library list view (#415)", () => {
     });
     const device = await created.json();
 
+    await trackFetches(page);
     await page.goto("/#/library");
     await page.evaluate(() =>
       window.Alpine.$data(document.querySelector("[x-data]")).goToTab("library"));
-    await page.waitForTimeout(400);
+    await settled(page);
     await page.evaluate(() => {
       const app = window.Alpine.$data(document.querySelector("[x-data]"));
       app.selectedArtist = "E2E List View Artist";
@@ -572,7 +679,7 @@ test.describe("Library list view (#415)", () => {
       app.albums = [{album: "E2E List View Album", track_count: 8, year: 2020}];
       app.profile.cover_view_mode = "list";
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     // "Sync to…" appears twice: the artist header's own more specific
     // "Sync entire artist" label is different text, so only the album
@@ -615,10 +722,11 @@ test.describe("basket indicator on single-item Add to basket buttons (#416 part 
     });
     const device = await created.json();
 
+    await trackFetches(page);
     await page.goto("/#/library");
     await page.evaluate(() =>
       window.Alpine.$data(document.querySelector("[x-data]")).goToTab("library"));
-    await page.waitForTimeout(400);
+    await settled(page);
     await page.evaluate(() => {
       const app = window.Alpine.$data(document.querySelector("[x-data]"));
       app.selectedArtist = "E2E Indicator Artist";
@@ -626,7 +734,7 @@ test.describe("basket indicator on single-item Add to basket buttons (#416 part 
       app.albums = [{ album: "E2E Indicator Album", track_count: 5, year: 2021 }];
       app.profile.cover_view_mode = "list";
     });
-    await page.waitForTimeout(200);
+    await settled(page);
 
     // #501: the header button ("Sync entire artist"/"In basket") and the
     // row button ("Sync to…"/"In basket") share "In basket" once either is

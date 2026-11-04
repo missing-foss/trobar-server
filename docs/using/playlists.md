@@ -21,6 +21,23 @@ configures them, an [extra playlist folder](../providers/filesystem.md#playlists
 outside it or an exported [iTunes/Apple Music](../providers/itunes.md)
 library.
 
+Trobar reads all of these in a **playlist sync**, which is also when it
+updates mirrors, re-fetches linked playlists and asks Lidarr for missing
+albums. A playlist sync runs:
+
+- when someone presses **Refresh playlists**, or a phone asks for one;
+- when an admin switches the library source;
+- after a library scan that added, changed or removed tracks, so new files
+  reach playlists, devices and mirrors without waiting;
+- on a schedule: every 6 hours on a new install, measured from when the
+  previous sync finished. An install upgraded from a version without the
+  schedule keeps it off until an admin sets an interval.
+
+Both automatic ones are set under **Administration → Configuration →
+Automatic playlist sync**: an interval of 0 turns the schedule off, and
+unticking **Sync playlists after each library scan** (ticked by default)
+turns off the sync after a scan.
+
 ## How they sync
 
 Select a playlist for a device like any other selection. It lands on the device
@@ -28,6 +45,12 @@ as an ordered **`.m3u8`** file at the sync-folder root — same name and order a
 the source, listing only the tracks that are **actually on the device**. Entries
 that resolve to files you don't have are skipped (Trobar only syncs files you
 have).
+
+When a playlist changes, devices that select it follow on their next sync:
+they get the tracks it gained and drop the ones it lost, unless another
+selection still needs them. That applies to a playlist sync that finds it
+changed, an edit to a playlist made in Trobar, and a match you **Accept**
+in its unresolved tracks.
 
 `.m3u8` is UTF-8; Poweramp and most player apps read it directly. A few very old
 DAP firmwares only read legacy `.m3u` — see
@@ -70,6 +93,22 @@ backup and so it's visible everywhere.
   Trobar's isn't written there. Yours isn't read into Trobar either, since
   that name is Trobar's on that device; rename one of the two.
 
+## Rule playlists
+
+A rule playlist is filled from your library by a rule, not from a provider.
+**New rule playlist…** on the Playlists tab opens a dialog where you combine
+conditions on year, file type, lossless, when a track was added, artist, album
+and length, with one level of "any of" or "all of" groups. Pick an order and,
+if you want one, a limit. The dialog shows how many tracks the rule would hold
+as you edit it.
+
+The playlist fills when you save it, and again on every playlist sync. Its
+owner or an admin changes it with **Edit rule…** in its Actions menu; its
+tracks can't be edited by hand, because the next sync would undo that. Like a
+playlist made in Trobar, it starts private to you, and devices and mirrors treat
+it like any other playlist. The Shuffled order stays the same from one sync to
+the next.
+
 ## Ownership & sharing
 
 A playlist has an owner — and a sharing toggle — when it arrives through
@@ -102,28 +141,32 @@ to a different household member).
 ### The "shared by *name*" badge is a different thing
 
 A flat, non-clickable label — attribution, not a privacy control, and
-unrelated to the Shared/Private pill above. It can appear on a **Roon**
-playlist when the same playlist is *also* reachable through another
-household member's directly-linked Tidal or Spotify account (their
+unrelated to the Shared/Private pill above. It can appear on a **Roon** or
+**Music Assistant** playlist when the same playlist is *also* reachable through
+another household member's directly-linked Tidal or Spotify account (their
 "golden-source" copy):
 
 - If you can already see their linked-account copy (it's shared, or you're
-  the owner, or you're admin), the Roon duplicate is hidden entirely — you
-  just see their copy instead.
-- If you can't, you keep seeing the Roon row, labelled **"shared by *name*"**
-  so its origin is clear.
+  the owner, or you're admin), the Roon or Music Assistant duplicate is hidden
+  entirely — you just see their copy instead.
+- If you can't, you keep seeing the library's row, labelled **"shared by
+  *name*"** so its origin is clear.
 
-That badge means *"this reaches you via the household's shared Roon
+That badge means *"this reaches you via the household's shared library
 connection, and originates with *name*'s linked account"* — not *"*name*
-shared this playlist with you"*. The Roon copy itself has no owner and is
+shared this playlist with you"*. The library's copy itself has no owner and is
 never gated by the sharing toggle, regardless of the badge.
+
+Music Assistant says which service and playlist each of its playlists came
+from, so those are matched exactly. Roon doesn't, so its playlists are matched
+by title and shared tracks.
 
 ## Mirroring
 
 A playlist can be mirrored to a local folder, a Subsonic/Navidrome server, a
 Jellyfin server, an Emby server, Music Assistant or a Plex server. Six
 independent mirror sinks are available on any playlist you can see,
-each kept in sync automatically on every future playlist sync: as more of the
+each updated on every playlist sync: as more of the
 playlist's tracks show up in your library, the mirror grows to include them,
 always listing exactly the currently-resolved subset in the original order.
 Enabling one has no effect on the others — mirror to any combination.
@@ -149,13 +192,13 @@ Playlist mirrors**, have the full detail.
   your active provider, even when it happens to point at the same server.
   Tracks are matched onto the target by artist/album/title, so this works
   best when the target server indexes the same music library Trobar does;
-  a track it doesn't have is silently dropped from that copy rather than
-  erroring.
+  a track it doesn't have is left out of that copy rather than erroring,
+  and counted in the mirror's coverage (below).
 - **Jellyfin** does the same against a Jellyfin server — its own
   independent mirror-target connection, again separate from an active
   Jellyfin provider connection even when both point at the same server.
-  Matched the same way (artist/album/title), with the same silent-drop
-  behavior for tracks the target doesn't have.
+  Matched the same way (artist/album/title); a track the target doesn't
+  have is left out and counted, the same way.
 
     One thing here depends on the **server's version**, not on anything
     Trobar chooses. If a source playlist lists the same track twice,
@@ -240,6 +283,17 @@ Writing back to a streaming provider isn't implemented.
   the reason. Collapsed, each section's header keeps a summary and its
   warnings. With nothing set up at all, the tab explains what mirroring is
   instead.
+- **Coverage per target.** A server mirror line (every target but the
+  folder) says how many of the tracks Trobar sent are on the target, e.g.
+  "40 / 64 on Jellyfin · 24 not on Jellyfin". **Show** lists the missing
+  ones (up to 100) with a reason: not on the target (it has no matching
+  track), or refused (the target accepted the write, then its copy didn't
+  hold the track; only Music Assistant and Plex check this, by reading
+  their copy back). It also gives the on-target count of the last 5 writes,
+  so you can see whether the gap is closing. The playlist row's mirror icon
+  says the same count when you hover it. The folder mirror has no target:
+  its gaps are the tracks not matched locally, which the playlist's
+  unresolved tracks already list.
 
 ## Requesting missing albums from Lidarr
 
@@ -253,7 +307,10 @@ button.
 This is a request, not a mirror: nothing is copied anywhere, and nothing is
 searched for immediately. Enabling it puts each missing album on Lidarr's
 **wanted list, monitor-only** — Lidarr's own scheduled search is what
-actually finds a release later, on its own timeline. Turning the toggle back
+actually finds a release later, on its own timeline. The requests go out in
+the background, one album at a time, so turning the toggle on answers
+straight away and the playlist shows the outcome once they've been sent.
+Turning the toggle back
 off stops *future* gaps from being requested; it never un-monitors or
 removes anything already asked for. Every household member who can see the
 playlist can toggle it — same visibility rule as the Shared/Private pill
@@ -277,8 +334,13 @@ A few things shape when this can help:
   doesn't, that album is left exactly as a full lookup failure would be —
   recorded once, not retried automatically. An admin who notices one stuck
   can always finish it by hand directly in Lidarr.
+- **An album is asked for again if Lidarr didn't answer.** When Lidarr can't
+  be reached, nothing is recorded for that album, so the next run (the next
+  sync, or turning the toggle on again) tries it again. Only an answer from
+  Lidarr, even a failing one, counts as asked.
 - **Feedback is deliberately minimal**: a small "requested N albums, last
-  run HH:MM" line, or an error if the last run hit one. There's no live
+  run HH:MM" line, or an error if the last run hit one. A later run with
+  nothing new to ask for keeps those numbers rather than showing 0. There's no live
   polling of Lidarr's own state — the gap count on the playlist itself
   dropping over time, as Lidarr finds and Trobar's next scan picks up new
   files, is the real signal that a request worked.

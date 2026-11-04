@@ -15,29 +15,86 @@ Trobar's server is a **Flask** app backed by **SQLite**, served by the
 [waitress](https://pypi.org/project/waitress/) WSGI server, packaged as a single
 Docker image running as an unprivileged user. The main pieces live under `app/`:
 
-- **Providers** — `filesystem_client.py`, `roon_client.py`, `jellyfin_client.py`,
- `subsonic_client.py`, plus the per-user streaming clients `tidal_client.py` and
- `spotify_client.py`.
+- **Library providers** — the active library source is one of eight:
+  `filesystem_client.py`, `roon_client.py`, `jellyfin_client.py`,
+  `emby_client.py`, `plex_client.py`, `lms_client.py`, `subsonic_client.py` and
+  `music_assistant_client.py`. The Jellyfin and Emby clients share most of
+  their code in `mediabrowser_client.py`.
+- **Other playlist sources** — a member's own account through `tidal_client.py`
+  or `spotify_client.py`, and a public playlist by link through
+  `ytmusic_client.py` or `spotify_public_client.py`. `tidal_shares.py` keeps a
+  copy of one member's Tidal playlist in another member's Tidal account, on
+  each playlist sync.
 - **Library** — `scanner.py` (tag/folder scanning), `matching.py` (resolving
   playlist entries to local files).
 - **Suggestions & history** — `suggestions.py`, `lastfm.py`, `listenbrainz.py`.
-- **Playlists** — `playlist_sync.py`.
+- **Playlists** — `playlist_sync.py`; mirrors in `mirror.py` (the `.m3u`
+  folder) and `mirror_subsonic.py`, `mirror_jellyfin.py`, `mirror_emby.py`,
+  `mirror_plex.py`, `mirror_music_assistant.py` (the Jellyfin and Emby sinks
+  share `mirror_mediabrowser.py`, and `mirror_sinks.py` lists all six for
+  the code that writes, deletes or toggles them); missing-album requests in
+  `lidarr_requests.py` and `lidarr_client.py`.
 - **Images** — `covers.py`, `artist_images.py`, `audiodb_client.py`.
-- **Sync/transcode** — `sync_state.py`, `transcode.py`.
-- **Data** — `db.py`; schema migrations run at startup.
+- **Sync/transcode** — `selection_store.py` (selections and the device state
+  they add up to), `basket_store.py` (what's staged for devices before it's
+  sent), `token_store.py` (device, pairing-code and integration tokens),
+  `device_store.py` (devices: what each holds and is told to change, and
+  where each track lands on it), `unresolved_store.py` (playlist entries that
+  matched no library track), `autofit.py` (filling a device's storage budget
+  with its owner's most-played albums), `sync_state.py` (re-exports all of
+  these for one release), `transcode.py`.
+- **Data** — `db.py`; schema migrations run at startup. They are numbered (`db.MIGRATIONS`), each runs once, and `PRAGMA user_version` records how many have run. A new schema change is a new function appended to that list, never an edit to one that has shipped.
 
 ## The device sync protocol
 
-Devices authenticate with a per-device **Bearer token** (created in the web UI,
-shown once). Sync is **server-driven**:
+Devices authenticate with a per-device **Bearer token**. The client normally
+gets it by redeeming a short pairing code (`POST /api/enrollment/redeem`; see
+[Device tokens](../clients/index.md#device-tokens)), and the token isn't
+shown. Two cases show it: **Add device** falls back to showing the raw token
+when it can't create a pairing code, and **Older desktop app? Get a config
+file instead** issues a new token for a desktop build that predates codes.
+Sync is **server-driven**:
 
-1. The client asks what it's missing; the server diffs the device's selections
-   against what the device has acknowledged.
+1. The client asks what it's missing (`GET /api/device/changes`); the server
+   diffs the device's selections against what the device has acknowledged.
+   The answer also carries `playlists`: one `.m3u8` per playlist selected for
+   the device, listing only the tracks that are or will be on it, with the
+   paths the device knows them by. A playlist with none of its tracks on the
+   device is left out, which tells the client to delete its file. Beside
+   it, `play_playlist` is the `filename` of the one playlist the device
+   should play, chosen per device, or `null` to play everything on it, as
+   before. It is also `null` when the chosen playlist has no file on the
+   device. A client that does not play music ignores it.
 2. The client downloads each track (`GET /api/device/file/<id>`), writing
    **atomically**, and **acknowledges** it with the real byte count written.
 3. On each sync the client **verifies** that files the server believes are
    present still exist, and reports removals — the server stops re-queuing tracks
    the user chose to leave deleted.
+4. The Android and desktop clients also upload the playlists a person made
+   on the device (`POST /api/device/playlists`): every `.m3u`/`.m3u8` they
+   find, except the ones Trobar wrote. Each becomes a playlist of the
+   device's owner, and one missing from a later upload is removed. See
+   [Playlists made on a device](../using/playlists.md#playlists-made-on-a-device).
+
+Every route under `/api/device/` takes the device's Bearer token:
+
+| Route | What it is for |
+|---|---|
+| `GET /api/device/info` | The device's own record as the server holds it (its name, limit and settings), so a client can show what was set in the web UI. |
+| `GET /api/device/changes` | What to download and delete, the playlist files, and `play_playlist` (step 1). |
+| `GET /api/device/file/<id>` | One track, transcoded on the fly when the device's format is set (step 2). |
+| `POST /api/device/ack` | A track downloaded or removed, with the bytes written; ignored if the track's state changed since `changes` said so. |
+| `POST /api/device/missing-tracks` | Tracks the client found missing from disk: `redownload` queues them again, `exclude` stops them being queued again (step 3). |
+| `POST /api/device/storage` | Free and total space of the device's storage, and the size of music in its folder that Trobar didn't put there. |
+| `POST /api/device/sync-completed` | A sync finished with no error. It only adds one to a count for the whole server, which decides when administrators see the thank-you card; nothing about the device is kept. |
+| `PATCH /api/device/limit` | The device sets its own storage limit, as the web UI can. |
+| `PATCH /api/device/source-of-truth` | The device sets *Keep device content* (`"device"`) or not (`"server"`). |
+| `POST /api/device/manifest` | The paths the device already holds, after pairing again: matching tracks are marked downloaded instead of fetched again, and the rest are recorded as its unknown tracks. The Android and desktop apps send it only then, after turning *Keep device content* on. |
+| `GET /api/device/fingerprints` | The server's audio fingerprint for each track the device holds or will hold, paged, for the client's own record of where its files came from. |
+| `POST /api/device/provenance` | That record sent back (track id, fingerprint, path), so a fresh server database can recognise the device's files by fingerprint. |
+| `POST /api/device/plays` | Plays on the device, stored only if its owner keeps a play history. |
+| `POST /api/device/playlists` | The playlists made on the device (step 4). |
+| `GET /api/device/artist-image` | An artist's picture for the device's folders, `?size=small` for a downscaled one. |
 
 Transcoding to MP3 happens **on the server**, on the fly at
 `GET /api/device/file/<id>` for any device whose format is set — never cached

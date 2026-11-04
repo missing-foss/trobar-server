@@ -179,13 +179,13 @@ def _pending(conn) -> list:
     album from the source, none looked up yet."""
     return conn.execute(
         "SELECT id, playlist_id, artist, title, isrc FROM unresolved_playlist_tracks "
-        "WHERE excluded = 0 AND (album IS NULL OR album = '') AND inferred_album IS NULL"
+        "WHERE excluded = 0 AND accepted = 0 AND (album IS NULL OR album = '') AND inferred_album IS NULL"
     ).fetchall()
 
 
 def run_job(_payload: dict | None = None, report=None) -> dict:
     """Job handler. Looks up every pending gap's album, once per lookup key,
-    and fills in inferred_album wherever an answer names one; then runs the
+    and fills in inferred_album wherever an answer names one; then queues the
     Lidarr requests of every playlist that gained one and has them on, so
     they don't wait for the next sync. Returns counts for the jobs panel."""
     if db.get_lidarr_config() is None:
@@ -207,7 +207,8 @@ def run_job(_payload: dict | None = None, report=None) -> dict:
         for done, (key, rows) in enumerate(by_key.items()):
             if report:
                 report(done, total)
-            if key in cached:
+            fresh = key not in cached
+            if not fresh:
                 album = cached[key]
             else:
                 first = rows[0]
@@ -215,20 +216,20 @@ def run_job(_payload: dict | None = None, report=None) -> dict:
                 asked += 1
                 if not answered:
                     continue
-                conn.execute(
-                    "INSERT OR REPLACE INTO musicbrainz_album_lookups (lookup_key, album) VALUES (?, ?)",
-                    (key, album),
-                )
+            if fresh or album:
+                with db.write(conn):
+                    if fresh:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO musicbrainz_album_lookups (lookup_key, album) "
+                            "VALUES (?, ?)", (key, album))
+                    if album:
+                        conn.executemany(
+                            "UPDATE unresolved_playlist_tracks SET inferred_album = ? WHERE id = ?",
+                            [(album, r["id"]) for r in rows])
             if album:
-                conn.executemany(
-                    "UPDATE unresolved_playlist_tracks SET inferred_album = ? WHERE id = ?",
-                    [(album, r["id"]) for r in rows],
-                )
                 filled_playlists.update(r["playlist_id"] for r in rows)
-            conn.commit()
         for playlist_id in sorted(filled_playlists):
-            lidarr_requests.run_for_playlist(conn, playlist_id)
-            conn.commit()
+            lidarr_requests.enqueue(conn, playlist_id)
         return {"gaps": sum(len(r) for r in by_key.values()), "asked": asked,
                 "playlists_filled": len(filled_playlists)}
     finally:
@@ -246,7 +247,7 @@ def enqueue(conn) -> None:
 def enqueue_if_pending(conn, playlist_id: int) -> None:
     """enqueue(), when this playlist has a gap waiting for a lookup."""
     pending = conn.execute(
-        "SELECT 1 FROM unresolved_playlist_tracks WHERE playlist_id = ? AND excluded = 0 "
+        "SELECT 1 FROM unresolved_playlist_tracks WHERE playlist_id = ? AND excluded = 0 AND accepted = 0 "
         "AND (album IS NULL OR album = '') AND inferred_album IS NULL LIMIT 1",
         (playlist_id,),
     ).fetchone()

@@ -49,12 +49,16 @@ connect time and no redirect is followed. Either way the call fails like an
 unreachable Maloja, with a log line that leaves the URL out.
 """
 
+import logging
 import random
 import re
 from datetime import date, timedelta
 
+import history_cache
 import suggestions as suggestions_mod
 import url_guard
+
+_log = logging.getLogger(__name__)
 
 _API = "/apis/mlj_1"
 _HEADERS = {"User-Agent": "Trobar/1.0 (+https://github.com/missing-foss)"}
@@ -99,9 +103,9 @@ def _get(base: str, endpoint: str, params: dict, timeout: int = 15):
 def _log_failure(e: Exception) -> None:
     if isinstance(e, url_guard.BlockedAddress):
         # The URL is the user's own; the kind is enough to act on.
-        print(f"[maloja] refused: the Maloja URL leads to a {e.kind} address")
+        _log.warning("refused: the Maloja URL leads to a %s address", e.kind)
     else:
-        print(f"[maloja] error: {e}")
+        _log.warning("error: %s", e)
 
 
 def check_connection(base: str) -> bool:
@@ -117,28 +121,31 @@ def check_connection(base: str) -> bool:
         return False
 
 
-def album_charts(base: str, period: str = "6month") -> list[dict]:
-    """The raw album chart for a Trobar period. [] on any failure or
-    missing config, as lastfm.top_albums() and
-    listenbrainz.top_release_groups() do."""
+@history_cache.cached("maloja.album_charts")
+def album_charts(base: str, period: str = "6month") -> list[dict] | None:
+    """The raw album chart for a Trobar period. Same contract as
+    lastfm.top_albums() and listenbrainz.top_release_groups(): [] for none
+    or missing config, None on any failure."""
     if not base:
         return []
     try:
         return _get(base, "charts/albums", {"from": _from(period)}).get("list", [])
     except Exception as e:
         _log_failure(e)
-        return []
+        return None
 
 
-def recent_scrobbles(base: str, limit: int = 50) -> list[dict]:
-    """The latest scrobbles, newest first. [] on any failure."""
+@history_cache.cached("maloja.recent_scrobbles")
+def recent_scrobbles(base: str, limit: int = 50) -> list[dict] | None:
+    """The latest scrobbles, newest first. [] for none or missing config,
+    None on any failure."""
     if not base:
         return []
     try:
         return _get(base, "scrobbles", {"from": "1970", "page": 0, "perpage": limit}).get("list", [])
     except Exception as e:
         _log_failure(e)
-        return []
+        return None
 
 
 def _library_by_artist_set(conn) -> dict[tuple[frozenset[str], str], tuple[str, str]]:
@@ -155,12 +162,15 @@ def _album_of(entry: dict) -> tuple[list[str], str] | None:
 
 
 def suggestions(conn, base: str, period: str = "6month", limit: int = 50,
-                user_device_ids: set[int] | None = None) -> list[dict]:
+                user_device_ids: set[int] | None = None) -> list[dict] | None:
     """Top-played albums already in the local catalog but not yet synced to
     every device the caller manages: the Maloja counterpart of
     lastfm.suggestions(). `artist`/`album` are the library's own names, so
     the merge with the other sources dedups on them."""
-    chart = album_charts(base, period)[:limit]
+    chart = album_charts(base, period)
+    if chart is None:
+        return None  # Maloja didn't answer
+    chart = chart[:limit]
     if not chart:
         return []
     library = _library_by_artist_set(conn)
@@ -188,14 +198,17 @@ def suggestions(conn, base: str, period: str = "6month", limit: int = 50,
     return out
 
 
-def most_played(conn, base: str, period: str = "6month", limit: int = 10) -> list[dict]:
+def most_played(conn, base: str, period: str = "6month", limit: int = 10) -> list[dict] | None:
     """The Maloja counterpart of lastfm.most_played(): ranked by scrobbles,
     no library filter, no shuffle. An album in the library is named as the
     library names it, so the merge with Last.fm or ListenBrainz keeps one
     copy; another keeps Maloja's credits, joined with " & "."""
+    chart = album_charts(base, period)
+    if chart is None:
+        return None  # Maloja didn't answer
     library = _library_by_artist_set(conn)
     out = []
-    for entry in album_charts(base, period)[:limit]:
+    for entry in chart[:limit]:
         found = _album_of(entry)
         if found is None:
             continue
@@ -210,12 +223,14 @@ def most_played(conn, base: str, period: str = "6month", limit: int = 10) -> lis
 
 
 def recently_played_suggestions(conn, base: str, limit: int = 50,
-                                user_device_ids: set[int] | None = None) -> list[dict]:
+                                user_device_ids: set[int] | None = None) -> list[dict] | None:
     """Distinct albums from the latest scrobbles, in the library and not
     yet everywhere: the Maloja counterpart of
     lastfm.recently_played_suggestions(). Scrobbles without an album are
     skipped."""
     scrobbles = recent_scrobbles(base, limit)
+    if scrobbles is None:
+        return None  # Maloja didn't answer
     if not scrobbles:
         return []
     library = _library_by_artist_set(conn)

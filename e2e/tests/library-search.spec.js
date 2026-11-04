@@ -4,6 +4,7 @@
 
 // @ts-check
 const { test, expect } = require("@playwright/test");
+const { trackFetches, settled } = require("../support/settle");
 
 // The library search folds the query and each artist name the same way before
 // comparing: a keyboard types U+002D and plain letters, while tags written by
@@ -82,6 +83,7 @@ function searchWithAlbums(page, query, artists = WITH_ALBUMS) {
 
 test.describe("library search matches album titles", () => {
   test.beforeEach(async ({ page }) => {
+    await trackFetches(page);
     await page.goto("/");
     await page.waitForFunction(() => window.Alpine && window.Alpine.$data(document.querySelector("[x-data]")));
   });
@@ -111,7 +113,7 @@ test.describe("library search matches album titles", () => {
   test("the list shows the matching album under the artist's name", async ({ page }) => {
     await page.goto("/#/library");
     await page.evaluate(() => window.Alpine.$data(document.querySelector("[x-data]")).goToTab("library"));
-    await page.waitForTimeout(800); // the tab's own artist load settles before the rows are replaced
+    await settled(page); // the tab's own artist load settles before the rows are replaced
     await page.evaluate((list) => {
       const app = window.Alpine.$data(document.querySelector("[x-data]"));
       app.artists = list;
@@ -123,3 +125,44 @@ test.describe("library search matches album titles", () => {
   });
 });
 
+
+// The filtered list is remembered for the last list, query and sort: the page
+// reads it three times per render. A remembered list must never be a stale
+// one, so the rendered list is checked after each input changes.
+test.describe("the filtered artist list is remembered, never stale", () => {
+  const LIST = [
+    { artist: "Muse", track_count: 40, album_count: 4 },
+    { artist: "Björk", track_count: 30, album_count: 3 },
+    { artist: "Air", track_count: 10, album_count: 6 },
+  ];
+  const rows = (page) => page.locator("button span.truncate:not(.text-xs)").filter({ hasText: /^(Muse|Björk|Air|Bonobo)$/ });
+
+  test.beforeEach(async ({ page }) => {
+    await trackFetches(page);
+    await page.goto("/#/library");
+    await settled(page);
+    await page.evaluate((list) => { window.Alpine.$data(document.querySelector("[x-data]")).artists = list; }, LIST);
+  });
+
+  test("the same inputs give the same list without filtering again", async ({ page }) => {
+    const same = await page.evaluate(() => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      return app.filteredArtists() === app.filteredArtists();
+    });
+    expect(same).toBe(true);
+  });
+
+  test("typing, sorting and a new list each show at once", async ({ page }) => {
+    await expect(rows(page)).toHaveText(["Air", "Björk", "Muse"]);
+    await page.getByPlaceholder("Search for an artist or album…").fill("mu");
+    await expect(rows(page)).toHaveText(["Muse"]);
+    await page.getByPlaceholder("Search for an artist or album…").fill("");
+    await page.getByRole("button", { name: "Sort: name" }).click();
+    await expect(rows(page)).toHaveText(["Air", "Muse", "Björk"]);
+    await page.evaluate(() => {
+      const app = window.Alpine.$data(document.querySelector("[x-data]"));
+      app.artists = [...app.artists, { artist: "Bonobo", track_count: 9, album_count: 9 }];
+    });
+    await expect(rows(page)).toHaveText(["Bonobo", "Air", "Muse", "Björk"]);
+  });
+});

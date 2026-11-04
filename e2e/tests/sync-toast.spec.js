@@ -4,6 +4,7 @@
 
 // @ts-check
 const { test, expect } = require("@playwright/test");
+const { trackFetches, settled } = require("../support/settle");
 
 // #412: the sync-complete toast used to be `fixed top-4 right-4 z-50` —
 // rendering ON TOP of the header's provider/scrobbler/profile icons (header
@@ -14,10 +15,11 @@ const { test, expect } = require("@playwright/test");
 // made, not an approximation of one.
 
 test("a sync-complete toast never overlaps the header's icon row (#412)", async ({ page }) => {
+  await trackFetches(page);
   await page.goto("/#/home");
   await page.evaluate(() =>
     window.Alpine.$data(document.querySelector("[x-data]")).goToTab("home"));
-  await page.waitForTimeout(400);
+  await settled(page);
 
   await page.evaluate(() => {
     const app = window.Alpine.$data(document.querySelector("[x-data]"));

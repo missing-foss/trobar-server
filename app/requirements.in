@@ -14,6 +14,7 @@ tinytag>=2.3.0
 pillow>=12.3.0
 roonapi>=0.1.6,<0.2
 authlib>=1.7.2
+cryptography>=46.0
 waitress>=3.0.2
 # #200: AcoustID/Chromaprint fingerprinting (fingerprint.py) — binds to the
 # libchromaprint1 shared lib via ctypes and decodes via audioread (already

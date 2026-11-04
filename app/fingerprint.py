@@ -233,7 +233,7 @@ def _resolve_one(api_key: str, root, track_id: int, relative_path: str,
                  cached_fingerprint: str | None = None,
                  cached_duration: float | None = None) -> bool:
     """Own short transaction per track — never one long one, same
-    principle as scanner.py's periodic commits. Returns True iff an ISRC
+    principle as scanner.py's commit per file. Returns True iff an ISRC
     was actually resolved and persisted."""
     if cached_fingerprint and cached_duration:
         # #239: provenance.py may already have computed this exact
@@ -308,13 +308,9 @@ def _fetch_musicbrainz_isrc(mbid: str) -> str | None:
 
 
 def _persist(track_id: int, fingerprint: str | None, isrc: str | None, mbid: str | None) -> None:
-    conn = db.get_conn()
-    try:
+    with db.write() as conn:
         conn.execute(
             "UPDATE tracks SET fingerprint = ?, acoustid_isrc = ?, acoustid_mbid = ?, "
             "fingerprint_checked_at = datetime('now') WHERE id = ?",
             (fingerprint, isrc, mbid, track_id),
         )
-        conn.commit()
-    finally:
-        conn.close()

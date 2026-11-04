@@ -23,6 +23,7 @@ from pathlib import Path
 
 import db
 import matching
+import mirror_runs
 import mirror_subsonic
 import subsonic_client
 
@@ -287,6 +288,44 @@ class UntaggedFileDivergenceTests(_MirrorSubsonicTestBase):
             song_ids = client.mirror_create_or_replace_playlist.call_args.args[1]
         self.assertEqual(song_ids, ["s1"])
         self.assertIsNone(self._row(pid)["subsonic_mirror_last_error_code"])
+
+
+
+class CoverageRunTests(_MirrorSubsonicTestBase):
+    """Each write that gets as far as matching records a mirror_runs row."""
+
+    def _write(self, pid, index, result=None):
+        with mock.patch("mirror_subsonic.subsonic_client") as client:
+            client.mirror_build_tag_index.return_value = index
+            client.mirror_create_or_replace_playlist.return_value = result or {
+                "status": "ok", "remote_id": "1"}
+            mirror_subsonic.write_mirror(self.conn, pid)
+
+    def test_a_partial_write_records_what_the_target_lacked(self):
+        pid = self._make_playlist("Chill")
+        self._add_playlist_track(pid, 0, self._make_track("Artist", "Album", "Song"))
+        self._add_playlist_track(pid, 1, self._make_track("Other", "Album", "Gone"))
+        self._write(pid, {_key("Artist", "Album", "Song"): [{"id": "s1", "track_no": None}]})
+        run = mirror_runs.missing(self.conn, pid, "subsonic")
+        assert run is not None
+        self.assertEqual((run["total"], run["on_target"], run["lacked"], run["refused"]), (2, 1, 1, 0))
+        self.assertEqual(run["missing"], [{"artist": "Other", "title": "Gone", "reason": "not_on_target"}])
+
+    def test_no_target_matches_records_every_track_as_lacked(self):
+        pid = self._make_playlist("Chill")
+        self._add_playlist_track(pid, 0, self._make_track("Other", "Album", "Gone"))
+        self._write(pid, {})
+        run = mirror_runs.missing(self.conn, pid, "subsonic")
+        assert run is not None
+        self.assertEqual((run["total"], run["on_target"], run["lacked"]), (1, 0, 1))
+        self.assertEqual(self._row(pid)["subsonic_mirror_last_error_code"], "no_target_matches")
+
+    def test_a_failed_write_records_nothing(self):
+        pid = self._make_playlist("Chill")
+        self._add_playlist_track(pid, 0, self._make_track("Artist", "Album", "Song"))
+        self._write(pid, {_key("Artist", "Album", "Song"): [{"id": "s1", "track_no": None}]},
+                    {"status": "error", "reason": "boom"})
+        self.assertIsNone(mirror_runs.missing(self.conn, pid, "subsonic"))
 
 
 class TrackNoTiebreakTests(_MirrorSubsonicTestBase):

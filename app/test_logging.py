@@ -15,12 +15,14 @@ stay complete, which the first test here enforces.
 
     python3 -m unittest test_logging -v      # from app/
 """
+import ast
 import logging
 import os
 import re
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import db
@@ -33,6 +35,20 @@ db.DATA_DIR = Path(_TMP)
 db.DB_PATH = Path(_TMP) / "music-sync.db"
 
 import main  # noqa: E402 — must follow the DATA_DIR setup above
+import settings  # noqa: E402
+
+# The one print() allowed: `python3 -m scanner` writing its result.
+_SCANNER_CLI_PRINT = next(
+    i for i, line in enumerate((Path(__file__).parent / "scanner.py").read_text().splitlines(), 1)
+    if line.strip() == "print(result, file=sys.stderr)")
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
 
 
 def tearDownModule():
@@ -56,6 +72,31 @@ class AllowlistCompletenessTests(unittest.TestCase):
             missing, set(),
             f"these modules define a logger but LOG_LEVEL won't reach them: {sorted(missing)} "
             f"— add them to main._APP_LOGGERS")
+
+    def test_every_module_has_a_logger(self):
+        # Without one, a module's messages go to print() or nowhere, and
+        # LOG_LEVEL can't reach them (#258). 'main' uses logging.getLogger("main")
+        # and Flask's app.logger instead (it runs as __main__ in the container).
+        app_dir = Path(__file__).parent
+        pattern = re.compile(r"^_log = logging\.getLogger\(__name__\)", re.M)
+        without = {
+            path.stem for path in app_dir.glob("*.py")
+            if not path.stem.startswith("test_") and path.stem != "main"
+            and not pattern.search(path.read_text())
+        }
+        self.assertEqual(without, set(), f"modules without `_log`: {sorted(without)}")
+
+    def test_no_module_prints(self):
+        # print() bypasses LOG_LEVEL and the log format. scanner's CLI entry
+        # point printing its own result is output, not logging.
+        app_dir = Path(__file__).parent
+        printing = {
+            f"{path.stem}:{i}" for path in app_dir.glob("*.py")
+            if not path.stem.startswith("test_")
+            for i, line in enumerate(path.read_text().splitlines(), 1)
+            if re.match(r"\s*print\(", line)
+        } - {f"scanner:{_SCANNER_CLI_PRINT}"}
+        self.assertEqual(printing, set(), f"print() calls: {sorted(printing)}")
 
     def test_the_allowlist_has_no_stale_entries(self):
         # 'main' is legitimately there without the `_log =` idiom (it's Flask's
@@ -155,6 +196,77 @@ class ThirdPartyIsolationTests(_LoggingTestBase):
         self.assertIn("scanner:ours-debug", records)
         self.assertFalse([r for r in records if "TOKEN" in r],
                          "a third-party DEBUG record leaked through")
+
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+class StartupWarningTests(_LoggingTestBase):
+    """The startup security warnings were print()s, shown whatever LOG_LEVEL
+    said. LOG_LEVEL=ERROR must not hide them. Captured on root's side, with
+    no level touched: assertLogs would set the logger's level itself and so
+    prove nothing about what LOG_LEVEL leaves visible."""
+
+    def _warnings_with_log_level_error(self, **patches):
+        self._configure("ERROR")
+        capture = _Capture()
+        root = logging.getLogger()
+        root.addHandler(capture)
+        self.addCleanup(root.removeHandler, capture)
+        defaults: dict[str, object] = {"_music_root_is_readonly": lambda: True,
+                    "_network_data_dir_warning": lambda: None,
+                    "_forward_auth_warnings": lambda: [],
+                    "EMERGENCY_PORT": None}
+        merged = {**defaults, **patches}
+        # The settings live in their own module; the rest are main's.
+        on_settings = {k: v for k, v in merged.items() if k in ("AUTH_MODE", "EMERGENCY_PORT")}
+        on_main = {k: v for k, v in merged.items() if k not in on_settings}
+        with mock.patch.multiple(settings, **on_settings), mock.patch.multiple(main, **on_main):
+            main._log_startup_warnings()
+        return [r.getMessage() for r in capture.records if r.levelno >= logging.WARNING]
+
+    def test_the_forward_auth_warning_survives_log_level_error(self):
+        messages = self._warnings_with_log_level_error(
+            _forward_auth_warnings=lambda: ["anyone can spoof X-authentik-username"])
+        self.assertEqual(messages, ["anyone can spoof X-authentik-username"])
+
+    def test_the_music_root_warning_survives_log_level_error(self):
+        with mock.patch.object(db, "get_music_root", return_value=Path("/music")):
+            messages = self._warnings_with_log_level_error(_music_root_is_readonly=lambda: False)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("not mounted read-only", messages[0])
+
+    def test_an_ignored_emergency_port_survives_log_level_error(self):
+        messages = self._warnings_with_log_level_error(EMERGENCY_PORT=9443, AUTH_MODE="local")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("EMERGENCY_PORT=9443", messages[0])
+
+    def test_the_startup_logger_is_out_of_log_levels_reach(self):
+        self.assertNotIn("trobar.startup", main._APP_LOGGERS)
+        self.assertNotIn("trobar", main._APP_LOGGERS)
+
+
+class StartupCallSiteTests(unittest.TestCase):
+    """Nothing runs main.py's __main__ block under test, so pin statically
+    that it calls _log_startup_warnings(): a dropped call would otherwise
+    pass every other test and silently lose the warnings."""
+
+    def test_the_main_block_calls_the_startup_warnings(self):
+        tree = ast.parse((Path(__file__).parent / "main.py").read_text())
+        blocks = [n for n in tree.body if isinstance(n, ast.If)
+                  and isinstance(n.test, ast.Compare)
+                  and isinstance(n.test.left, ast.Name) and n.test.left.id == "__name__"]
+        self.assertEqual(len(blocks), 1)
+        calls = [c for stmt in blocks[0].body for c in ast.walk(stmt)
+                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                 and c.func.id == "_log_startup_warnings"]
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

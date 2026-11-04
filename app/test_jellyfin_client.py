@@ -22,10 +22,12 @@ functions and the _request_as()/_get() split at the bottom of the module).
     python3 -m unittest test_jellyfin_client -v      # from app/
 """
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock as mock
 from pathlib import Path
+from urllib.parse import urlparse
 
 _TMP = tempfile.mkdtemp(prefix="trobar-test-jellyfin-client-")
 os.environ["DATA_DIR"] = _TMP
@@ -272,9 +274,20 @@ class ActiveGetPlaylistTracksTests(_ActiveJellyfinClientTestBase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["tracks"], [{
             "position": 0, "title": "Track One", "artist": "Artist A",
-            "path": "/music/a/1.flac", "album": "Album A",
+            "path": "/music/a/1.flac", "album": "Album A", "mbid": None,
         }])
         self.assertIn("/Playlists/p1/Items", req.call_args.args[1])
+
+    def test_passes_the_recording_id_and_not_the_release_track_id(self):
+        with mock.patch("requests.request", return_value=_resp(body={"Items": [
+            {"Name": "T", "Artists": ["A"], "Path": None, "Album": None,
+             "ProviderIds": {"MusicBrainzRecording": "8f3471b5-7e6a-48da-86a9-c1c07a0f47ae", "MusicBrainzTrack": "11111111-2222-3333-4444-555555555555"}},
+            {"Name": "U", "Artists": ["A"], "Path": None, "Album": None,
+             "ProviderIds": {"MusicBrainzTrack": "11111111-2222-3333-4444-555555555555"}},
+        ]})) as req:
+            result = jellyfin_client.get_playlist_tracks("X", source_playlist_id="p1")
+        self.assertEqual([t["mbid"] for t in result["tracks"]], ["8f3471b5-7e6a-48da-86a9-c1c07a0f47ae", None])
+        self.assertIn("ProviderIds", req.call_args.kwargs["params"]["Fields"].split(","))
 
     def test_joins_multiple_artists_with_comma(self):
         with mock.patch("requests.request", return_value=_resp(body={"Items": [
@@ -310,7 +323,7 @@ class ActiveGetPlaylistTracksTests(_ActiveJellyfinClientTestBase):
 class ActiveGetArtistImageTests(_ActiveJellyfinClientTestBase):
     def setUp(self):
         super().setUp()
-        jellyfin_client._artist_image_key_map = None
+        jellyfin_client._artist_image_key_map.clear()
         jellyfin_client._music_library_id = None
         self._set_config(url="http://jf.local", api_key="key1", user_id="u1")
 
@@ -451,14 +464,16 @@ class MirrorBuildTagIndexTests(_JellyfinClientTestBase):
         self.assertEqual({("a", "al", "one"), ("b", "al", "two")}, set(index.keys()))
         starts = [call.kwargs["params"]["StartIndex"] for call in req.call_args_list]
         self.assertEqual(starts, [0, 2, 4])
+        self.assertEqual([c.kwargs["params"]["Limit"] for c in req.call_args_list], [2, 2, 2])
 
     def test_page_cap_backstop_gives_up_if_a_page_is_never_empty(self):
         self._configure()
         full_page = _resp(body={"Items": [_item("A", "Al", "One", "1"), _item("B", "Al", "Two", "2")]})
         with mock.patch.object(jellyfin_client, "_MIRROR_PAGE_SIZE", 2), \
              mock.patch.object(jellyfin_client, "_MIRROR_MAX_PAGES", 3):
-            with mock.patch("requests.request", return_value=full_page):
+            with mock.patch("requests.request", return_value=full_page) as req:
                 self.assertIsNone(jellyfin_client.mirror_build_tag_index())
+        self.assertEqual(req.call_count, 3)
 
     def test_a_failing_page_mid_walk_fails_the_whole_index(self):
         self._configure()
@@ -629,10 +644,16 @@ class MirrorDeletePlaylistTests(_JellyfinClientTestBase):
             self.assertFalse(jellyfin_client.mirror_delete_playlist("42"))
 
 
+def _is_library(url):
+    """Which fake server a request is for: the library's or the mirror
+    target's, told apart by host."""
+    return urlparse(url).hostname == "library.local"
+
+
 class MirrorTargetIsLibraryServerTests(_JellyfinClientTestBase):
     def _ids(self, library, mirror):
         def get(url, **_kw):
-            sid = library if url.startswith("http://library.local") else mirror
+            sid = library if _is_library(url) else mirror
             if sid is None:
                 raise requests.ConnectionError("down")
             return _resp_id(sid)
@@ -664,7 +685,7 @@ class MirrorTargetIsLibraryServerTests(_JellyfinClientTestBase):
         # Jellyfin answers camelCase for its first seconds after a start.
         def get(url, **_kw):
             r = mock.Mock()
-            r.json.return_value = {"id": "srv-1"} if url.startswith("http://library.local") else {"Id": "srv-1"}
+            r.json.return_value = {"id": "srv-1"} if _is_library(url) else {"Id": "srv-1"}
             r.raise_for_status.return_value = None
             return r
         with mock.patch("requests.get", side_effect=get):
@@ -684,6 +705,20 @@ def _resp_id(server_id):
     r.json.return_value = {"Id": server_id, "ServerName": "x"}
     r.raise_for_status.return_value = None
     return r
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

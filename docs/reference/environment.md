@@ -68,7 +68,7 @@ reference.
     as an issue than switched on in a running install.
 
 !!! note "Listening-history API bases"
- `LASTFM_API_BASE` (default `http://ws.audioscrobbler.com/2.0/`) and
+ `LASTFM_API_BASE` (default `https://ws.audioscrobbler.com/2.0/`) and
  `LISTENBRAINZ_API_BASE` (default `https://api.listenbrainz.org`), if set,
     provide the default when the equivalent Administration fields are left
     blank — see
@@ -81,6 +81,8 @@ not a typical household deployment.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `TROBAR_CREDENTIAL_KEY_FILE` | `DATA_DIR/credential_key` | The file holding the key that encrypts the credentials for sending plays. Set it outside `DATA_DIR` to keep the key out of a copy of `DATA_DIR`; see [Backups](../operations/backups.md). Trobar makes the file if it is missing. |
+| `SESSION_LIFETIME_DAYS` | `30` | How long a signed-in browser session lasts without a visit. It slides: each request renews it. Changing your password, or an admin resetting it, also ends that user's other sessions. |
 | `SESSION_COOKIE_SECURE` | `1` (secure) | Set to `0`/`false`/`no` to drop the session cookie's `Secure` flag for plain-HTTP local development — over real HTTPS, leave this at its default or login breaks. See [SECURITY.md](https://github.com/missing-foss/trobar-server/blob/main/SECURITY.md). |
-| `DEV_USER` | `dev` | `forward` mode only: username used when the proxy's identity header is absent — a local-dev convenience, never seen behind a real ForwardAuth proxy that always sets it. |
-| `TROBAR_DEV_SERVER` | *(unset, off)* | Set to `1`/`true`/`yes` to run Flask's Werkzeug development server (reloader/debugger) instead of waitress. **Local development only** — Werkzeug's dev server isn't built to be efficient, stable, or secure. |
+| `DEV_USER` | `dev` | `forward` mode with `TROBAR_DEV_SERVER` on only: the username a request without the proxy's identity header signs in as. Otherwise such a request is refused (401), and the refusal is logged. |
+| `TROBAR_DEV_SERVER` | *(unset, off)* | Set to `1`/`true`/`yes` to run Flask's Werkzeug development server (reloader/debugger) instead of waitress, and, in `forward` mode, to let a request without the identity header in as `DEV_USER`. **Local development only** — Werkzeug's dev server isn't built to be efficient, stable, or secure. |

@@ -6,10 +6,16 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 # First Run & Setup Wizard
 
-The first visit as the admin opens a short setup wizard. In `AUTH_MODE=local`
-the very first login attempt creates the admin account — which is why you set
-`ADMIN_USERNAME` **before first launch**, so a stranger who reaches a fresh
-instance first can't claim it (see [Authentication Modes](authentication.md)).
+In `AUTH_MODE=local`, the first visit as the admin opens a short setup
+wizard. The very first login attempt creates the admin account — which is why
+you set `ADMIN_USERNAME` **before first launch**, so a stranger who reaches a
+fresh instance first can't claim it (see [Authentication Modes](authentication.md)).
+
+Under `oidc` and `forward` there is no wizard: the admin is whoever signs in as
+`ADMIN_USERNAME`, and the provider and listening-history settings are made in
+[Administration → Configuration](../administration.md#configuration). The
+music folder is the `MUSIC_ROOT` environment variable (see
+[Environment variables](../reference/environment.md)).
 
 ## The wizard steps
 
@@ -62,6 +68,18 @@ background, then takes you straight to the library — there's no separate
 "scan in progress" screen to wait on. Plan for a few minutes per 10k tracks on
 network storage; incremental rescans afterwards only touch changed files. More
 on scanning in [Library & Selections](../using/library-selections.md).
+
+## Running it again
+
+In `AUTH_MODE=local`, an admin can walk through the wizard again from
+**Administration → Configuration → Maintenance → Run setup again**: to move the
+music folder, re-enter the library source's connection details, or set the
+default Last.fm key. It starts from the current settings and saves nothing
+until **Finish**; **Back to Administration** leaves at any step without
+changing anything. **Test connection** tests the details as typed, without
+saving them. Changing to a different library source isn't done here: use
+[Change library source](../administration.md#changing-the-library-source).
+Finishing starts a library scan, as the first run does.
 
 ## Next
 

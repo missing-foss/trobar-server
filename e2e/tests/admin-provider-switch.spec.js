@@ -55,6 +55,12 @@ async function scanDialog(page) {
 }
 
 test.describe.serial("Change library source", () => {
+  // Each test walks the dialog through real steps, and scans it in every
+  // theme along the way (16 axe runs in the cancel test alone). They can't
+  // be split without repeating the flow, and a loaded runner takes them past
+  // the default timeout, so they get three times it.
+  test.slow();
+
   test("the card shows the active provider only", async ({ page }) => {
     await gotoConfig(page);
     await expect(page.getByTestId("active-provider")).toHaveText("Roon");

@@ -130,15 +130,95 @@ class SourcePrecedenceTests(_ArtistImagesTestCase):
         self.assertIsNone(result)
         self.assertEqual(fs.call_count, 1)
 
-    def test_returns_none_and_caches_nothing_when_every_source_misses(self):
+    def test_returns_none_and_caches_no_image_when_every_source_misses(self):
         provider = _fake_provider(result=None)
         with mock.patch.object(artist_images.filesystem_client, "get_artist_image",
                                return_value=None):
             result = artist_images.get_artist_image("Nobody", provider, None)
         self.assertIsNone(result)
-        # No negative caching here (unlike covers.py) — an artist with no
-        # picture today may get one when the provider is next reachable.
-        self.assertFalse(artist_images.CACHE_DIR.exists())
+        # Only the miss marker: no image, no content type, no sidecar.
+        self.assertEqual([p.suffix for p in artist_images.CACHE_DIR.iterdir()], [".none"])
+
+
+class MissCacheTests(_ArtistImagesTestCase):
+    """A miss everywhere is remembered for MISS_TTL_S. Asserted the same way
+    as the cache: by which sources are asked again, not by files."""
+
+    def _miss(self, artist="Nobody", key=None):
+        provider = _fake_provider(result=None)
+        with mock.patch.object(artist_images.filesystem_client, "get_artist_image",
+                               return_value=None) as fs, \
+                mock.patch.object(artist_images.audiodb_client, "get_artist_image",
+                                  return_value=None) as adb:
+            result = artist_images.get_artist_image(artist, provider, key)
+        return result, provider.get_artist_image, fs, adb
+
+    def _age_marker(self, artist, seconds):
+        marker = artist_images._cache_path(artist).with_suffix(".none")
+        old = marker.stat().st_mtime - seconds
+        os.utime(marker, (old, old))
+
+    def test_a_remembered_miss_asks_no_source_again(self):
+        self._miss(key="k")
+        result, provider, fs, adb = self._miss(key="k")
+        self.assertIsNone(result)
+        provider.assert_not_called()
+        fs.assert_not_called()
+        adb.assert_not_called()
+
+    def test_a_miss_is_asked_again_after_a_day(self):
+        self._miss()
+        self._age_marker("Nobody", artist_images.MISS_TTL_S + 1)
+        _result, provider, fs, _adb = self._miss()
+        provider.assert_called_once_with("Nobody")
+        fs.assert_called_once_with("Nobody")
+
+    def test_a_miss_just_short_of_a_day_is_still_remembered(self):
+        self._miss()
+        self._age_marker("Nobody", artist_images.MISS_TTL_S - 60)
+        _result, provider, _fs, _adb = self._miss()
+        provider.assert_not_called()
+
+    def test_the_memory_lasts_a_day_and_no_longer(self):
+        # Literal hours, not MISS_TTL_S: "at most a day" is the bound that
+        # makes remembering a miss acceptable (a briefly unreachable provider
+        # leaves an artist without a picture that long), so it is pinned here.
+        self._miss()
+        self._age_marker("Nobody", 23 * 3600)
+        _result, provider, _fs, _adb = self._miss()
+        provider.assert_not_called()
+        self._age_marker("Nobody", 2 * 3600)  # 25 hours old now
+        _result, provider, _fs, _adb = self._miss()
+        provider.assert_called_once_with("Nobody")
+
+    def test_asking_again_renews_the_day(self):
+        self._miss()
+        self._age_marker("Nobody", artist_images.MISS_TTL_S + 1)
+        self._miss()  # asks, misses again, and renews the marker
+        _result, provider, _fs, _adb = self._miss()
+        provider.assert_not_called()
+
+    def test_a_found_picture_replaces_an_expired_miss(self):
+        self._miss()
+        self._age_marker("Nobody", artist_images.MISS_TTL_S + 1)
+        provider = _fake_provider(result=(_png(), "image/png"))
+        with mock.patch.object(artist_images.filesystem_client, "get_artist_image"):
+            found = artist_images.get_artist_image("Nobody", provider, None)
+        self.assertIsNotNone(found)
+        self.assertFalse(artist_images._cache_path("Nobody").with_suffix(".none").exists())
+
+    def test_one_artists_miss_does_not_hide_another(self):
+        self._miss("Nobody")
+        provider = _fake_provider(result=(_png(), "image/png"))
+        with mock.patch.object(artist_images.filesystem_client, "get_artist_image"):
+            self.assertIsNotNone(artist_images.get_artist_image("Somebody", provider, None))
+
+    def test_clearing_the_cache_forgets_the_misses(self):
+        # main.py clears the cache with shutil.rmtree(CACHE_DIR).
+        self._miss()
+        shutil.rmtree(artist_images.CACHE_DIR)
+        _result, provider, _fs, _adb = self._miss()
+        provider.assert_called_once_with("Nobody")
 
 
 class CacheTests(_ArtistImagesTestCase):
@@ -258,6 +338,20 @@ class DownscaleTests(unittest.TestCase):
         data, content_type = artist_images.downscale(b"", "image/jpeg")
         self.assertEqual(data, b"")
         self.assertEqual(content_type, "image/jpeg")
+
+
+def setUpModule():
+    # unittest calls this every time it enters the module, and
+    # tearDownModule every time it leaves; a selection that interleaves
+    # modules (`test_routes.A test_maloja test_routes.B`) comes back after
+    # the dir was removed. _TMP is made once, at import.
+    os.makedirs(_TMP, exist_ok=True)
+
+
+def tearDownModule():
+    # The module's temp dir (and the DB files in it) would otherwise be left
+    # in the system temp dir by every run.
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

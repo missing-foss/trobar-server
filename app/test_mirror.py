@@ -500,6 +500,33 @@ class UserFolderNameTests(_MirrorTestBase):
         self.assertEqual(mirror.user_folder_name(self.conn, self._user("_shared")), "shared")
 
 
+class SeenInLibraryTests(unittest.TestCase):
+    """The probe that checks the share location against the files: written
+    through the mirror folder, looked for under MUSIC_ROOT/location."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="trobar-test-seen-"))
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self.music = self._tmp / "music"
+        (self.music / "Playlists").mkdir(parents=True)
+
+    def test_the_same_folder_is_seen(self):
+        self.assertTrue(mirror.seen_in_library(self.music / "Playlists", self.music, "Playlists"))
+
+    def test_a_different_folder_is_not(self):
+        elsewhere = self._tmp / "elsewhere"
+        self.assertFalse(mirror.seen_in_library(elsewhere, self.music, "Playlists"))
+
+    def test_a_location_outside_the_library_is_refused_before_any_probe(self):
+        """Even when the mirror folder really is that outside folder, so a
+        probe would be found: the location must stay inside MUSIC_ROOT."""
+        outside = self._tmp / "outside"
+        for location in ("../outside", "Playlists/../../outside", str(outside), ""):
+            with self.subTest(location=location):
+                self.assertFalse(mirror.seen_in_library(outside, self.music, location))
+        self.assertFalse(outside.exists())  # refused before the probe made the folder
+
+
 class EntryPathTests(unittest.TestCase):
     def test_no_location_keeps_the_absolute_path(self):
         self.assertEqual(mirror.entry_path(Path("/music"), "A/B/t.flac", None), "/music/A/B/t.flac")
