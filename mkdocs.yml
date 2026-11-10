@@ -114,6 +114,7 @@ nav:
       - Spotify: providers/spotify.md
       - YouTube Music: providers/youtube-music.md
       - Spotify links: providers/spotify-links.md
+      - Tidal links: providers/tidal-links.md
       - Providers we don't support: providers/other.md
   - Using Trobar:
       - Library & Selections: using/library-selections.md

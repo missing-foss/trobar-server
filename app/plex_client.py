@@ -385,7 +385,7 @@ def mirror_build_index() -> dict | None:
 
 def mirror_read(remote_id: str) -> dict | None:
     """A copy as it stands: {"title", "summary", "keys": [track keys, in
-    order]}, or None when it can't be read (gone, or no answer:
+    order], "items": [{"id", "artist", "title"}, the same tracks]}, or None when it can't be read (gone, or no answer:
     mirror_exists tells which)."""
     meta = _mirror_request("GET", f"/playlists/{remote_id}")
     items = _mirror_request("GET", f"/playlists/{remote_id}/items")
@@ -394,8 +394,11 @@ def mirror_read(remote_id: str) -> dict | None:
     # A key that now names a track has no items to read (a 500), so this
     # is only reached for a playlist; mirror_exists tells the two apart.
     [playlist] = _container(meta[1]).get("Metadata") or [{}]
+    entries = _container(items[1]).get("Metadata") or []
     return {"title": playlist.get("title"), "summary": playlist.get("summary") or "",
-            "keys": [str(i["ratingKey"]) for i in _container(items[1]).get("Metadata") or []]}
+            "keys": [str(i["ratingKey"]) for i in entries],
+            "items": [{"id": str(i["ratingKey"]), "artist": i.get("grandparentTitle") or "",
+                       "title": i.get("title") or ""} for i in entries]}
 
 
 def mirror_exists(remote_id: str) -> bool | None:

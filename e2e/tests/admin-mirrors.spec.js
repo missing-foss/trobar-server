@@ -106,6 +106,64 @@ test.describe("Playlist mirrors tab", () => {
     await expect(header(page, "playlists")).toContainText("1 playlist with a failed write");
   });
 
+  test("edits a write overwrote: a count per line, the folder too, and Show lists them", async ({ page }) => {
+    await page.route("**/api/admin/mirrors/1/jellyfin/missing", route => route.fulfill({ json: {
+      run_at: "2026-11-09 04:10:00", total: 48, on_target: 48, lacked: 0, refused: 0, missing: [],
+      discarded: 2, restored: 1, list_max: 100, overwritten: [
+        { artist: "Velvet Tide", title: "Undertow", change: "discarded" },
+        { artist: "Orrery", title: "Perihelion", change: "discarded" },
+        { artist: "Cinder & Ash", title: "Kindling", change: "restored" }] } }));
+    await gotoMirrors(page);
+    await seed(page, [target("filesystem", { configured: true, state: "ok", where: "/mirror" }),
+      target("jellyfin", { configured: true, state: "ok", where: "http://jf.example" })], [{
+      id: 1, title: "Road Trip", matched: 48, total: 48,
+      mirror_enabled: true, mirror_filename: "Road Trip.m3u", mirror_last_written_at: "2026-11-09 04:10:00",
+      jellyfin_mirror_enabled: true, jellyfin_mirror_remote_id: "abc123",
+      jellyfin_mirror_last_written_at: "2026-11-09 04:10:00",
+      coverage: { jellyfin: { on_target: 48, total: 48, lacked: 0, refused: 0, history: [48] } },
+      overwrites: { jellyfin: { discarded: 2, restored: 1 }, filesystem: { discarded: 1, restored: 0 } },
+    }]);
+    const rows = page.locator("#mirror-section-playlists");
+    await expect(rows.getByText("3 edits overwritten", { exact: true })).toBeVisible();
+    await expect(rows.getByText("1 edit overwritten", { exact: true })).toBeVisible();
+    const panel = rows.locator("[data-mirror-overwritten]").filter({ hasText: "Jellyfin" });
+    await expect(panel).toBeHidden();
+    // The jellyfin line's own Show, the one after its count.
+    await rows.getByText("3 edits overwritten", { exact: true }).locator("xpath=following-sibling::button[1]").click();
+    await expect(panel).toBeVisible();
+    await expect(panel).toContainText("Changed in Jellyfin since Trobar last wrote this copy");
+    await expect(panel.locator("tbody tr")).toHaveCount(3);
+    await expect(panel.locator("tbody tr").nth(0)).toContainText("Added there, removed");
+    await expect(panel.locator("tbody tr").nth(2)).toContainText("Removed there, put back");
+  });
+
+  test("a failed line says its error, not what an earlier write overwrote", async ({ page }) => {
+    await gotoMirrors(page);
+    await seed(page, [target("jellyfin", { configured: true, state: "warning", where: "http://jf.example" })], [{
+      id: 1, title: "Road Trip", matched: 48, total: 48,
+      jellyfin_mirror_enabled: true, jellyfin_mirror_remote_id: "abc123",
+      jellyfin_mirror_last_error_code: "unreachable", jellyfin_mirror_last_error: "timed out",
+      overwrites: { jellyfin: { discarded: 2, restored: 1 } },
+    }]);
+    const rows = page.locator("#mirror-section-playlists");
+    await expect(rows).toContainText("timed out");
+    await expect(rows.getByText("3 edits overwritten", { exact: true })).toHaveCount(0);
+  });
+
+  test("the mirror icon's tooltip adds the count when the row carries one", async ({ page }) => {
+    await gotoMirrors(page);
+    const titles = await page.evaluate(() => {
+      const d = window.Alpine.$data(document.querySelector("[x-data]"));
+      const p = { mirror_coverage: { jellyfin: { on_target: 40, total: 64 } } };
+      return [d.mirrorIconTitle(p, "jellyfin"),
+        d.mirrorIconTitle({ ...p, mirror_overwritten: { jellyfin: 3 } }, "jellyfin"),
+        d.mirrorIconTitle({ mirror_overwritten: { filesystem: 1 } }, "filesystem")];
+    });
+    expect(titles[0]).not.toContain("overwritten");
+    expect(titles[1]).toContain("40 of 64 tracks on Jellyfin, 3 edits overwritten");
+    expect(titles[2]).toContain("1 edit overwritten");
+  });
+
   test("a Settings link opens the Configuration section holding that target's field", async ({ page }) => {
     await gotoMirrors(page);
     await seed(page, [target("filesystem"), target("subsonic"), target("jellyfin"), target("emby"),

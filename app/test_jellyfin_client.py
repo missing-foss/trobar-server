@@ -505,7 +505,7 @@ class MirrorCreateOrReplacePlaylistTests(_JellyfinClientTestBase):
         self._configure()
         with mock.patch("requests.request", return_value=_resp(body={"Id": "42"})) as req:
             result = jellyfin_client.mirror_create_or_replace_playlist("Chill", ["1", "2"], None)
-        self.assertEqual(result, {"status": "ok", "remote_id": "42"})
+        self.assertEqual(result, {"status": "ok", "remote_id": "42", "previous": None})
         self.assertEqual(req.call_args.args[:2], ("POST", "http://jf.local/Playlists"))
         body = req.call_args.kwargs["json"]
         self.assertEqual(body["Name"], "Chill")
@@ -537,12 +537,14 @@ class MirrorCreateOrReplacePlaylistTests(_JellyfinClientTestBase):
 
     def test_replace_reads_current_items_deletes_then_adds(self):
         self._configure()
-        current = _resp(body={"Items": [{"Id": "old1"}, {"Id": "old2"}]})
+        current = _resp(body={"Items": [{"Id": "old1", "Name": "Undertow", "Artists": ["Velvet Tide"]}, {"Id": "old2"}]})
         delete_resp = _resp(status_code=204)
         add_resp = _resp(status_code=204)
         with mock.patch("requests.request", side_effect=[current, delete_resp, add_resp]) as req:
             result = jellyfin_client.mirror_create_or_replace_playlist("Chill", ["new1"], "42")
-        self.assertEqual(result, {"status": "ok", "remote_id": "42"})
+        self.assertEqual(result, {"status": "ok", "remote_id": "42", "previous": [
+            {"id": "old1", "artist": "Velvet Tide", "title": "Undertow"},
+            {"id": "old2", "artist": "", "title": ""}]})
         get_call, delete_call, add_call = req.call_args_list
         self.assertEqual(get_call.args[:2], ("GET", "http://jf.local/Playlists/42/Items"))
         self.assertEqual(delete_call.args[:2], ("DELETE", "http://jf.local/Playlists/42/Items"))
@@ -556,7 +558,7 @@ class MirrorCreateOrReplacePlaylistTests(_JellyfinClientTestBase):
         add_resp = _resp(status_code=204)
         with mock.patch("requests.request", side_effect=[current, add_resp]) as req:
             result = jellyfin_client.mirror_create_or_replace_playlist("Chill", ["new1"], "42")
-        self.assertEqual(result, {"status": "ok", "remote_id": "42"})
+        self.assertEqual(result, {"status": "ok", "remote_id": "42", "previous": []})
         self.assertEqual(len(req.call_args_list), 2)
 
     def test_replace_skips_add_when_song_ids_is_empty(self):
@@ -565,7 +567,7 @@ class MirrorCreateOrReplacePlaylistTests(_JellyfinClientTestBase):
         delete_resp = _resp(status_code=204)
         with mock.patch("requests.request", side_effect=[current, delete_resp]) as req:
             result = jellyfin_client.mirror_create_or_replace_playlist("Chill", [], "42")
-        self.assertEqual(result, {"status": "ok", "remote_id": "42"})
+        self.assertEqual(result, {"status": "ok", "remote_id": "42", "previous": [{"id": "old1", "artist": "", "title": ""}]})
         self.assertEqual(len(req.call_args_list), 2)
 
     def test_replace_surfaces_a_404_as_a_specific_not_found_code(self):

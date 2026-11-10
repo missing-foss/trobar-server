@@ -21,7 +21,10 @@ import db
 import device_plays
 import play_forward
 import settings
+import subsonic_client
+import time
 import tidal_client
+import tidal_token
 import url_guard
 from web_common import (
     ADMIN_ONLY_WIDGETS,
@@ -34,6 +37,8 @@ from web_common import (
     _is_admin,
     _is_valid_url,
     _normalize_dashboard_widgets,
+    _rate_limited,
+    _record_failure,
     _session_user_id,
     _spotify_experimental_enabled,
     get_current_user_id,
@@ -77,6 +82,56 @@ _SEND_CREDENTIAL_TARGETS = {"maloja_api_key": "maloja", "listenbrainz_token": "l
 _SEND_CREDENTIAL_MAX = 500
 
 
+# Navidrome's user list per server, briefly: the Profile asks on each load.
+_NAVIDROME_USERS_TTL = 60
+_navidrome_users_cache: dict[tuple, tuple[float, set[str] | None]] = {}
+
+
+def _subsonic_server(conn) -> tuple[str, str, str] | None:
+    """The Subsonic server a member's Navidrome username is for: the library
+    source when it is Subsonic, otherwise the mirror target. None when
+    neither is set up, and the Profile then doesn't offer the field."""
+    if (db.get_config(conn, "provider") or "roon") == "subsonic":
+        url = db.get_config(conn, "subsonic_url") or ""
+        username = db.get_config(conn, "subsonic_username") or ""
+        if url and username:
+            return url, username, db.get_config(conn, "subsonic_password") or ""
+    return db.get_mirror_subsonic_config()
+
+
+def _navidrome_users(server: tuple[str, str, str]) -> set[str] | None:
+    now = time.monotonic()
+    cached = _navidrome_users_cache.get(server)
+    if cached is not None and now - cached[0] < _NAVIDROME_USERS_TTL:
+        return cached[1]
+    users = subsonic_client.navidrome_usernames(*server)
+    _navidrome_users_cache[server] = (now, users)
+    return users
+
+
+def _subsonic_profile(conn, user_id: int, username: str | None) -> dict:
+    """The Profile's Navidrome block: whether it applies, and for a saved
+    username whether the server has that user ("known"/"unknown"), or
+    "unchecked" when the server can't say (not Navidrome, not an admin
+    account, not reachable). No password is ever involved."""
+    server = _subsonic_server(conn)
+    state = "none"
+    if username and server is not None:
+        users = _navidrome_users(server)
+        state = "unchecked" if users is None else ("known" if username.casefold() in users else "unknown")
+    owned = conn.execute(
+        "SELECT COUNT(*) FROM playlists WHERE owner_user_id = ? AND source_provider = 'subsonic'",
+        (user_id,)).fetchone()[0]
+    return {"subsonic_available": server is not None, "subsonic_user_state": state,
+            "subsonic_playlists_owned": owned}
+
+
+_SUBSONIC_USERNAME_MAX = 200
+_SUBSONIC_PASSWORD_MAX = 1000
+_SUBSONIC_CLAIM_FAILURES = 5
+_SUBSONIC_CLAIM_WINDOW_S = 15 * 60
+
+
 def _profile_dict(conn: sqlite3.Connection, user_id: int) -> dict:
     row = conn.execute(
         "SELECT username, lastfm_username, lastfm_api_key, listenbrainz_username, maloja_url, "
@@ -84,7 +139,7 @@ def _profile_dict(conn: sqlite3.Connection, user_id: int) -> dict:
         "hide_zero_match_playlists, thanks_card_dismissed, device_plays_enabled, "
         "maloja_api_key_enc, listenbrainz_token_enc, lastfm_session_enc, lastfm_session_name, "
         "is_admin, email, avatar_path, tidal_refresh_token, tidal_display_name, tidal_scopes, "
-        "spotify_refresh_token, spotify_display_name, "
+        "spotify_refresh_token, spotify_display_name, subsonic_username, "
         "(password_hash IS NOT NULL) AS has_local_password FROM users WHERE id = ?",
         (user_id,),
     ).fetchone()
@@ -112,7 +167,14 @@ def _profile_dict(conn: sqlite3.Connection, user_id: int) -> dict:
     email = result.pop("email")
     # The refresh token itself is never sent to the frontend — connected
     # status + display name is all the UI needs (see /profile/tidal/* below).
-    result["tidal_connected"] = result.pop("tidal_refresh_token") is not None
+    # One that can't be decrypted (the credential key was lost or changed)
+    # isn't connected: the Profile offers Connect again. With a key file that
+    # can't be used it is still linked: the token is kept until the key is fixed.
+    stored_tidal = result.pop("tidal_refresh_token")
+    try:
+        result["tidal_connected"] = tidal_token.unseal(stored_tidal, user_id) is not None
+    except credential_store.CredentialKeyError:
+        result["tidal_connected"] = True
     # Sharing needs playlists.write, which Connect requests only once the
     # admin has enabled it; a link made before then is read-only until the
     # user reconnects.
@@ -126,6 +188,7 @@ def _profile_dict(conn: sqlite3.Connection, user_id: int) -> dict:
     # "Connect Spotify" block rather than just leaving it there advertising
     # a feature the routes below will refuse.
     result["spotify_experimental_enabled"] = db.get_config(conn, "experimental_spotify_enabled") == "1"
+    result.update(_subsonic_profile(conn, user_id, result["subsonic_username"]))
     # See get_current_user_id: a local session (AUTH_MODE=local, or the
     # admin's break-glass login) always takes precedence over Authentik
     # headers when both are present, so this is the same check that decides
@@ -231,6 +294,62 @@ def api_profile_send_credentials():
             if stored is None:
                 play_forward.set_enabled(conn, user_id, _SEND_CREDENTIAL_TARGETS[name], False, commit=False)
         conn.commit()
+        return jsonify(_profile_dict(conn, user_id))
+
+
+@bp.route("/api/profile/subsonic-username", methods=["PUT"])
+def api_profile_subsonic_username():
+    """The caller's own Navidrome username, so the playlists they keep there
+    (private ones included) sync as theirs and their mirror copies go into
+    their account. {"username", "password"}: the password proves the
+    username is theirs. Trobar signs in with it once and keeps only the
+    username; the password is neither stored nor logged. One Navidrome user
+    per member: a username someone else has is refused. An empty username
+    removes it, with no password. Failed proofs are limited per member, so
+    this can't be used to guess someone's Navidrome password. Returns the
+    profile."""
+    with db.connection() as conn:
+        user_id = get_current_user_id(conn)
+        body = request.get_json(force=True, silent=True)
+        body = body if isinstance(body, dict) else {}
+        value, password = body.get("username"), body.get("password", "")
+        if not isinstance(value, str) or len(value) > _SUBSONIC_USERNAME_MAX \
+                or not isinstance(password, str) or len(password) > _SUBSONIC_PASSWORD_MAX:
+            abort(400, description=_("That value can't be used."))
+        value = value.strip()
+        if not value:
+            conn.execute("UPDATE users SET subsonic_username = NULL WHERE id = ?", (user_id,))
+            conn.commit()
+            return jsonify(_profile_dict(conn, user_id))
+        server = _subsonic_server(conn)
+        if server is None:
+            abort(409, description=_("No Navidrome server is set up."))
+        bucket = f"subsonic-claim:{user_id}"
+        if _rate_limited(bucket, _SUBSONIC_CLAIM_FAILURES, _SUBSONIC_CLAIM_WINDOW_S):
+            abort(429, description=_("Too many attempts. Try again later."))
+        # The accounts Trobar itself uses own the household's playlists and
+        # copies: no member can be them.
+        mirror = db.get_mirror_subsonic_config()
+        trobar_accounts = {server[1].casefold()} | ({mirror[1].casefold()} if mirror else set())
+        if value.casefold() in trobar_accounts:
+            abort(409, description=_("That is the account Trobar uses on Navidrome, not a member's."))
+        taken = conn.execute(
+            "SELECT 1 FROM users WHERE subsonic_username = ? COLLATE NOCASE AND id != ?",
+            (value, user_id)).fetchone()
+        if taken is not None:
+            abort(409, description=_("Another member already has that Navidrome user."))
+        accepted = subsonic_client.check_login(server[0], value, password)
+        if accepted is None:
+            abort(502, description=_("Navidrome couldn't be reached."))
+        if not accepted:
+            _record_failure(bucket)
+            abort(400, description=_("Navidrome didn't accept that username and password."))
+        try:
+            conn.execute("UPDATE users SET subsonic_username = ? WHERE id = ?", (value, user_id))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            abort(409, description=_("Another member already has that Navidrome user."))
         return jsonify(_profile_dict(conn, user_id))
 
 

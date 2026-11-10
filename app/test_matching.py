@@ -14,7 +14,10 @@ non-ASCII letter ("Édith Piaf", "CÉLINE DION") silently never matched and
 never synced. The fix folds both sides with the same Unicode-aware Python
 normalization via a registered pynorm() function.
 """
+import random
+import re
 import sqlite3
+import time
 import unicodedata
 import unittest
 
@@ -239,6 +242,59 @@ class CloseMatchNormalisationTests(unittest.TestCase):
         # and a wrong match is worse than a miss.
         _add(self.conn, "Marigold Avenue", "Paper Days")
         self.assertIsNone(matching.match_playlist_track(self.conn, "Marigold Avenue", "Copper Days"))
+
+
+# The trailing-annotation expression _strip_annotations used to apply in a
+# loop. On a long title of "(" or spaces it was quadratic, so the scan that
+# replaced it is checked here against it, on short titles only.
+_OLD_ANNOTATION = re.compile(r"\s*[\(\[][^)\]]*[\)\]]\s*$")
+
+
+def _old_strip_annotations(title: str) -> str:
+    prev = title
+    while True:
+        stripped = _OLD_ANNOTATION.sub("", prev).strip()
+        if stripped == prev:
+            return prev
+        prev = stripped
+
+
+class StripAnnotationsTests(unittest.TestCase):
+    def test_trailing_annotations_go(self):
+        cases = {
+            "Copper Days (2011 Remaster)": "Copper Days",
+            "Copper Days (Live) [Remastered]": "Copper Days",
+            "Copper Days [Demo)": "Copper Days",
+            "Copper Days (Live) - Encore": "Copper Days (Live) - Encore",
+            "(Intro)": "",
+            "  Copper Days  ": "Copper Days",
+            "Copper Days (Live": "Copper Days (Live",
+            "Copper Days (a (b)": "Copper Days",
+            "Copper Days (a) (b) \t": "Copper Days",
+            "": "",
+        }
+        for title, expected in cases.items():
+            with self.subTest(title=title):
+                self.assertEqual(matching._strip_annotations(title), expected)
+
+    def test_same_result_as_the_expression_it_replaced(self):
+        rng = random.Random(572)
+        alphabet = "ab ([)]\t\u00a0"
+        for _ in range(20000):
+            title = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 12)))
+            with self.subTest(title=title):
+                self.assertEqual(matching._strip_annotations(title), _old_strip_annotations(title))
+
+    def test_a_long_title_is_linear(self):
+        # The old expression took about 14 s on the first of these.
+        n = 50_000
+        for name, title in (("open parens", "(" * n), ("spaces", " " * n + "x"),
+                            ("open then spaces", "(" + " " * n + "x"),
+                            ("many annotations", "x" + "(y)" * (n // 3))):
+            with self.subTest(title=name):
+                start = time.perf_counter()
+                matching._strip_annotations(title)
+                self.assertLess(time.perf_counter() - start, 1.0)
 
 
 if __name__ == "__main__":

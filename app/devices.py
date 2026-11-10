@@ -31,6 +31,7 @@ from web_common import (
     _refresh_autofit_after_limit_change,
     _require_device_access,
     _send_projection,
+    _validated_artist_images,
     _validated_device_name,
     _validated_device_type,
     _validated_max_size_bytes,
@@ -55,13 +56,6 @@ def _validated_autofit_percent(value):
     if isinstance(value, bool) or not isinstance(value, int) or not (1 <= value <= 100):
         abort(400, description=_("Fill percentage must be a whole number between 1 and 100."))
     return value
-
-
-def _validated_artist_images(value):
-    imgs = value or None
-    if imgs not in (None, "small", "full"):
-        abort(400, description=_("Unsupported artist image setting."))
-    return imgs
 
 
 def _validated_device_icon(value):

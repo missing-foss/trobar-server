@@ -91,6 +91,7 @@ import auth
 import tidal_share_routes
 from web_common import (
     APP_API_VERSION,
+    write_oidc_state_cookie,
     DASHBOARD_WIDGET_CATALOG,
     VALID_SELECTION_TYPES,
     _ALBUM_ARTIST,
@@ -207,21 +208,21 @@ from web_common import (
 _APP_LOGGERS = (
     "main",  # also Flask's app.logger, since the app is named after this module
     "album_artist", "album_lookup", "artist_image_keys", "artist_images", "audiodb_client",
-    "autofit", "basket_store", "covers", "credential_store", "db", "device_store", "admin", "app_api", "auth",
+    "autofit", "basket_store", "cover_links", "covers", "credential_store", "db", "device_store", "admin", "app_api", "auth",
     "device_api", "device_plays", "devices",
     "integrations", "library", "ops", "playlists", "selections", "user_profile", "web_common",
     "emby_client", "filesystem_client", "fingerprint", "history_cache", "identity",
-    "itunes_library", "jellyfin_client", "jobs", "lastfm", "library_quiz", "lidarr_client",
+    "gaps", "itunes_library", "jellyfin_client", "jobs", "lastfm", "library_quiz", "lidarr_client",
     "lidarr_requests", "listenbrainz", "lms_client", "maloja", "matching", "mbid_backfill",
     "play_forward",
     "mediabrowser_client",
-    "mirror", "mirror_emby", "mirror_jellyfin", "mirror_mediabrowser", "mirror_music_assistant",
+    "mirror", "mirror_copies", "mirror_emby", "mirror_jellyfin", "mirror_mediabrowser", "mirror_notes", "mirror_music_assistant",
     "mirror_plex", "mirror_runs", "mirror_sinks", "mirror_subsonic", "music_assistant_client",
     "playlist_sync",
     "plex_client",
     "provenance", "provider_config", "roon_client", "rule_playlists", "scanner", "selection_store", "settings",
-    "spotify_client", "spotify_public_client", "subsonic_client", "suggestions", "sync_state",
-    "tidal_client", "tidal_share_routes", "tidal_shares", "token_store", "track_merge", "transcode", "unresolved_store", "url_guard",
+    "source_health", "spotify_client", "spotify_public_client", "subsonic_client", "suggestions", "sync_state",
+    "tidal_client", "tidal_public_client", "tidal_share_routes", "tidal_shares", "tidal_token", "token_store", "track_merge", "transcode", "unresolved_store", "url_guard",
     "ytmusic_client",
 )
 
@@ -580,6 +581,7 @@ app.jinja_env.globals["get_locale"] = get_locale
 # oauth.register() before this line: until init_app has run, register()
 # returns a lazy proxy rather than a client.
 oauth.init_app(app)
+app.after_request(write_oidc_state_cookie)
 if settings.AUTH_MODE == "oidc":
     # server_metadata_url points Authlib at the IdP's discovery document; it
     # handles endpoint discovery, JWKS fetch/caching, and full ID-token
@@ -905,6 +907,7 @@ def _build_js_i18n() -> dict:
             "spotify": _("linked Spotify accounts"),
             "ytmusic": _("YouTube Music subscriptions"),
             "spotify_public": _("Spotify playlist links"),
+            "tidal_public": _("Tidal playlist links"),
             "other": _("no recorded source"),
         },
         "switchUntouchedRest": _("The library, users and devices; artist, album and track selections; listening history; every other setting on this page."),
@@ -1152,8 +1155,41 @@ def _build_js_i18n() -> dict:
         # fetch, and the pasted URL looks identical in both cases.
         "subscriptionAddFailed": _("Couldn't add that playlist."),
         "subscriptionUnavailable": _("Unavailable — deleted, made private, or the link is wrong."),
+        # Source health (source_health.py): the admins' header line and the
+        # list in Administration.
+        "sourceAlertOne": _("{source} has failed since {since}"),
+        "sourceAlertMany": {
+            "one": _("{n} playlist source is failing: {names}"),
+            "other": _("{n} playlist sources are failing: {names}"),
+        },
+        "sourceAccountFor": _("{provider} for {account}"),
+        "sourceHealthHint": _("Every place a playlist sync reads from, and how its runs have gone. A source that fails {runs} runs in a row, for at least {hours} hours, shows in the header for admins until it recovers."),
+        "sourceHealthLibrary": _("Library source"),
+        "sourceHealthOwnListing": _("{user} (own listing)"),
+        "sourceHealthSynced": _("synced {when}"),
+        "sourceHealthDetail": {
+            "one": _("since {since} · {n} run · {reason}"),
+            "other": _("since {since} · {n} runs · {reason}"),
+        },
+        "sourceHealthWillAlert": _("alerts after {runs} runs and {hours} hours"),
+        # Music Assistant streaming accounts given to a member (Administration).
+        "maAccountPlaylists": {
+            "one": _("{n} playlist"),
+            "other": _("{n} playlists"),
+        },
+        "maAccountBelongsTo": _("Who {account} belongs to"),
+        "maPendingHeadline": {
+            "one": _("{account} → {user}: {n} playlist becomes private to {user}."),
+            "other": _("{account} → {user}: {n} playlists become private to {user}."),
+        },
+        "maPendingNoSelections": _("No other member has them on a device. {user} can share any of them again from its row."),
+        "maPendingRevoked": {
+            "one": _("{n} device selection by other members ({who}) is removed at the next sync, as when an owner stops sharing. {user} can share any of them again from its row."),
+            "other": _("{n} device selections by other members ({who}) are removed at the next sync, as when an owner stops sharing. {user} can share any of them again from its row."),
+        },
         "subscriptionFetchFailed": _("Couldn't reach YouTube Music. Nothing already imported was changed."),
         "subscriptionFetchFailedSpotify": _("Couldn't read this playlist from Spotify. Nothing already imported was changed."),
+        "subscriptionFetchFailedTidal": _("Couldn't read this playlist from Tidal. Nothing already imported was changed."),
         # Spotify's embed page lists a playlist's first 100 tracks and gives
         # no total, so a playlist at the limit may be longer. Said on the row
         # so the missing tail doesn't read as tracks that failed to match.
@@ -1271,6 +1307,19 @@ def _build_js_i18n() -> dict:
         "mirrorReasonRefused": _("Refused after the write"),
         "mirrorMissingCap": _("Showing {shown} of {n}: each write keeps the first {max}."),
         "mirrorMissingFailed": _("The list could not be loaded."),
+        # What a mirror's last write overwrote on its target (mirror_runs):
+        # the admin line and its Show list, and the owner's icon tooltip.
+        "mirrorOverwritten": {"one": _("{n} edit overwritten"), "other": _("{n} edits overwritten")},
+        # The Profile's Navidrome username (#225).
+        "subsonicUser": _("Navidrome user {name}"),
+        "subsonicNoSuchUser": _("No Navidrome user called {name}"),
+        "subsonicClearConfirm": _("Clear {user}'s Navidrome user {name}? Their Navidrome playlists stop being theirs at the next sync."),
+        "subsonicPlaylistsOwned": {"one": _("{n} of your Navidrome playlists syncs as yours."),
+                                   "other": _("{n} of your Navidrome playlists sync as yours.")},
+        "mirrorOverwrittenExplain": _("Changed in {sink} since Trobar last wrote this copy, and undone by this write. Trobar's playlist is the source: edit it there to keep a change."),
+        "mirrorOverwrittenExplainFile": _("Changed in the .m3u file since Trobar last wrote it, and undone by this write. Trobar's playlist is the source: edit it there to keep a change."),
+        "mirrorChangeDiscarded": _("Added there, removed"),
+        "mirrorChangeRestored": _("Removed there, put back"),
         "mirrorShortChip": {
             "one": _("{n} playlist short on a target"),
             "other": _("{n} playlists short on a target"),
@@ -1427,6 +1476,39 @@ def _build_js_i18n() -> dict:
         # translated prefix, same shape as the mirror sinks' own error keys.
         "lidarrRequestErrorPartial": _("An album was added to Lidarr but couldn't be put on the wanted list:"),
         "lidarrRequestErrorFailed": _("Failed to request an album from Lidarr:"),
+        # The Gaps sub-tab of Playlists: every visible playlist's unresolved
+        # tracks, grouped by album, with bulk exclude and Lidarr requests.
+        "gapsTab": _("Gaps"),
+        "playlistsListTab": _("Playlists"),
+        "gapsIntro": _("Tracks in the playlists you can see that don't match anything in your library, grouped by album. Exclude one to stop flagging it: it doesn't change what syncs to a device."),
+        "gapsTotal": _("{tracks} tracks in {playlists} playlists"),
+        "gapsEmpty": _("Nothing missing: every track in the playlists you can see is in your library, or excluded."),
+        "gapsEmptyFiltered": _("No gaps match these filters."),
+        "gapsLoadError": _("Couldn't load the gaps."),
+        "gapsOwner": _("Owner"),
+        "gapsEveryone": _("Everyone"),
+        "gapsNoOwner": _("No owner"),
+        "gapsSource": _("Source"),
+        "gapsAllSources": _("All sources"),
+        "gapsShowExcluded": _("Show excluded"),
+        "gapsFromMusicBrainz": _("(from MusicBrainz)"),
+        "gapsOneTrack": _("1 track"),
+        "gapsTracks": _("{n} tracks"),
+        "gapsNoAlbum": _("No album known"),
+        "gapsNoAlbumHint": _("can be excluded, not requested"),
+        "gapsIn": _("In"),
+        "gapsShared": _("shared"),
+        "gapsExcludedTag": _("excluded"),
+        "gapsSelected": _("{albums} albums selected ({tracks} tracks)"),
+        "gapsRequest": _("Request from Lidarr"),
+        "gapsExclude": _("Exclude"),
+        "gapsInclude": _("Include again"),
+        "gapsCancel": _("Cancel"),
+        "gapsRequested": _("Requested from Lidarr, {when}"),
+        "gapsNoSuchArtist": _("Lidarr found no such artist"),
+        "gapsRequestQueued": _("Asked Lidarr for {n} albums. Each one shows here once Lidarr has answered."),
+        "gapsRequestNothing": _("Nothing was asked: none of those albums is an open gap any more."),
+        "gapsActionError": _("That didn't work. Try again."),
         # #297 step 2: background-jobs admin panel.
         "jobsRunning": _("Running"),
         "jobsQueued": _("Queued"),
@@ -1653,7 +1735,7 @@ def _build_js_i18n() -> dict:
         "pairDeviceTitle": _('Pair "{name}"'),
         # The desktop app: no QR scanner, so the dialog also shows the URL.
         "pairDesktopHelp": _("In the Trobar desktop app, open the card or folder and enter this server's URL and the code below. The device keeps its name, music and settings. The code works once and expires after 20 minutes."),
-        "confirmRepairDevice": _('Re-pair "{name}" with a fresh app install? The app keeps this device\'s music, settings and history. Whatever is currently paired stops working and must be re-paired too.'),
+        "confirmRepairDevice": _('Re-pair "{name}" with a fresh app install? The app keeps this device\'s music, settings and history. Whatever is paired now keeps working until the new app uses the code, within the 20 minutes before it expires; from then on, only the new app can sync.'),
         "repairFailed": _("Could not create a re-pairing code ({error})"),
         "confirmDeleteDevice": _('Permanently delete "{name}"? Its assigned selections will be unassigned (not deleted) and its token will stop working immediately.'),
         "confirmTranscodeChange": _('Change the format for "{name}"? Every synced track gets a new file name, so the next sync re-downloads everything and removes the old files.'),

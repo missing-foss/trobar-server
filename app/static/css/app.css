@@ -15,6 +15,13 @@
   --c-green-100:rgba(140,209,150,0.16); --c-green-600:#7cc78f;
   --c-green-700:#8fd6a0; --c-yellow-100:rgba(230,190,90,0.16);
   --c-yellow-700:#e8c15c; --c-amber-600:#e0a94a; --c-chart-1:#3987e5;
+  /* tints and borders as alpha, so they sit on any brand's panel */
+  --c-green-50:rgba(140,209,150,0.10); --c-green-500:#7cc78f;
+  --c-yellow-500:#e8c15c;
+  --c-amber-50:rgba(224,169,74,0.10); --c-amber-100:rgba(224,169,74,0.18);
+  --c-amber-200:rgba(224,169,74,0.35); --c-amber-300:rgba(224,169,74,0.45);
+  --c-amber-400:rgba(224,169,74,0.60);
+  --c-amber-700:#e8b45c; --c-amber-800:#f0c47c;
   --c-chart-2:#008300; --c-chart-3:#d55181; --c-chart-4:#c98500;
   --c-chart-5:#199e70; --c-chart-6:#d95926; --c-chart-7:#9085e9;
   --c-chart-8:#e66767;
@@ -25,6 +32,13 @@
   --c-green-100:rgba(46,125,50,0.10); --c-green-600:#2e7d32;
   --c-green-700:#256b29; --c-yellow-100:rgba(138,97,0,0.10);
   --c-yellow-700:#8a6100; --c-amber-600:#8a5300; --c-chart-1:#2a78d6;
+  /* tints and borders as alpha, so they sit on any brand's panel */
+  --c-green-50:rgba(46,125,50,0.06); --c-green-500:#2e7d32;
+  --c-yellow-500:#8a6100;
+  --c-amber-50:rgba(138,83,0,0.06); --c-amber-100:rgba(138,83,0,0.12);
+  --c-amber-200:rgba(138,83,0,0.25); --c-amber-300:rgba(138,83,0,0.35);
+  --c-amber-400:rgba(138,83,0,0.50);
+  --c-amber-700:#7a4900; --c-amber-800:#6a3f00;
   --c-chart-2:#008300; --c-chart-3:#e87ba4; --c-chart-4:#eda100;
   --c-chart-5:#1baf7a; --c-chart-6:#eb6834; --c-chart-7:#4a3aa7;
   --c-chart-8:#e34948;

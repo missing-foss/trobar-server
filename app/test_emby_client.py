@@ -490,7 +490,7 @@ class MirrorCreateOrReplacePlaylistTests(_MirrorEmbyClientTestBase):
         self._configure()
         with mock.patch("requests.request", return_value=_req_resp(json_body={"Id": "42"})) as req:
             result = emby_client.mirror_create_or_replace_playlist("Chill", ["1", "2"], None)
-        self.assertEqual(result, {"status": "ok", "remote_id": "42"})
+        self.assertEqual(result, {"status": "ok", "remote_id": "42", "previous": None})
         self.assertEqual(req.call_args.args[:2], ("POST", "http://emby.local/Playlists"))
         params = req.call_args.kwargs["params"]
         self.assertEqual(params["Name"], "Chill")
@@ -530,12 +530,15 @@ class MirrorCreateOrReplacePlaylistTests(_MirrorEmbyClientTestBase):
         self._configure()
         exists = _req_resp(json_body={"Id": "42"})
         current = _req_resp(json_body={"Items": [
-            {"Id": "old1", "PlaylistItemId": "1"}, {"Id": "old2", "PlaylistItemId": "2"}]})
+            {"Id": "old1", "PlaylistItemId": "1", "Name": "Undertow", "Artists": ["Velvet Tide"]},
+            {"Id": "old2", "PlaylistItemId": "2"}]})
         delete_resp = _req_resp(status_code=204, content=False)
         add_resp = _req_resp(status_code=204, content=False)
         with mock.patch("requests.request", side_effect=[exists, current, delete_resp, add_resp]) as req:
             result = emby_client.mirror_create_or_replace_playlist("Chill", ["new1"], "42")
-        self.assertEqual(result, {"status": "ok", "remote_id": "42"})
+        self.assertEqual(result, {"status": "ok", "remote_id": "42", "previous": [
+            {"id": "old1", "artist": "Velvet Tide", "title": "Undertow"},
+            {"id": "old2", "artist": "", "title": ""}]})
         exists_call, get_call, delete_call, add_call = req.call_args_list
         self.assertEqual(exists_call.args[:2], ("GET", "http://emby.local/Users/u1/Items/42"))
         self.assertEqual(get_call.args[:2], ("GET", "http://emby.local/Playlists/42/Items"))
@@ -553,7 +556,7 @@ class MirrorCreateOrReplacePlaylistTests(_MirrorEmbyClientTestBase):
         add_resp = _req_resp(status_code=204, content=False)
         with mock.patch("requests.request", side_effect=[exists, current, add_resp]) as req:
             result = emby_client.mirror_create_or_replace_playlist("Chill", ["new1"], "42")
-        self.assertEqual(result, {"status": "ok", "remote_id": "42"})
+        self.assertEqual(result, {"status": "ok", "remote_id": "42", "previous": []})
         self.assertEqual(len(req.call_args_list), 3)
 
     def test_replace_skips_add_when_song_ids_is_empty(self):
@@ -563,7 +566,7 @@ class MirrorCreateOrReplacePlaylistTests(_MirrorEmbyClientTestBase):
         delete_resp = _req_resp(status_code=204, content=False)
         with mock.patch("requests.request", side_effect=[exists, current, delete_resp]) as req:
             result = emby_client.mirror_create_or_replace_playlist("Chill", [], "42")
-        self.assertEqual(result, {"status": "ok", "remote_id": "42"})
+        self.assertEqual(result, {"status": "ok", "remote_id": "42", "previous": [{"id": "old1", "artist": "", "title": ""}]})
         self.assertEqual(len(req.call_args_list), 3)
 
     def test_a_stale_id_is_caught_by_the_upfront_existence_check_not_a_500(self):

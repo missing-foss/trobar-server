@@ -49,14 +49,34 @@ module.exports = {
           400: "var(--c-gray-400)", 500: "var(--c-gray-500)", 600: "var(--c-gray-600)", 700: "var(--c-gray-700)",
           800: "var(--c-gray-800)", 900: "var(--c-gray-900)",
         },
+        // 200 and 800 take the nearest themed shade: a border and a title.
         indigo: {
-          50: "var(--c-indigo-50)", 300: "var(--c-indigo-300)",
+          50: "var(--c-indigo-50)", 200: "var(--c-indigo-300)", 300: "var(--c-indigo-300)",
           400: "var(--c-indigo-400)", 500: "var(--c-indigo-500)", 600: "var(--c-indigo-600)", 700: "var(--c-indigo-700)",
+          800: "var(--c-indigo-700)",
         },
-        green: { 100: "var(--c-green-100)", 600: "var(--c-green-600)", 700: "var(--c-green-700)" },
-        yellow: { 100: "var(--c-yellow-100)", 700: "var(--c-yellow-700)" },
-        red: { 50: "var(--c-red-50)", 500: "var(--c-red-500)", 600: "var(--c-red-600)" },
-        amber: { 600: "var(--c-amber-600)" },
+        // An information badge: the theme's accent pair, as indigo.
+        blue: { 50: "var(--c-indigo-50)", 700: "var(--c-indigo-700)" },
+        // Status colours (app.css, per light/dark): tints for panels and
+        // hovers, borders, dots and text. Every shade the templates use is
+        // here; test_theme_colours fails on one that isn't.
+        green: {
+          50: "var(--c-green-50)", 100: "var(--c-green-100)", 500: "var(--c-green-500)",
+          600: "var(--c-green-600)", 700: "var(--c-green-700)",
+        },
+        yellow: {
+          100: "var(--c-yellow-100)", 400: "var(--c-yellow-500)", 500: "var(--c-yellow-500)",
+          700: "var(--c-yellow-700)",
+        },
+        red: {
+          50: "var(--c-red-50)", 300: "var(--c-red-300)", 500: "var(--c-red-500)", 600: "var(--c-red-600)",
+          800: "var(--c-red-600)",
+        },
+        amber: {
+          50: "var(--c-amber-50)", 100: "var(--c-amber-100)", 200: "var(--c-amber-200)",
+          300: "var(--c-amber-300)", 400: "var(--c-amber-400)", 600: "var(--c-amber-600)",
+          700: "var(--c-amber-700)", 800: "var(--c-amber-800)",
+        },
       },
     },
   },

@@ -20,6 +20,7 @@ from flask_babel import gettext as _
 
 import db
 import filesystem_client
+import gaps
 import mirror_sinks
 import playlist_sync
 import rule_playlists
@@ -34,6 +35,7 @@ from web_common import (
     _exclude_unresolved_tracks,
     _is_admin,
     _mirror_coverage,
+    _mirror_overwritten,
     _playlist_title,
     _own_subscriptions,
     _refresh_subscription,
@@ -375,6 +377,62 @@ def api_playlist_unresolved_tracks_accept(playlist_id: int):
         return jsonify({"changed": changed, "unresolved_count": count})
 
 
+@bp.route("/api/provider/playlists/gaps")
+def api_playlist_gaps():
+    """The Gaps view: the unresolved tracks of every playlist the caller can
+    see (the playlist list's own rule), grouped by album, each with the
+    playlists it is in and what Lidarr did with it. Query: `owner` (a
+    username, or empty for unowned playlists), `source` (a provider), and
+    `show_excluded=1` to list excluded tracks too. `open_count` ignores the
+    filters: it is the tab's count of open gaps."""
+    with db.connection() as conn:
+        playlists = _visible_playlists(conn, get_current_user_id(conn))
+        owner = request.args.get("owner")
+        source = request.args.get("source") or None
+        out = gaps.list_gaps(conn, playlists, owner=owner, source=source,
+                             show_excluded=request.args.get("show_excluded") == "1")
+        out["lidarr_configured"] = db.get_lidarr_config() is not None
+        return jsonify(out)
+
+
+@bp.route("/api/provider/playlists/gaps/exclude", methods=["POST"])
+def api_playlist_gaps_exclude():
+    """{"ids": [...], "excluded": true|false}: exclude (or un-exclude)
+    unresolved tracks across playlists, as each playlist's own review does.
+    Rows of a playlist the caller can't see are left alone. Returns how
+    many changed."""
+    with db.connection() as conn:
+        playlists = _visible_playlists(conn, get_current_user_id(conn))
+        body = request.get_json(force=True, silent=True) or {}
+        ids = body.get("ids")
+        if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+            abort(400, description=_("ids must be a list of unresolved-track row ids."))
+        changed = gaps.set_excluded(conn, playlists, ids, bool(body.get("excluded", True)))
+        conn.commit()
+        return jsonify({"changed": changed})
+
+
+@bp.route("/api/provider/playlists/gaps/request", methods=["POST"])
+def api_playlist_gaps_request():
+    """{"albums": [{"artist", "album"}, ...]}: ask Lidarr for these albums,
+    through the same job and dedupe as a playlist's "Request missing
+    albums". Like that switch, open to anyone who can see the playlists the
+    albums are missing from, and only once an admin has set Lidarr up. An
+    album that isn't an open gap of a playlist the caller can see is
+    dropped. Returns how many albums were queued."""
+    with db.connection() as conn:
+        if db.get_lidarr_config() is None:
+            abort(409, description=_("Lidarr isn't set up."))
+        playlists = _visible_playlists(conn, get_current_user_id(conn))
+        body = request.get_json(force=True, silent=True) or {}
+        albums = body.get("albums")
+        if not isinstance(albums, list) or not all(
+                isinstance(a, dict) and isinstance(a.get("artist"), str) and isinstance(a.get("album"), str)
+                for a in albums):
+            abort(400, description=_("albums must be a list of {artist, album}."))
+        return jsonify(gaps.request_albums(conn, playlists, [(a["artist"], a["album"]) for a in albums]))
+
+
 @bp.route("/api/provider/playlists/<int:playlist_id>/mirror", methods=["POST"])
 def api_playlist_mirror_toggle(playlist_id: int):
     """#285/#189: {"enabled": true|false, "sink": "filesystem"|"subsonic"|
@@ -442,7 +500,15 @@ def api_playlist_mirror_toggle(playlist_id: int):
             "music_assistant_mirror_enabled": bool(row["music_assistant_mirror_enabled"]),
             "plex_mirror_enabled": bool(row["plex_mirror_enabled"]),
             "mirror_coverage": _mirror_coverage(conn, [playlist_id]).get(playlist_id, {}),
+            "mirror_overwritten": (
+                _mirror_overwritten(conn, [playlist_id]).get(playlist_id, {})
+                if _owner_or_admin(conn, user_id, playlist_id) else {}),
         })
+
+
+def _owner_or_admin(conn, user_id: int, playlist_id: int) -> bool:
+    row = conn.execute("SELECT owner_user_id FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+    return (row is not None and row["owner_user_id"] == user_id) or _is_admin(conn, user_id)
 
 
 @bp.route("/api/provider/playlists/<int:playlist_id>/lidarr-requests", methods=["POST"])

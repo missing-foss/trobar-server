@@ -19,6 +19,7 @@ from flask_babel import gettext as _
 import db
 import mirror_runs
 import scanner
+import source_health
 import sync_state
 from web_common import (
     _client_ip,
@@ -27,6 +28,7 @@ from web_common import (
     _meta_file,
     _rate_limited,
     _record_failure,
+    _start_playlist_sync,
     get_current_user_id,
     require_admin,
 )
@@ -233,7 +235,7 @@ def api_integrations_mirrors():
         by_sink = {sink: {"enabled": 0, "failing": 0, "short": 0} for sink in _MIRROR_SINK_COLUMNS}
         failing = []
         # Coverage: a pair is "short" when its last write left tracks off
-        # the target (mirror_runs; the filesystem mirror records none).
+        # the target (mirror_runs; the filesystem mirror's runs never lack).
         # Counted like failing, so by_sink.*.short sums to mirrors_short.
         runs = mirror_runs.latest(conn, [r["id"] for r in rows])
         short = []
@@ -274,6 +276,110 @@ def api_integrations_mirrors():
             "short": short[:_MIRRORS_FAILING_LIMIT],
             "short_truncated": len(short) > _MIRRORS_FAILING_LIMIT,
         })
+
+
+@bp.route("/api/integrations/playlist-sources")
+def api_integrations_playlist_sources():
+    """Playlist sources that keep failing (source_health.py), for an
+    integration to alert on as it alerts on mirrors: the totals, and the
+    alerting ones as a capped worklist with raw reason codes. A source
+    alerts after source_health.ALERT_RUNS failed runs in a row spanning
+    ALERT_HOURS, so one bad night pages nobody; `sources_failing` counts
+    any failure in a row, for an earlier warning."""
+    with db.connection() as conn:
+        _authenticated_integration_token(conn)
+        rows = source_health.rows(conn)
+    # failing_since as ISO 8601 with its zone, as approved for this payload:
+    # the stored value is SQLite's UTC "YYYY-MM-DD HH:MM:SS", which a client
+    # could read as local time.
+    alerting = [{**{k: r[k] for k in ("kind", "provider", "account", "runs", "reason")},
+                 "failing_since": r["failing_since"].replace(" ", "T") + "Z" if r["failing_since"] else None}
+                for r in rows if r["alerting"]]
+    return jsonify({
+        "sources_total": len(rows),
+        "sources_failing": sum(1 for r in rows if r["runs"] > 0),
+        "sources_alerting": len(alerting),
+        "alerting": alerting[:_MIRRORS_FAILING_LIMIT],
+        "alerting_truncated": len(alerting) > _MIRRORS_FAILING_LIMIT,
+    })
+
+
+# A device's playlists listed per device, capped like the mirror worklists:
+# a device holding more says so with `playlists_truncated`.
+_DEVICE_PLAYLISTS_LIMIT = 100
+
+
+@bp.route("/api/integrations/playlists")
+def api_integrations_playlists():
+    """Which playlists each device has, and how complete each is, for an
+    integration (trobar-ha#19) to show per device; and the server's
+    totals. A playlist's `available` is the share of its entries matched to
+    a track in the library; it `has_gaps` when it has unresolved entries
+    nobody has excluded or accepted, as the Playlists tab's Gaps view
+    counts them. Devices are the ones the token's owner may see, as on
+    /api/integrations/devices.
+
+    A private playlist (owned, not shared) is listed and counted with its
+    title left out: whatever an integration shows can reach people the web
+    UI would not show it to."""
+    with db.connection() as conn:
+        user_id = _authenticated_integration_token(conn)
+        stats = {r["id"]: r for r in conn.execute(
+            "SELECT p.id, p.title, "
+            "((p.owner_user_id IS NOT NULL AND p.shared = 0) OR p.source_private = 1) AS private, "
+            "(SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS tracks, "
+            "(SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id "
+            " AND pt.matched_track_id IS NOT NULL) AS matched, "
+            "(SELECT COUNT(*) FROM unresolved_playlist_tracks u WHERE u.playlist_id = p.id "
+            " AND u.excluded = 0 AND u.accepted = 0) AS gaps "
+            "FROM playlists p")}
+        devices = []
+        for d in _device_list(conn, user_id):
+            ids = [int(r["target"]) for r in conn.execute(
+                "SELECT s.target FROM selections s JOIN selection_devices sd ON sd.selection_id = s.id "
+                "WHERE s.type = 'playlist' AND sd.device_id = ? ORDER BY s.id", (d["id"],))
+                if str(r["target"]).isdigit() and int(r["target"]) in stats]
+            listed = [_playlist_entry(stats[i]) for i in dict.fromkeys(ids)]
+            devices.append({
+                "device_id": d["id"],
+                "name": d.get("name"),
+                "playlists_count": len(listed),
+                "playlists": listed[:_DEVICE_PLAYLISTS_LIMIT],
+                "playlists_truncated": len(listed) > _DEVICE_PLAYLISTS_LIMIT,
+            })
+    return jsonify({
+        "playlists_total": len(stats),
+        "playlists_with_gaps": sum(1 for r in stats.values() if r["gaps"]),
+        "devices": devices,
+    })
+
+
+def _playlist_entry(row) -> dict:
+    """One playlist as /api/integrations/playlists lists it. `available` is
+    a whole percentage, or null for a playlist with no entries; `title` is
+    null for a private one."""
+    private = bool(row["private"])
+    return {
+        "playlist_id": row["id"],
+        "title": None if private else row["title"],
+        "private": private,
+        "tracks": row["tracks"],
+        "matched": row["matched"],
+        "available": round(100 * row["matched"] / row["tracks"]) if row["tracks"] else None,
+        "has_gaps": bool(row["gaps"]),
+    }
+
+
+@bp.route("/api/integrations/actions/playlist-sync", methods=["POST"])
+def api_integrations_actions_playlist_sync():
+    """Start a playlist sync, for an integration (trobar-ha#19) to offer as
+    a button or service: the same as the web UI's "Sync playlists", from
+    the active library provider and every linked account and subscription.
+    202 when it starts, 409 while one is already running, as for the scan
+    action."""
+    with db.connection() as conn:
+        _authenticated_integration_token(conn)
+    return _start_playlist_sync()
 
 
 @bp.route("/api/integrations/actions/scan", methods=["POST"])

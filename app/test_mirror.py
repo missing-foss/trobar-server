@@ -21,6 +21,7 @@ from pathlib import Path
 
 import db
 import mirror
+import mirror_runs
 import sync_state
 
 
@@ -105,6 +106,98 @@ class NoOpTests(_MirrorTestBase):
         self.assertEqual(row["mirror_last_error_code"], "unset_folder")
         self.assertIsNone(row["mirror_last_error"])
 
+
+
+class OverwriteTests(_MirrorTestBase):
+    """An entry added to or removed from the .m3u by hand is overwritten
+    by the next write; the run says what it discarded and what it put
+    back."""
+
+    def _file(self, pid) -> Path:
+        return self.mirror_folder / self._row(pid)["mirror_filename"]
+
+    def _playlist(self, *names):
+        pid = self._make_playlist("Mix")
+        for pos, name in enumerate(names):
+            self._add_playlist_track(pid, pos, self._make_track("Artist", name, f"Artist/Album/{name}.flac"))
+        return pid
+
+    def _run(self, pid):
+        run = mirror_runs.missing(self.conn, pid, "filesystem")
+        assert run is not None
+        return run
+
+    def _write(self, pid):
+        mirror.write_mirror(self.conn, pid)
+        self.conn.commit()
+
+    def test_the_first_write_reports_nothing_and_misses_nothing(self):
+        pid = self._playlist("One")
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["total"], run["on_target"], run["lacked"]), (1, 1, 0))
+        self.assertEqual((run["discarded"], run["restored"]), (0, 0))
+
+    def test_an_entry_added_by_hand_is_discarded_and_said(self):
+        pid = self._playlist("One")
+        self._write(pid)
+        path = self._file(pid)
+        path.write_text(path.read_text() + "#EXTINF:200,Someone - Stray\nElsewhere/Stray.flac\n")
+        self._write(pid)
+        self.assertNotIn("Stray", path.read_text())
+        self.assertEqual(self._run(pid)["overwritten"],
+                         [{"artist": "Someone", "title": "Stray", "change": "discarded"}])
+
+    def test_an_entry_removed_by_hand_is_put_back_and_said(self):
+        pid = self._playlist("One", "Two")
+        self._write(pid)
+        path = self._file(pid)
+        lines = path.read_text().splitlines()
+        cut = next(i for i, line in enumerate(lines) if line.endswith("Two.flac"))
+        path.write_text("\n".join(lines[:cut - 1] + lines[cut + 1:]) + "\n")
+        self._write(pid)
+        self.assertIn("Two.flac", path.read_text())
+        self.assertEqual(self._run(pid)["overwritten"],
+                         [{"artist": "Artist", "title": "Two", "change": "restored"}])
+
+    def test_a_change_made_in_trobar_is_not_an_overwrite(self):
+        pid = self._playlist("One")
+        self._write(pid)
+        self._add_playlist_track(pid, 1, self._make_track("Artist", "Two", "Artist/Album/Two.flac"))
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"]), (0, 0))
+
+    def test_an_unchanged_file_is_left_alone_and_still_recorded(self):
+        pid = self._playlist("One")
+        self._write(pid)
+        path = self._file(pid)
+        before = path.stat().st_mtime_ns
+        self._write(pid)
+        self.assertEqual(path.stat().st_mtime_ns, before)
+        self.assertEqual(len(mirror_runs.latest(self.conn, [pid])[(pid, "filesystem")]["history"]), 2)
+
+    def test_stopping_the_mirror_forgets_the_baseline(self):
+        pid = self._playlist("One")
+        self._write(pid)
+        mirror.delete_mirror(self.conn, pid)
+        self.conn.commit()
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM mirror_copies WHERE playlist_id = ?", (pid,)).fetchone())
+
+    def test_the_icon_tooltip_shows_no_coverage_for_the_file(self):
+        import web_common  # noqa: PLC0415 - heavy to import; only this test needs it
+        pid = self._playlist("One")
+        self._write(pid)
+        self.assertNotIn(pid, web_common._mirror_coverage(self.conn, [pid]))
+
+    def test_an_entry_without_trobars_extinf_still_has_a_name(self):
+        path = Path(self._tmp) / "edited.m3u"
+        path.write_text("#EXTM3U\n#EXTINF:-1,Just A Title\nA/x.flac\nB/y.flac\n")
+        self.assertEqual(mirror._read_entries(path), [
+            {"id": "A/x.flac", "artist": "", "title": "Just A Title"},
+            {"id": "B/y.flac", "artist": "", "title": ""}])
+        self.assertIsNone(mirror._read_entries(Path(self._tmp) / "absent.m3u"))
 
 class WriteContentTests(_MirrorTestBase):
     def test_writes_marker_and_resolved_tracks_in_order(self):

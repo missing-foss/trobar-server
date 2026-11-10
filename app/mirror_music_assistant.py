@@ -41,6 +41,7 @@ import logging
 
 import db
 import matching
+import mirror_copies
 import mirror_runs
 import music_assistant_client
 
@@ -143,6 +144,7 @@ def delete_mirror(conn, playlist_id: int) -> None:
         "UPDATE playlists SET music_assistant_mirror_remote_id = NULL, "
         "music_assistant_mirror_last_written_at = NULL WHERE id = ?", (playlist_id,),
     )
+    mirror_copies.forget(conn, playlist_id, "music_assistant")
 
 
 def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> None:
@@ -192,7 +194,8 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
         return
 
     remote_id = row["music_assistant_mirror_remote_id"]
-    current = music_assistant_client.mirror_read(remote_id) if remote_id else None
+    current_items = music_assistant_client.mirror_read_items(remote_id) if remote_id else None
+    current = None if current_items is None else [i["id"] for i in current_items]
     if remote_id and current is None:
         # The copy couldn't be read. A deleted playlist and a passing server
         # error both answer 500, so only a complete listing without it means
@@ -221,18 +224,26 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
         current = []
 
     expected = [w["path"] for w in wanted]
-    if current != expected:
+    # Edits made to the copy in Music Assistant that this write undoes.
+    discarded, restored = mirror_copies.overwritten(
+        conn, playlist_id, "music_assistant", current_items, expected)
+    if current == expected:
+        mirror_copies.remember(conn, playlist_id, "music_assistant", current_items or [])
+    else:
         if not music_assistant_client.mirror_replace(remote_id, len(current or []), [w["uri"] for w in wanted]):
             _set_error(conn, playlist_id, "write_failed", "a playlist update task did not finish")
             return
-        written = music_assistant_client.mirror_read(remote_id)
+        written_items = music_assistant_client.mirror_read_items(remote_id)
+        written = None if written_items is None else [i["id"] for i in written_items]
+        if written_items is not None:
+            mirror_copies.remember(conn, playlist_id, "music_assistant", written_items)
         if written != expected:
             if written is not None:
-                held = set(written)
-                refused = [placed[p] for p in dict.fromkeys(expected) if p not in held]
+                kept = set(written)
+                refused = [placed[p] for p in dict.fromkeys(expected) if p not in kept]
                 mirror_runs.record(conn, playlist_id, "music_assistant",
                                    len(wanted) + len(lacked), len(wanted) - len(refused),
-                                   lacked, refused)
+                                   lacked, refused, discarded, restored)
             _set_error(conn, playlist_id, "readback_mismatch", _mismatch(expected, written))
             return
 
@@ -243,4 +254,4 @@ def write_mirror(conn, playlist_id: int, index_cache: dict | None = None) -> Non
     )
     # Duplicates of a placed track are mirrored once and counted once.
     mirror_runs.record(conn, playlist_id, "music_assistant", len(wanted) + len(lacked),
-                       len(wanted), lacked)
+                       len(wanted), lacked, discarded=discarded, restored=restored)

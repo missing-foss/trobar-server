@@ -197,9 +197,24 @@ class ActiveListPlaylistsTests(_ActiveSubsonicClientTestBase):
             ]},
         })):
             result = subsonic_client.list_playlists()
+        # A server that names no owner (plain Subsonic) gives None and False.
         self.assertEqual(result, {"status": "ok", "playlists": [
-            {"id": "1", "title": "Road Trip"}, {"id": "2", "title": "Chill"},
+            {"id": "1", "title": "Road Trip", "owner": None, "public": False},
+            {"id": "2", "title": "Chill", "owner": None, "public": False},
         ]})
+
+    def test_navidromes_owner_and_public_flag_are_carried(self):
+        # As Navidrome lists to an admin account: every user's playlists,
+        # `public` true or absent.
+        with mock.patch("requests.get", return_value=_resp(subsonic_body={
+            "status": "ok", "playlists": {"playlist": [
+                {"id": "a1", "name": "Diary", "owner": "alice"},
+                {"id": "a2", "name": "Party", "owner": "alice", "public": True},
+            ]},
+        })):
+            result = subsonic_client.list_playlists()
+        self.assertEqual([(p["title"], p["owner"], p["public"]) for p in result["playlists"]],
+                         [("Diary", "alice", False), ("Party", "alice", True)])
 
     def test_a_single_playlist_is_not_collapsed_out_of_a_list(self):
         # #189's own _as_list() concern: some server implementations
@@ -209,7 +224,7 @@ class ActiveListPlaylistsTests(_ActiveSubsonicClientTestBase):
             "status": "ok", "playlists": {"playlist": {"id": 1, "name": "Only One"}},
         })):
             result = subsonic_client.list_playlists()
-        self.assertEqual(result["playlists"], [{"id": "1", "title": "Only One"}])
+        self.assertEqual(result["playlists"], [{"id": "1", "title": "Only One", "owner": None, "public": False}])
 
     def test_server_error_surfaces_the_message(self):
         with mock.patch("requests.get", return_value=_resp(subsonic_body={
@@ -553,6 +568,35 @@ class MirrorSetPlaylistMetadataTests(_SubsonicClientTestBase):
             subsonic_client.mirror_set_playlist_metadata("42", "Chill", "x")  # must not raise
 
 
+class MirrorReadItemsTests(_SubsonicClientTestBase):
+    def test_none_without_a_configured_target(self):
+        with mock.patch("requests.get") as get:
+            self.assertIsNone(subsonic_client.mirror_read_items("42"))
+        get.assert_not_called()
+
+    def test_the_copys_entries_in_order(self):
+        self._configure()
+        body = {"status": "ok", "playlist": {"id": "42", "entry": [
+            {"id": "s1", "artist": "Velvet Tide", "title": "Undertow"},
+            {"id": "s2", "title": "Kindling"}]}}
+        with mock.patch("requests.get", return_value=_resp(subsonic_body=body)) as get:
+            items = subsonic_client.mirror_read_items("42")
+        self.assertEqual(get.call_args.kwargs["params"]["id"], "42")
+        self.assertEqual(items, [{"id": "s1", "artist": "Velvet Tide", "title": "Undertow"},
+                                 {"id": "s2", "artist": "", "title": "Kindling"}])
+
+    def test_an_empty_copy_is_an_empty_list(self):
+        self._configure()
+        with mock.patch("requests.get", return_value=_resp(subsonic_body={"status": "ok", "playlist": {"id": "42"}})):
+            self.assertEqual(subsonic_client.mirror_read_items("42"), [])
+
+    def test_none_when_it_cannot_be_read(self):
+        self._configure()
+        for resp in (_resp(status_code=500), _resp(subsonic_body={"status": "failed"})):
+            with mock.patch("requests.get", return_value=resp):
+                self.assertIsNone(subsonic_client.mirror_read_items("42"))
+
+
 class MirrorDeletePlaylistTests(_SubsonicClientTestBase):
     def test_false_when_not_configured(self):
         self.assertFalse(subsonic_client.mirror_delete_playlist("42"))
@@ -579,6 +623,73 @@ def setUpModule():
     # modules (`test_routes.A test_maloja test_routes.B`) comes back after
     # the dir was removed. _TMP is made once, at import.
     os.makedirs(_TMP, exist_ok=True)
+
+
+def _json(body, status_code=200):
+    r = mock.Mock()
+    r.status_code = status_code
+    r.json.return_value = body
+    if status_code >= 400:
+        r.raise_for_status.side_effect = requests.HTTPError(str(status_code))
+    else:
+        r.raise_for_status.return_value = None
+    return r
+
+
+class NavidromeAdminTests(unittest.TestCase):
+    """The admin check, and what only Navidrome's own API does: list users
+    and give a playlist to one. Payloads as Navidrome 0.64.2 answers."""
+
+    URL, USER, PW = "http://navidrome.example.com", "trobar", "secret"
+    USERS = [{"id": "u-admin", "userName": "trobar"}, {"id": "u-bob", "userName": "Bob"}]
+
+    def test_is_admin_reads_admin_role_from_its_own_user(self):
+        for role, want in ((True, True), (False, False)):
+            with self.subTest(role=role), mock.patch("requests.get", return_value=_resp(subsonic_body={
+                    "status": "ok", "user": {"username": "trobar", "adminRole": role}})) as get:
+                self.assertIs(subsonic_client.is_admin(self.URL, self.USER, self.PW), want)
+            self.assertEqual(get.call_args.kwargs["params"]["username"], "trobar")
+
+    def test_is_admin_is_unknown_when_the_server_says_nothing_clear(self):
+        for body in ({"status": "failed", "error": {"code": 40}}, {"status": "ok", "user": {}}):
+            with self.subTest(body=body), mock.patch("requests.get", return_value=_resp(subsonic_body=body)):
+                self.assertIsNone(subsonic_client.is_admin(self.URL, self.USER, self.PW))
+
+    def test_usernames_are_listed_case_folded(self):
+        with mock.patch("requests.post", return_value=_json({"token": "t"})), \
+             mock.patch("requests.get", return_value=_json(self.USERS)) as get:
+            self.assertEqual(subsonic_client.navidrome_usernames(self.URL, self.USER, self.PW), {"trobar", "bob"})
+        self.assertEqual(get.call_args.kwargs["headers"], {"X-ND-Authorization": "Bearer t"})
+
+    def test_usernames_are_unknown_without_a_login_or_a_list(self):
+        cases = (
+            (_json({}, 401), _json(self.USERS)),        # not a Navidrome login
+            (_json({"token": "t"}), _json({}, 403)),    # not an admin
+            (_json({"token": "t"}), _json({"x": 1})),   # not a list
+        )
+        for login, listing in cases:
+            with self.subTest(), mock.patch("requests.post", return_value=login), \
+                    mock.patch("requests.get", return_value=listing):
+                self.assertIsNone(subsonic_client.navidrome_usernames(self.URL, self.USER, self.PW))
+
+    def test_give_playlist_sends_only_the_owner_id(self):
+        with mock.patch("requests.post", return_value=_json({"token": "t"})), \
+             mock.patch("requests.get", return_value=_json(self.USERS)), \
+             mock.patch("requests.put", return_value=_json({})) as put:
+            self.assertTrue(subsonic_client.navidrome_give_playlist(self.URL, self.USER, self.PW, "p9", "bob"))
+        self.assertEqual(put.call_args.args[0], "http://navidrome.example.com/api/playlist/p9")
+        self.assertEqual(put.call_args.kwargs["json"], {"ownerId": "u-bob"})
+
+    def test_give_playlist_to_an_unknown_user_or_on_failure_is_false(self):
+        with mock.patch("requests.post", return_value=_json({"token": "t"})), \
+             mock.patch("requests.get", return_value=_json(self.USERS)), \
+             mock.patch("requests.put") as put:
+            self.assertFalse(subsonic_client.navidrome_give_playlist(self.URL, self.USER, self.PW, "p9", "carol"))
+        put.assert_not_called()
+        with mock.patch("requests.post", return_value=_json({"token": "t"})), \
+             mock.patch("requests.get", return_value=_json(self.USERS)), \
+             mock.patch("requests.put", return_value=_json({}, 403)):
+            self.assertFalse(subsonic_client.navidrome_give_playlist(self.URL, self.USER, self.PW, "p9", "bob"))
 
 
 def tearDownModule():

@@ -83,6 +83,9 @@ album and track selections are untouched.
 - [Spotify](spotify-links.md) — the same for a public Spotify playlist, up to
   its first 100 tracks. Read from Spotify's embed player page, which is not
   an API either; the page says what that means.
+- [Tidal](tidal-links.md) — the same for a public Tidal playlist, in full,
+  through Tidal's own API with the server's Tidal app. Tracks come with their
+  ISRC, so many match exactly.
 
 ### Services with no direct integration (Roon only)
 

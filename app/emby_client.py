@@ -70,7 +70,7 @@ import requests
 
 import db
 from artist_image_keys import ArtistImageKeys
-from mediabrowser_client import MediaBrowserClient
+from mediabrowser_client import MediaBrowserClient, copy_item
 
 _log = logging.getLogger(__name__)
 
@@ -250,8 +250,10 @@ def mirror_create_or_replace_playlist(
     name: str, song_ids: list[str], remote_id: str | None, user_id: str | None = None
 ) -> dict:
     """Creates (remote_id is None) or FULLY REPLACES (remote_id given) a
-    playlist's song list. Returns {"status": "ok", "remote_id": str} or
-    {"status": "error", "reason": str, "code": int | None}.
+    playlist's song list. Returns {"status": "ok", "remote_id": str,
+    "previous": the replaced copy's items as {"id", "artist", "title"}, or
+    None for a new playlist} or {"status": "error", "reason": str, "code":
+    int | None}.
 
     Confirmed live against a real Emby 4.9.5 instance — two real
     divergences from jellyfin_client.mirror_create_or_replace_playlist(),
@@ -290,7 +292,7 @@ def mirror_create_or_replace_playlist(
         status, body = _request_as("POST", "/Playlists", api_key, url, params=params)
         if status is None or status >= 400 or not body or "Id" not in body:
             return {"status": "error", "reason": "create failed", "code": status}
-        return {"status": "ok", "remote_id": body["Id"]}
+        return {"status": "ok", "remote_id": body["Id"], "previous": None}
 
     exists_status, _exists_body = _request_as(
         "GET", f"/Users/{user_id}/Items/{remote_id}", api_key, url)
@@ -320,7 +322,10 @@ def mirror_create_or_replace_playlist(
         )
         if status is None or status >= 400:
             return {"status": "error", "reason": "failed to add items", "code": status}
-    return {"status": "ok", "remote_id": remote_id}
+    # The item's own Id, not its PlaylistItemId: the sink writes item ids,
+    # and compares like with like.
+    return {"status": "ok", "remote_id": remote_id,
+            "previous": [copy_item(i) for i in current.get("Items", []) if i.get("Id")]}
 
 
 # The definitions both servers share live in mediabrowser_client.py; each

@@ -95,9 +95,7 @@ to `DATA_DIR` or the host.
 
 - the SQLite database — **password hashes** and **plaintext provider
   credentials** (Subsonic password, Jellyfin API key, per-user Last.fm keys,
-  Roon host/port, per-user Tidal OAuth refresh tokens — unlike the
-  others, a Tidal refresh token is a credential to that specific
-  household member's own Tidal account, not a shared admin-configured one);
+  Roon host/port), and the encrypted credentials described below;
 - `flask_secret_key` — the session-signing key (whoever holds it can forge
   session cookies);
 - `roon_token.json` — the Roon Core pairing token;
@@ -115,13 +113,17 @@ boundary**, not encryption:
  to `0o600` on creation (best-effort — some bind-mounted filesystems ignore
  `chmod`).
 - **The exception:** the Maloja API key, ListenBrainz user token and Last.fm
-  session used to send someone's plays, and the install's Last.fm shared secret,
-  can write to accounts, so they are encrypted with
-  AES-256-GCM. The key is a separate file, `credential_key` in `DATA_DIR`, or
+  session used to send someone's plays, the install's Last.fm shared secret, and
+  each person's Tidal refresh token (a credential to that person's own Tidal
+  account, which playlist sharing can write to) can write to accounts, so they
+  are encrypted with AES-256-GCM. The key is a separate file, `credential_key` in `DATA_DIR`, or
   wherever `TROBAR_CREDENTIAL_KEY_FILE` points. That protects a leaked database
   or snapshot. It protects against someone who can read all of `DATA_DIR` only
-  if the key is kept elsewhere. Per-user Tidal refresh tokens are not encrypted
-  yet.
+  if the key is kept elsewhere. While a key file exists but can't be used
+  (damaged, or unreadable), linking Tidal is refused and stores nothing, as for
+  Last.fm. A token Tidal renews during a sync is stored unencrypted instead,
+  because Tidal has already replaced the old one and refusing would unlink the
+  person; the next start with a usable key encrypts it.
 - **You should:** treat `DATA_DIR` like a password store — keep it on a volume
   only the container's user can read, and **back it up encrypted**. Do not commit
  it or bake it into an image (the `Dockerfile` copies only `app/`, and

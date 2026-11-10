@@ -54,8 +54,44 @@ not create. See
 
 !!! tip
     If your server exposes more than one API dialect, use its **Subsonic**
-    endpoint/credentials here. Native (non-Subsonic) APIs aren't used by this
-    provider.
+    endpoint/credentials here. Playlists are read and written through the
+    Subsonic API. Navidrome's own API is used for two things only, both
+    for members' own playlists (below): listing the server's users, and
+    giving a mirror copy to its owner.
+
+## Members' own playlists (Navidrome)
+
+On Navidrome, each member's playlists can be theirs in Trobar too, private
+ones staying private, and their mirror copies can go into their own Navidrome
+account.
+
+- **The account Trobar uses must be a Navidrome admin**, here and for the
+  mirror target. An admin account lists every user's playlists, private ones
+  included, each with its owner. When you enter the connection details,
+  Administration says whether the account is an admin. With an ordinary
+  account, only the shared pass runs: the account's own playlists and other
+  users' public ones, as household playlists.
+- **Each member gives their Navidrome username** on Profile → Streaming
+  accounts, with their Navidrome password. The password proves the username
+  is theirs: Trobar signs in with it once to check it, then keeps only the
+  username. The password is never stored or logged. One Navidrome user can
+  belong to one member only, and the accounts Trobar itself uses can't be
+  claimed: their playlists are the household's. A member can remove theirs on
+  Profile, and an administrator can clear it under Administration → Users.
+- **What a sync does with each playlist:**
+    - a member's own is theirs, private to them until they share it, like
+      any playlist they own;
+    - one owned by the account Trobar uses, or public on Navidrome, is a
+      household playlist, as before;
+    - **a private one whose owner isn't a member yet is visible to
+      administrators only**, until its owner gives their username.
+- **Mirror copies** of a member's playlist are written as before, then given
+  to the member's Navidrome account, so they appear in their own library.
+  Trobar goes on updating them through the mirror account. If the member
+  removes their username, the copies stay where they are.
+
+Other Subsonic servers don't say who owns a playlist, so on them only the
+shared pass runs.
 
 ## How Trobar signs in, and what that risks
 

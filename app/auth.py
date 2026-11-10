@@ -16,6 +16,7 @@ import logging
 import secrets
 from pathlib import Path
 
+from authlib.integrations.base_client.errors import MismatchingStateError, OAuthError
 from flask import jsonify, request, render_template, abort, session, redirect, url_for, Blueprint, current_app
 from flask_babel import gettext as _
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -29,6 +30,7 @@ import settings
 import sync_state
 import spotify_client
 import tidal_client
+import tidal_token
 from web_common import (
     _RL_LOCK,
     _app_authenticates,
@@ -250,6 +252,30 @@ def oidc_login():
             error=_("SSO is unreachable right now. An administrator can sign in with a local password.")), 503
 
 
+def _oauth_error_code(value) -> str:
+    """An OAuth error code as RFC 6749 allows it (%x20-21 / %x23-5B / %x5D-7E),
+    capped: the provider writes it and the callback takes no authentication,
+    so anything else, a line break above all, would let a request write log
+    lines of its own."""
+    return "".join(c for c in str(value) if " " <= c <= "~" and c not in '"\\')[:64]
+
+
+def _oidc_refusal_reason(exc: Exception) -> str:
+    """Why a callback was refused, for the log: the kind of failure and the
+    provider's error code, never the code, the state, a token or the
+    provider's free-text description."""
+    if isinstance(exc, MismatchingStateError):
+        return ("state missing or mismatched: this browser's session no longer holds "
+                "the sign-in it started")
+    provider_error = request.args.get("error")
+    if provider_error:
+        # The provider sent the user back with an error instead of a code.
+        return f"the identity provider answered error={_oauth_error_code(provider_error)}"
+    if isinstance(exc, OAuthError):
+        return f"token exchange or ID token check failed: {_oauth_error_code(exc.error) or type(exc).__name__}"
+    return f"token exchange or ID token check failed: {type(exc).__name__}"
+
+
 @bp.route("/oidc/callback")
 def oidc_callback():
     """IdP redirect target. authorize_access_token() exchanges the code and
@@ -261,12 +287,15 @@ def oidc_callback():
         return redirect(url_for("auth.login"))
     try:
         token = oauth.oidc.authorize_access_token()
-    except Exception:
+    except Exception as exc:
+        current_app.logger.warning("OIDC sign-in refused: %s", _oidc_refusal_reason(exc))
         return render_template("login.html", bootstrap=False,
                                error=_("Sign-in failed. Please try again."), auth_mode=settings.AUTH_MODE), 401
     claims = token.get("userinfo") or {}
     username = (claims.get(settings.OIDC_USERNAME_CLAIM) or "").strip()
     if not username:
+        current_app.logger.warning("OIDC sign-in refused: the ID token has no %r claim",
+                                   settings.OIDC_USERNAME_CLAIM)
         return render_template("login.html", bootstrap=False,
                                error=_("Your identity provider did not return a username."), auth_mode=settings.AUTH_MODE), 401
     email = claims.get("email", "") or ""
@@ -393,10 +422,16 @@ def tidal_callback():
         if info["status"] != "ok":
             return redirect(url_for("index") + "?tidal_error=1#/profile")
         granted = token.get("scope") or requested_scope
+        try:
+            sealed = tidal_token.seal(refresh_token, user_id)
+        except credential_store.CredentialKeyError:
+            # The key file can't be used: refuse the link, as the Last.fm link
+            # does, rather than store it unencrypted. A link already there stays.
+            return redirect(url_for("index") + "?tidal_error=1#/profile")
         conn.execute(
             "UPDATE users SET tidal_refresh_token = ?, tidal_user_id = ?, tidal_display_name = ?, "
             "tidal_scopes = ? WHERE id = ?",
-            (refresh_token, info["user_id"], info["display_name"], granted, user_id),
+            (sealed, info["user_id"], info["display_name"], granted, user_id),
         )
         conn.commit()
         return redirect(url_for("index") + "#/profile")

@@ -16,7 +16,7 @@ const made = [];
 function app(page) {
   return page.evaluate(() => {
     const a = window.Alpine.$data(document.querySelector("[x-data]"));
-    return { pin: a.newPlaylistPin, count: a.playlists.length };
+    return { pin: a.newPlaylistPin };
   });
 }
 
@@ -65,14 +65,22 @@ for (const hideZero of [false, true]) {
 
 test("cancelling creates nothing", async ({ page }) => {
   await open(page, false);
-  const before = (await app(page)).count;
+  // What this page asks the server to create, whatever the title: the old
+  // bug made an untitled row on the click itself. Not the total playlist
+  // count, which other spec files running in parallel change.
+  const creates = [];
+  page.on("request", (req) => {
+    if (req.method() === "POST" && new URL(req.url()).pathname.startsWith("/api/provider/playlists")) {
+      creates.push(req.url());
+    }
+  });
   await newButton(page).click();
   await page.locator("[data-new-playlist-name]").fill("E2E never");
   await page.locator("[data-new-playlist-dialog]").getByRole("button", { name: "Cancel" }).click();
   await expect(page.locator("[data-new-playlist-dialog]")).toBeHidden();
   const list = await (await page.request.get("/api/provider/playlists")).json();
   expect(list.filter((p) => p.title === "E2E never")).toHaveLength(0);
-  expect(list.length).toBe(before);
+  expect(creates).toEqual([]);
 });
 
 test("a double-click on Create makes one playlist", async ({ page }) => {

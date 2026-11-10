@@ -377,6 +377,95 @@ class LoopGuardTests(_Base):
 
 
 
+
+class OverwriteTests(_Base):
+    """An edit made to the copy in Music Assistant is overwritten by the
+    next write; the run says what it discarded and what it put back."""
+
+    def _copy(self, pid):
+        return self._row(pid)["music_assistant_mirror_remote_id"]
+
+    def _add_in_ma(self, pid, n):
+        self.fake.playlists[self._copy(pid)]["entries"].append(self.fake.library[n])
+
+    def _remove_in_ma(self, pid, n):
+        entries = self.fake.playlists[self._copy(pid)]["entries"]
+        entries[:] = [t for t in entries if t is not self.fake.library[n]]
+
+    def _run(self, pid):
+        return mirror_runs.missing(self.conn, pid, "music_assistant")
+
+    def _named(self, n, change):
+        _path, artist, _album, title, _no = LIBRARY[n]
+        return {"artist": artist, "title": title, "change": change}
+
+    def test_the_first_write_reports_nothing(self):
+        pid = self._playlist("Mix", self._tracks(LIBRARY[:1]))
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"], run["overwritten"]), (0, 0, []))
+
+    def test_a_track_added_in_music_assistant_is_discarded_and_said(self):
+        pid = self._playlist("Mix", self._tracks(LIBRARY[:1]))
+        self._write(pid)
+        self._add_in_ma(pid, 3)
+        self._write(pid)
+        self.assertEqual(self.fake.entry_paths(self._copy(pid)), [LIBRARY[0][0]])
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"]), (1, 0))
+        self.assertEqual(run["overwritten"], [self._named(3, "discarded")])
+
+    def test_a_track_removed_in_music_assistant_is_put_back_and_said(self):
+        pid = self._playlist("Mix", self._tracks(LIBRARY[:2]))
+        self._write(pid)
+        self._remove_in_ma(pid, 1)
+        self._write(pid)
+        self.assertEqual(self.fake.entry_paths(self._copy(pid)), [LIBRARY[0][0], LIBRARY[1][0]])
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"]), (0, 1))
+        self.assertEqual(run["overwritten"], [self._named(1, "restored")])
+
+    def test_a_change_made_in_trobar_is_not_an_overwrite(self):
+        ids = self._tracks(LIBRARY[:2])
+        pid = self._playlist("Mix", ids)
+        self._write(pid)
+        self.conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ? AND matched_track_id = ?",
+                          (pid, ids[1]))
+        self.conn.commit()
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"], run["overwritten"]), (0, 0, []))
+
+    def test_an_edit_to_a_track_trobar_added_last_time_is_caught(self):
+        pid = self._playlist("Mix", self._tracks(LIBRARY[:1]))
+        self._write(pid)
+        tid = self._tracks(LIBRARY[1:2])[0]
+        self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, artist, title, matched_track_id) "
+                          "VALUES (?, 1, 'a', 't', ?)", (pid, tid))
+        self.conn.commit()
+        self._write(pid)
+        self._remove_in_ma(pid, 1)
+        self._write(pid)
+        self.assertEqual(self._run(pid)["overwritten"], [self._named(1, "restored")])
+
+    def test_a_copy_already_right_still_sets_the_baseline(self):
+        pid = self._playlist("Mix", self._tracks(LIBRARY[:1]))
+        self._write(pid)
+        self.conn.execute("DELETE FROM mirror_copies")
+        self.conn.commit()
+        self._write(pid)
+        self._add_in_ma(pid, 3)
+        self._write(pid)
+        self.assertEqual(self._run(pid)["discarded"], 1)
+
+    def test_stopping_the_mirror_forgets_the_baseline(self):
+        pid = self._playlist("Mix", self._tracks(LIBRARY[:1]))
+        self._write(pid)
+        mirror_music_assistant.delete_mirror(self.conn, pid)
+        self.conn.commit()
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM mirror_copies WHERE playlist_id = ?", (pid,)).fetchone())
+
 class CoverageRunTests(_Base):
     """Each write that gets as far as matching records a mirror_runs row,
     including what Music Assistant refused after accepting it."""

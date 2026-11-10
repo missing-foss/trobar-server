@@ -570,6 +570,163 @@ class CoverageRunTests(_Base):
         self.assertEqual(mirror_runs.latest(self.conn, [pid])[(pid, "plex")]["history"], [1, 1])
 
 
+
+class OverwriteTests(_Base):
+    """An edit made to the copy in Plex is overwritten by the next write;
+    the run says what it discarded and what it put back."""
+
+    def _copy(self, pid):
+        return self._row(pid)["plex_mirror_remote_id"]
+
+    def _add_in_plex(self, pid, n):
+        self.fake._add(self.fake.playlists[self._copy(pid)], self._keys_of(n))
+
+    def _remove_in_plex(self, pid, n):
+        playlist = self.fake.playlists[self._copy(pid)]
+        playlist["entries"] = [e for e in playlist["entries"] if e["key"] not in self._keys_of(n)]
+
+    def _add_in_trobar(self, pid, track_id):
+        pos = self.conn.execute("SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?", (pid,)).fetchone()[0]
+        self.conn.execute("INSERT INTO playlist_tracks (playlist_id, position, artist, title, matched_track_id) "
+                          "VALUES (?, ?, 'a', 't', ?)", (pid, pos, track_id))
+        self.conn.commit()
+
+    def _run(self, pid):
+        return mirror_runs.missing(self.conn, pid, "plex")
+
+    def _named(self, n, change):
+        _path, artist, _album, title, _no = LIBRARY[n]
+        return {"artist": artist, "title": title, "change": change}
+
+    def test_the_first_write_reports_nothing(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"], run["overwritten"]), (0, 0, []))
+
+    def test_a_track_added_in_plex_is_discarded_and_said(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        self._add_in_plex(pid, 3)
+        self._write(pid)
+        self.assertEqual(self.fake.keys(self._copy(pid)), self._keys_of(0))
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"]), (1, 0))
+        self.assertEqual(run["overwritten"], [self._named(3, "discarded")])
+
+    def test_a_track_removed_in_plex_is_put_back_and_said(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0), self._local(1)]))
+        self._write(pid)
+        self._remove_in_plex(pid, 1)
+        self._write(pid)
+        self.assertEqual(self.fake.keys(self._copy(pid)), self._keys_of(0, 1))
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"]), (0, 1))
+        self.assertEqual(run["overwritten"], [self._named(1, "restored")])
+
+    def test_a_change_made_in_trobar_is_not_an_overwrite(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        self._add_in_trobar(pid, self._tracks([self._local(2)])[0])
+        self._write(pid)
+        self.assertEqual(self.fake.keys(self._copy(pid)), self._keys_of(0, 2))
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"], run["overwritten"]), (0, 0, []))
+
+    def test_a_track_added_in_plex_that_trobar_also_adds_is_kept_and_not_said(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        self._add_in_plex(pid, 2)
+        self._add_in_trobar(pid, self._tracks([self._local(2)])[0])
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"]), (0, 0))
+
+    def test_the_baseline_follows_each_write(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        self._add_in_plex(pid, 3)
+        self._write(pid)
+        # Already reported once: the next write, with nothing edited since,
+        # reports nothing.
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"]), (0, 0))
+
+    def test_a_track_removed_in_plex_and_in_trobar_is_not_said(self):
+        ids = self._tracks([self._local(0), self._local(1)])
+        pid = self._playlist("Mix", ids)
+        self._write(pid)
+        self._remove_in_plex(pid, 1)
+        self.conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ? AND matched_track_id = ?",
+                          (pid, ids[1]))
+        self.conn.commit()
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"]), (0, 0))
+
+    def test_a_copy_already_right_still_sets_the_baseline(self):
+        # As on the first write after an upgrade: the copy is right, so
+        # nothing is written, but the next edit in Plex is still caught.
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        self.conn.execute("DELETE FROM mirror_copies")
+        self.conn.commit()
+        self._write(pid)
+        self._add_in_plex(pid, 3)
+        self._write(pid)
+        self.assertEqual(self._run(pid)["discarded"], 1)
+
+    def test_without_a_baseline_an_extra_track_is_not_said(self):
+        # The first write after an upgrade: what is on the copy can't be
+        # told from an edit, so nothing is claimed.
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        self.conn.execute("DELETE FROM mirror_copies")
+        self.conn.commit()
+        self._add_in_plex(pid, 3)
+        self._write(pid)
+        self.assertEqual(self._run(pid)["discarded"], 0)
+
+    def test_an_edit_to_a_track_trobar_added_last_time_is_caught(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        self._add_in_trobar(pid, self._tracks([self._local(2)])[0])
+        self._write(pid)
+        self._remove_in_plex(pid, 2)
+        self._write(pid)
+        self.assertEqual(self._run(pid)["overwritten"], [self._named(2, "restored")])
+
+    def test_after_a_partly_refused_write_the_baseline_is_what_plex_holds(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        self._add_in_trobar(pid, self._tracks([self._local(1)])[0])
+        self._add_in_trobar(pid, self._tracks([self._local(2)])[0])
+        real_add = self.fake._add
+        with mock.patch.object(self.fake, "_add", side_effect=lambda playlist, keys: real_add(playlist, keys[:2])):
+            row = self._write(pid)
+        self.assertEqual(row["plex_mirror_last_error_code"], "readback_mismatch")
+        # Track 1 landed; removing it in Plex is an edit the next write undoes.
+        self._remove_in_plex(pid, 1)
+        self._write(pid)
+        self.assertIn(self._named(1, "restored"), self._run(pid)["overwritten"])
+
+    def test_a_copy_deleted_in_plex_and_made_afresh_reports_nothing(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        del self.fake.playlists[self._copy(pid)]
+        self._write(pid)
+        run = self._run(pid)
+        self.assertEqual((run["discarded"], run["restored"]), (0, 0))
+
+    def test_stopping_the_mirror_forgets_the_baseline(self):
+        pid = self._playlist("Mix", self._tracks([self._local(0)]))
+        self._write(pid)
+        mirror_plex.delete_mirror(self.conn, pid)
+        self.conn.commit()
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM mirror_copies WHERE playlist_id = ?", (pid,)).fetchone())
+
 def setUpModule():
     # unittest calls this every time it enters the module, and
     # tearDownModule every time it leaves; a selection that interleaves

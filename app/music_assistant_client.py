@@ -249,8 +249,36 @@ def _source_ids(playlist: dict) -> list[tuple[str, str]]:
     return found
 
 
+def _accounts(playlist: dict) -> list[str]:
+    """The accounts this playlist comes from, as Music Assistant's provider
+    instance ids ("tidal--abc123"): one per streaming account that carries
+    it. Empty for one made in Music Assistant itself or read from files."""
+    found = []
+    for m in playlist.get("provider_mappings") or []:
+        domain, instance = m.get("provider_domain") or "", m.get("provider_instance") or ""
+        if instance and instance not in found and domain not in ("builtin", "library") \
+                and not domain.startswith(_FILE_DOMAINS):
+            found.append(instance)
+    return found
+
+
+def streaming_accounts() -> dict:
+    """{"status": "ok", "accounts": [{"instance_id", "domain", "name"}, ...]}:
+    the streaming accounts Music Assistant has (its music providers that
+    stream, from `providers`), or an error when it isn't reachable."""
+    url, token = _current_config()
+    providers = _command("providers", {}, url, token)
+    if not isinstance(providers, list):
+        return {"status": "error", "reason": "not_paired"}
+    return {"status": "ok", "accounts": [
+        {"instance_id": p["instance_id"], "domain": p.get("domain") or "", "name": p.get("name") or p["instance_id"]}
+        for p in providers
+        if p.get("type") == "music" and p.get("is_streaming_provider") and p.get("instance_id")
+    ]}
+
+
 def list_playlists() -> dict:
-    """Returns {"status": "ok", "playlists": [{"id", "title", "source_ids"}, ...]},
+    """Returns {"status": "ok", "playlists": [{"id", "title", "source_ids", "accounts"}, ...]},
     the common shape every provider client returns plus _source_ids(), or an
     error when not configured or unreachable — which the sync treats as "this source has
     nothing this run", never as "every playlist was deleted". Leaves out
@@ -264,7 +292,8 @@ def list_playlists() -> dict:
         if not isinstance(items, list):
             return {"status": "error", "reason": "not_paired"}
         playlists += [
-            {"id": str(p["item_id"]), "title": p["name"], "source_ids": _source_ids(p)}
+            {"id": str(p["item_id"]), "title": p["name"], "source_ids": _source_ids(p),
+             "accounts": _accounts(p)}
             for p in items
             if p.get("name") and p.get("item_id") is not None and not _is_generated(p)
             and not is_mirror_copy(p.get("name"), p.get("item_id"), mirror_ids)
@@ -412,13 +441,30 @@ def _wait_task(task: object, url: str, token: str) -> bool:
 
 def mirror_read(remote_id: str) -> list[str] | None:
     """The paths of a mirrored playlist's entries, in order, or None when it
-    can't be read: gone (500), or the server unreachable."""
+    can't be read: gone (500), or the server unreachable. See
+    mirror_read_items."""
+    items = mirror_read_items(remote_id)
+    return None if items is None else [i["id"] for i in items]
+
+
+def mirror_read_items(remote_id: str) -> list[dict] | None:
+    """A mirrored playlist's entries, in order, as {"id": the entry's path,
+    "artist", "title"}, or None when it can't be read: gone (500), or the
+    server unreachable.
+
+    Read with force_refresh: Music Assistant 2.9.9 caches playlist_tracks, and
+    within about a second of a write the cached read can still return the
+    list from before it. That made a read-back after two quick rewrites look
+    like a wrong order, and a read before a write could count the old list."""
     url, token = _current_config()
     entries = _command("music/playlists/playlist_tracks",
-                       {"item_id": str(remote_id), "provider_instance_id_or_domain": "library"}, url, token)
+                       {"item_id": str(remote_id), "provider_instance_id_or_domain": "library",
+                        "force_refresh": True}, url, token)
     if not isinstance(entries, list):
         return None
-    return [_file_path(e) or e.get("uri") or "" for e in entries]
+    return [{"id": _file_path(e) or e.get("uri") or "", "title": e.get("name") or "",
+             "artist": ", ".join(a["name"] for a in e.get("artists") or [] if a.get("name"))}
+            for e in entries]
 
 
 def mirror_listed(remote_id: str) -> bool | None:

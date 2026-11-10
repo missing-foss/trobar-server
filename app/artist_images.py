@@ -100,18 +100,18 @@ def get_artist_image(artist: str, provider,
 SMALL_MAX_PX = 512
 
 
-def downscale(data: bytes, content_type: str) -> tuple[bytes, str]:
-    """the `small` device variant: longest side capped at
-    SMALL_MAX_PX, re-encoded JPEG. Never upscales; on any decode problem the
-    original passes through untouched (a picture is decorative, never worth
-    failing a request over)."""
+def downscale(data: bytes, content_type: str, max_px: int = SMALL_MAX_PX) -> tuple[bytes, str]:
+    """the `small` device variant: longest side capped at `max_px`
+    (SMALL_MAX_PX unless asked), re-encoded JPEG. Never upscales; on any
+    decode problem the original passes through untouched (a picture is
+    decorative, never worth failing a request over)."""
     try:
         # Image.Image, not the narrower ImageFile.open() returns — .convert()
         # below produces a plain Image, not still an ImageFile.
         img: Image.Image = Image.open(io.BytesIO(data))
-        if max(img.size) <= SMALL_MAX_PX:
+        if max(img.size) <= max_px:
             return data, content_type
-        img.thumbnail((SMALL_MAX_PX, SMALL_MAX_PX))
+        img.thumbnail((max_px, max_px))
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
         out = io.BytesIO()

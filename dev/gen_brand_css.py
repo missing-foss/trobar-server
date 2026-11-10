@@ -219,6 +219,8 @@ def web_vars(key, mode, r, t):
         "--c-indigo-600": r["primary"],
         "--c-indigo-700": primary_far,
         "--c-red-50": alpha(r["error"], 0.08 if light else 0.14),
+        # A border on an error chip or panel: the error colour, faded.
+        "--c-red-300": alpha(r["error"], 0.40 if light else 0.50),
         "--c-red-500": r["error"], "--c-red-600": r["error"],
         "--c-selection-bg": alpha(r["accent"], 0.25 if light else 0.35),
         "--c-selection-fg": WHITE if light else ink,
@@ -254,6 +256,10 @@ def pairs(key, mode, r, v):
         ("gray-700 text on panel", v["--c-gray-700"], panel, 4.5),
         ("gray-800 text on panel", v["--c-gray-800"], panel, 4.5),
         ("red-500 text on panel", v["--c-red-500"], panel, 4.5),
+        # Error text inside a red-50 panel (the red-800 shade maps to red-600).
+        ("red-600 text on a red-50 panel", v["--c-red-600"], over(r["error"], 0.08 if light else 0.14, panel), 4.5),
+        # The destructive button: bg-red-600 with an on-primary label.
+        ("label on a red-600 button", v["--c-on-primary"], v["--c-red-600"], 4.5),
         ("text on primary container", r["onPrimaryContainer"], r["primaryContainer"], 4.5),
         ("outline on panel", r["outline"], panel, 3.0),
         ("button label on metal", v["--c-on-metal"], v["--c-metal"], 4.5),
@@ -428,13 +434,38 @@ def status_colours():
     return out
 
 
+def status_tints():
+    """app.css's status tints (rgba), per light/dark, as (hex, alpha): panel
+    backgrounds such as amber-50, checked with the text drawn on them."""
+    import re
+    css = APP_CSS.read_text()
+    out = {}
+    for mode in ("light", "dark"):
+        block = re.search(r':root\[data-theme="%s"\]\{(.*?)\}' % mode, css, re.S).group(1)
+        out[mode] = {name: ("#%02X%02X%02X" % (int(r), int(g), int(b)), float(a)) for name, r, g, b, a in re.findall(
+            r"--c-((?:green|yellow|amber)-[0-9]+):rgba\((\d+),(\d+),(\d+),([0-9.]+)\);", block)}
+    return out
+
+
+# The text an amber-50 review panel carries (the unmatched tracks, a device's
+# unknown files): its title, the track names and their secondary lines, the
+# exclude buttons and the errors.
+AMBER_PANEL_TEXT = ("--c-amber-800", "--c-amber-700", "--c-gray-800", "--c-gray-700", "--c-gray-600",
+                    "--c-gray-500", "--c-gray-400", "--c-yellow-700", "--c-red-600", "--c-indigo-600")
+
+
 def check_contrast():
     data = json.loads(TOKENS.read_text())
     status = status_colours()
+    tints = status_tints()
     failures, rows = [], []
     for key, mode, r, t in variants(data["themes"]):
         v = web_vars(key, mode, r, t)
         extra = [(f"status text ({name}) on panel", val, v["--c-panel"], 4.5) for name, val in sorted(status[mode].items())]
+        tint_hex, tint_a = tints[mode]["amber-50"]
+        amber_panel = over(tint_hex, tint_a, v["--c-panel"])
+        colours = {**v, **{f"--c-{n}": c for n, c in status[mode].items()}}
+        extra += [(f"{name[4:]} text on an amber-50 panel", colours[name], amber_panel, 4.5) for name in AMBER_PANEL_TEXT]
         for what, fg, bg, minimum in pairs(key, mode, r, v) + extra:
             got = ratio(fg, bg)
             rows.append((key, mode, what, got, minimum))

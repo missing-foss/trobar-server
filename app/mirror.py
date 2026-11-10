@@ -41,6 +41,8 @@ from pathlib import Path
 from werkzeug.utils import secure_filename
 
 import db
+import mirror_copies
+import mirror_runs
 import sync_state
 
 _log = logging.getLogger(__name__)
@@ -268,6 +270,7 @@ def delete_mirror(conn, playlist_id: int) -> None:
         "UPDATE playlists SET mirror_filename = NULL, mirror_last_written_at = NULL "
         "WHERE id = ?", (playlist_id,),
     )
+    mirror_copies.forget(conn, playlist_id, "filesystem")
 
 
 def write_mirror(conn, playlist_id: int) -> None:
@@ -336,6 +339,15 @@ def write_mirror(conn, playlist_id: int) -> None:
         "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)
     ).fetchone()[0]
 
+    # The file as it stands, for what this write overwrites: an entry added
+    # or removed by hand (or by a player that keeps Trobar's marker line;
+    # one that drops it is refused above as marker_unsafe).
+    current = _read_entries(target)
+    written = [{"id": entry_path(music_root, e["relative_path"], location),
+                "artist": e["artist"] or "", "title": e["title"] or ""} for e in entries]
+    discarded, restored = mirror_copies.overwritten(
+        conn, playlist_id, "filesystem", current, [w["id"] for w in written])
+
     lines = [
         "#EXTM3U",
         sync_state.M3U_MARKER,
@@ -358,6 +370,7 @@ def write_mirror(conn, playlist_id: int) -> None:
                 "mirror_last_error_code = NULL WHERE id = ?",
                 (new_filename, playlist_id),
             )
+            _record(conn, playlist_id, entries, written, discarded, restored)
             return
         target.write_text(content, encoding="utf-8")
     except OSError as exc:
@@ -369,3 +382,39 @@ def write_mirror(conn, playlist_id: int) -> None:
         "mirror_last_error = NULL, mirror_last_error_code = NULL WHERE id = ?",
         (new_filename, playlist_id),
     )
+    _record(conn, playlist_id, entries, written, discarded, restored)
+
+
+def _record(conn, playlist_id: int, entries, written, discarded, restored) -> None:
+    """The file as written becomes the next baseline, and the run records
+    what this write overwrote. A file has no target library to fall short
+    on, so every entry counts as placed."""
+    mirror_copies.remember(conn, playlist_id, "filesystem", written)
+    mirror_runs.record(conn, playlist_id, "filesystem", len(entries), len(entries),
+                       discarded=discarded, restored=restored)
+
+
+def _read_entries(path: Path) -> list[dict] | None:
+    """The entries of an existing mirror file, in order, as {"id": the path
+    line, "artist", "title"} (from the #EXTINF line before it, when it has
+    one in Trobar's "artist - title" form); None when there is no file or
+    it can't be read."""
+    try:
+        if not path.is_file():
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    items: list[dict] = []
+    artist = title = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXTINF:"):
+            name = line.split(",", 1)[1] if "," in line else ""
+            artist, _sep, title = name.partition(" - ")
+            if not _sep:
+                artist, title = "", name
+        elif line and not line.startswith("#"):
+            items.append({"id": line, "artist": artist, "title": title})
+            artist = title = ""
+    return items

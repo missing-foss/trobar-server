@@ -31,6 +31,24 @@ start.
 Sections below that need something from you say so up front; a section with no
 such flag needs nothing.
 
+## Tidal refresh tokens are encrypted at rest (2.18.0)
+
+At its first start, Trobar encrypts each person's stored Tidal refresh token
+with the credential key, the one that already protects the credentials that
+send plays (`credential_key` in `DATA_DIR`, or wherever
+`TROBAR_CREDENTIAL_KEY_FILE` points). If there is no key yet, it makes one.
+Everyone stays linked to Tidal.
+
+- **If the key file can't be used** (it is damaged or can't be read), the tokens
+  stay as they were, the log says how many, and every later start tries again.
+  Nobody is unlinked. Until the key works, linking Tidal is refused, and a token
+  Tidal renews during a sync is stored unencrypted until a later start encrypts it.
+- **From now on the Tidal links need the key.** A database restored without its
+  key, or a lost key, means each person connects Tidal again on their Profile.
+  Back the key up with `DATA_DIR`, as [Backups & DATA_DIR](backups.md) describes.
+- **Going back** to an older release: it can't read the encrypted tokens, so its
+  Tidal syncs fail. Restore the backup taken before upgrading.
+
 ## Upgrading from a pre-10001 (root) image
 
 !!! warning "Action needed: a one-time `chown`, or the app won't start"

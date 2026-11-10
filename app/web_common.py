@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import NoReturn
 from urllib.parse import urlsplit
 
-from authlib.integrations.flask_client import OAuth
-from flask import request, abort, current_app, session, Response, jsonify
+from authlib.integrations.flask_client import FlaskIntegration, OAuth
+from flask import g, request, abort, current_app, session, Response, jsonify
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 from flask_babel import gettext as _
 
 import artist_images
@@ -47,6 +48,7 @@ import roon_client
 import rule_playlists
 import settings
 import spotify_public_client
+import tidal_public_client
 import subsonic_client
 import suggestions
 import sync_state
@@ -213,6 +215,15 @@ def _refresh_autofit_after_limit_change(conn, device_id: int) -> None:
     sync_state.recompute_device_state(conn, device_id)
 
 
+def _validated_artist_images(value):
+    """Off (None), "small" or "full"; anything else is a 400. Shared by the
+    web device routes and the device's own PATCH."""
+    imgs = value or None
+    if imgs not in (None, "small", "full"):
+        abort(400, description=_("Unsupported artist image setting."))
+    return imgs
+
+
 def _validated_source_of_truth(value):
     if value not in ("server", "device"):
         abort(400, description=_("source_of_truth must be 'server' or 'device'."))
@@ -278,9 +289,10 @@ def _authenticated_device(conn):
 # any breaking change to a route under the prefix, and when a section
 # arrives that a client gates a whole screen on (2: the playlist section;
 # 4: removing a selection from a device; 5: an album's tracks; 6: the library
-# by album artist); /api/device/info advertises it so a client can refuse
+# by album artist; 7: the Home album widgets leave out what is already on the
+# calling device); /api/device/info advertises it so a client can refuse
 # gracefully instead of probing.
-APP_API_VERSION = 6
+APP_API_VERSION = 7
 
 
 def _config_int(conn, key: str, default: int) -> int:
@@ -819,14 +831,23 @@ def _months_ago_iso(months: int) -> str:
     return (datetime.now() - timedelta(days=30 * months)).strftime("%Y-%m-%d")
 
 
-def _recently_added_for(conn, user_id: int, months: int) -> list[dict]:
-    user_device_ids = {row["id"] for row in _device_rows_for_user(conn, user_id, _is_admin(conn, user_id))}
-    return suggestions.recently_added_widget(conn, _months_ago_iso(months), user_device_ids)
+def _covering_devices(conn, user_id: int, device_ids: set[int] | None) -> set[int]:
+    """The devices an album must be selected for before a suggestion or a
+    recent album leaves the list: the ones given (the phone asking, for the
+    App API), or else every device the user manages (the web dashboard)."""
+    if device_ids is not None:
+        return device_ids
+    return {row["id"] for row in _device_rows_for_user(conn, user_id, _is_admin(conn, user_id))}
 
 
-def _recently_released_for(conn, user_id: int, months: int) -> list[dict]:
-    user_device_ids = {row["id"] for row in _device_rows_for_user(conn, user_id, _is_admin(conn, user_id))}
-    return suggestions.recently_released_widget(conn, _months_ago_iso(months), user_device_ids)
+def _recently_added_for(conn, user_id: int, months: int, device_ids: set[int] | None = None) -> list[dict]:
+    return suggestions.recently_added_widget(
+        conn, _months_ago_iso(months), _covering_devices(conn, user_id, device_ids))
+
+
+def _recently_released_for(conn, user_id: int, months: int, device_ids: set[int] | None = None) -> list[dict]:
+    return suggestions.recently_released_widget(
+        conn, _months_ago_iso(months), _covering_devices(conn, user_id, device_ids))
 
 
 def _gravatar_url(email: str) -> str:
@@ -1230,9 +1251,96 @@ def _active_provider_id(conn) -> str:
     return pid if pid in _PROVIDERS else "roon"
 
 
+# #543: the OIDC sign-in's state, nonce and PKCE verifier, in a cookie of
+# their own rather than in the session cookie. Every signed-in response
+# rewrites the session cookie, so a request from another tab still in flight
+# when someone logs out and signs in again could put the old session back over
+# the state, or clear it, and the callback was refused before the token
+# exchange. This cookie is signed with the app's key, sent only to /oidc/,
+# and only the sign-in routes write it. It expires OIDC_STATE_MAX_AGE after it
+# was last written, and each flow in it OIDC_STATE_MAX_AGE after it started. It holds the
+# last OIDC_STATE_MAX_FLOWS flows, so a sign-in started in two tabs can finish
+# in either. The Tidal and Spotify links keep theirs in the session.
+OIDC_STATE_COOKIE = "trobar_oidc_state"
+OIDC_STATE_MAX_AGE = 600
+OIDC_STATE_MAX_FLOWS = 3
+
+
+def _oidc_state_serializer() -> URLSafeTimedSerializer:
+    key = current_app.secret_key
+    if not key:
+        raise RuntimeError("the app has no secret key to sign the OIDC state with")
+    return URLSafeTimedSerializer(key, salt="oidc-state")
+
+
+class _StateCookieIntegration(FlaskIntegration):
+    def _serializer(self) -> URLSafeTimedSerializer:
+        return _oidc_state_serializer()
+
+    def _states(self) -> dict:
+        """state -> {"data", "at"}: the flows still young enough. The cookie
+        as a whole expires OIDC_STATE_MAX_AGE after it was last written, and
+        each flow OIDC_STATE_MAX_AGE after it started, since a later sign-in
+        rewrites the cookie with a fresh timestamp."""
+        if hasattr(g, "oidc_state_cookie"):
+            states = dict(g.oidc_state_cookie or {})
+        else:
+            raw = request.cookies.get(OIDC_STATE_COOKIE)
+            if not raw:
+                return {}
+            try:
+                value = self._serializer().loads(raw, max_age=OIDC_STATE_MAX_AGE)
+            except BadSignature:  # tampered with, or older than OIDC_STATE_MAX_AGE
+                return {}
+            states = value if isinstance(value, dict) else {}
+        oldest = time.time() - OIDC_STATE_MAX_AGE
+        return {state: flow for state, flow in states.items()
+                if isinstance(flow, dict) and isinstance(flow.get("at"), (int, float)) and flow["at"] >= oldest}
+
+    def set_state_data(self, session, state, data):
+        if self.name != "oidc":
+            return super().set_state_data(session, state, data)
+        states = self._states()
+        states.pop(state, None)
+        states[state] = {"data": data, "at": time.time()}
+        g.oidc_state_cookie = dict(list(states.items())[-OIDC_STATE_MAX_FLOWS:])
+
+    def get_state_data(self, session, state):
+        if self.name != "oidc":
+            return super().get_state_data(session, state)
+        flow = self._states().get(state)
+        return flow["data"] if flow else None
+
+    def clear_state_data(self, session, state):
+        if self.name != "oidc":
+            return super().clear_state_data(session, state)
+        states = self._states()
+        states.pop(state, None)
+        g.oidc_state_cookie = states
+
+
+class TrobarOAuth(OAuth):
+    framework_integration_cls = _StateCookieIntegration
+
+
+def write_oidc_state_cookie(response: Response) -> Response:
+    """after_request: writes the OIDC state cookie when this request changed
+    it; deletes it once no flow is left in it."""
+    if not hasattr(g, "oidc_state_cookie"):
+        return response
+    secure = current_app.config.get("SESSION_COOKIE_SECURE", True)
+    if g.oidc_state_cookie:
+        value = _oidc_state_serializer().dumps(g.oidc_state_cookie)
+        response.set_cookie(OIDC_STATE_COOKIE, value, max_age=OIDC_STATE_MAX_AGE, path="/oidc/",
+                            secure=secure, httponly=True, samesite="Lax")
+    else:
+        response.delete_cookie(OIDC_STATE_COOKIE, path="/oidc/", secure=secure, httponly=True, samesite="Lax")
+    return response
+
+
 # Unbound here: main.py binds it with init_app(app) before anything is
 # registered on it (see the note there).
-oauth = OAuth()
+oauth = TrobarOAuth()
 
 
 def _end_other_sessions(conn, user_id: int) -> None:
@@ -1341,6 +1449,18 @@ def _failed_writes(rows: list, prefix: str) -> tuple[int, str | None]:
     return len(failed), (failed[0].get(f"{prefix}_last_error") if failed else None)
 
 
+def _visible_to_everyone(row) -> bool:
+    """Whether every member may see this playlist: an unowned one or a shared
+    one, unless it is private on its source server with an owner who isn't a
+    member yet (source_private), which only admins see. The SQL twin is
+    VISIBLE_TO_EVERYONE_SQL; keep the two the same."""
+    return not row["source_private"] and (row["owner_user_id"] is None or bool(row["shared"]))
+
+
+# The rule above for a playlists table aliased `p`.
+VISIBLE_TO_EVERYONE_SQL = "(p.source_private = 0 AND (p.owner_user_id IS NULL OR p.shared = 1))"
+
+
 def _require_playlist_visible(conn, user_id: int, sel_type: str, target: str) -> None:
     """#28: blocks creating/toggling a selection against an owned-and-
     unshared playlist someone else set private — the actual enforcement
@@ -1373,9 +1493,9 @@ def _require_playlist_visible(conn, user_id: int, sel_type: str, target: str) ->
     if playlist_id is None:
         abort(400, description=_("Invalid playlist."))
     row = conn.execute(
-        "SELECT owner_user_id, shared FROM playlists WHERE id = ?", (playlist_id,)
+        "SELECT owner_user_id, shared, source_private FROM playlists WHERE id = ?", (playlist_id,)
     ).fetchone()
-    if row is None or row["owner_user_id"] is None or row["shared"]:
+    if row is None or _visible_to_everyone(row):
         return
     if row["owner_user_id"] == user_id or _is_admin(conn, user_id):
         return
@@ -1396,13 +1516,7 @@ def _revoke_non_owner_playlist_selections(conn, playlist_id: int, owner_user_id:
     explicit user deletion elsewhere in this app. is_admin is checked
     live (current status), same as every other admin check here, not
     whatever it was at selection-creation time."""
-    rows = conn.execute(
-        "SELECT s.id FROM selections s JOIN users u ON u.id = s.created_by_user_id "
-        "WHERE s.type = 'playlist' AND s.target = ? AND s.created_by_user_id != ? AND u.is_admin = 0",
-        (str(playlist_id), owner_user_id),
-    ).fetchall()
-    for row in rows:
-        sync_state.delete_selection(conn, row["id"])
+    playlist_sync.revoke_non_owner_selections(conn, playlist_id, owner_user_id)
 
 
 def _start_playlist_sync():
@@ -1426,7 +1540,23 @@ def _mirror_coverage(conn, playlist_ids) -> dict:
     last write (mirror_runs), for the mirror icon's tooltip."""
     out: dict = {}
     for (pid, sink), run in mirror_runs.latest(conn, playlist_ids).items():
-        out.setdefault(pid, {})[sink] = {"on_target": run["on_target"], "total": run["total"]}
+        # The filesystem mirror records runs for what it overwrote, but has
+        # no target to fall short on: coverage is the server sinks' only.
+        if sink in mirror_runs.SINKS:
+            out.setdefault(pid, {})[sink] = {"on_target": run["on_target"], "total": run["total"]}
+    return out
+
+
+def _mirror_overwritten(conn, playlist_ids) -> dict:
+    """{playlist_id: {sink: n}}: how many edits made on each target its last
+    write overwrote (added there and left out, or removed there and put
+    back), the folder included; only sinks with any. For the mirror icon's
+    tooltip, and only for the playlist's owner or an admin."""
+    out: dict = {}
+    for (pid, sink), run in mirror_runs.latest(conn, playlist_ids).items():
+        n = run["discarded"] + run["restored"]
+        if n:
+            out.setdefault(pid, {})[sink] = n
     return out
 
 
@@ -1484,7 +1614,7 @@ def _visible_playlists(conn, user_id: int) -> list:
         # A playlist made on a device names it in its key, "<device id>:<path>".
         "LEFT JOIN devices sd ON p.source_provider = 'device' AND sd.id = "
         " CAST(substr(p.source_playlist_id, 1, instr(p.source_playlist_id, ':') - 1) AS INTEGER) "
-        "WHERE :admin OR p.owner_user_id IS NULL OR p.shared = 1 OR p.owner_user_id = :uid "
+        f"WHERE :admin OR {VISIBLE_TO_EVERYONE_SQL} OR p.owner_user_id = :uid "
         "GROUP BY p.id ORDER BY p.title",
         {"uid": user_id, "admin": admin},
     ).fetchall()
@@ -1518,9 +1648,13 @@ def _visible_playlists(conn, user_id: int) -> list:
 
     result = []
     coverage = _mirror_coverage(conn, [r["id"] for r in rows])
+    overwritten = _mirror_overwritten(conn, [r["id"] for r in rows])
     for r in rows:
         d = dict(r)
         d["mirror_coverage"] = coverage.get(r["id"], {})
+        # What a write undid on a target is the owner's business (and an
+        # admin's): another member who can see the playlist doesn't get it.
+        d["mirror_overwritten"] = overwritten.get(r["id"], {}) if admin or r["is_own"] else {}
         # #449: same SQLite-integer-vs-JSON-boolean coercion as
         # is_own/is_pinned in _device_rows_for_user() -- mirror_enabled
         # already got this treatment, is_own/shared hadn't. The App
@@ -1795,16 +1929,23 @@ def _add_subscription(conn, user_id: int):
     """Subscribe by URL and import at once; shared by both prefixes."""
     body = request.get_json(force=True)
     raw_url = (body.get("url") or "").strip()
-    # Spotify first: its parser takes only links, while YouTube Music's
-    # also takes a bare id, which would otherwise swallow anything.
-    provider = spotify_public_client.PROVIDER_ID
-    external_id = spotify_public_client.parse_playlist_url(raw_url)
+    # Tidal and Spotify first: their parsers take only links, while YouTube
+    # Music's also takes a bare id, which would otherwise swallow anything.
+    provider = tidal_public_client.PROVIDER_ID
+    external_id = tidal_public_client.parse_playlist_url(raw_url)
+    if external_id is not None and not tidal_public_client.is_configured():
+        abort(400, description=_(
+            "Tidal links need the server's Tidal app to be set up first: "
+            "an admin enters its client ID and secret under Admin, Tidal."))
+    if external_id is None:
+        provider = spotify_public_client.PROVIDER_ID
+        external_id = spotify_public_client.parse_playlist_url(raw_url)
     if external_id is None:
         provider = ytmusic_client.PROVIDER_ID
         external_id = ytmusic_client.parse_playlist_url(raw_url)
     if external_id is None:
         abort(400, description=_(
-            "That doesn't look like a YouTube Music or Spotify playlist link. "
+            "That doesn't look like a YouTube Music, Spotify or Tidal playlist link. "
             "Copy the playlist's Share link, or the address bar while it's open."))
     existing = conn.execute(
         "SELECT id FROM playlist_subscriptions "
@@ -1864,11 +2005,11 @@ def _require_playlist_visible_by_id(conn, user_id: int, playlist_id: int) -> Non
     playlist's review surface is exactly as invisible as the playlist
     itself is in that list."""
     row = conn.execute(
-        "SELECT owner_user_id, shared FROM playlists WHERE id = ?", (playlist_id,)
+        "SELECT owner_user_id, shared, source_private FROM playlists WHERE id = ?", (playlist_id,)
     ).fetchone()
     if row is None:
         abort(404, description=_("Playlist not found"))
-    if row["owner_user_id"] is None or row["shared"] or row["owner_user_id"] == user_id:
+    if _visible_to_everyone(row) or row["owner_user_id"] == user_id:
         return
     if _is_admin(conn, user_id):
         return
@@ -1978,7 +2119,8 @@ def _selections_for(conn, user_id: int) -> list[dict]:
             # forward.
             "AND NOT (s.type = 'playlist' AND EXISTS ("
             "  SELECT 1 FROM playlists p WHERE p.id = CAST(s.target AS INTEGER) "
-            "  AND p.owner_user_id IS NOT NULL AND p.shared = 0 AND p.owner_user_id != :uid"
+            "  AND ((p.owner_user_id IS NOT NULL AND p.shared = 0 AND p.owner_user_id != :uid) "
+            "       OR p.source_private = 1)"
             ")) "
             "GROUP BY s.id ORDER BY s.created_at DESC",
             {"uid": user_id},
@@ -2215,12 +2357,15 @@ def _add_from(combined: list, sources: dict, name: str, result) -> None:
         sources[name] = "ok"
 
 
-def _suggestions_for(conn, user_id: int, period: str) -> tuple[list[dict], dict]:
+def _suggestions_for(conn, user_id: int, period: str,
+                     device_ids: set[int] | None = None) -> tuple[list[dict], dict]:
     """The merged suggestion feed, and each history source's state:
-    "ok", "error" (it didn't answer), or "unconfigured"."""
+    "ok", "error" (it didn't answer), or "unconfigured". An album leaves the
+    feed once it is selected for every device in `device_ids` (see
+    _covering_devices)."""
     user, api_key, lastfm_base, listenbrainz_base = _scrobble_sources(conn, user_id)
     sources = dict.fromkeys(_SCROBBLE_SOURCES, "unconfigured")
-    user_device_ids = {row["id"] for row in _device_rows_for_user(conn, user_id, _is_admin(conn, user_id))}
+    user_device_ids = _covering_devices(conn, user_id, device_ids)
 
     # Fetch enough candidates per source that filtering-to-one-source in
     # the UI can still show a full 30 of it, not just whatever survived

@@ -263,6 +263,33 @@ class UpgradeMatchesNewTests(unittest.TestCase):
         self.assertEqual(set(got) - set(want), set())
 
 
+class SubsonicOwnersMigrationTests(unittest.TestCase):
+    """A real version-4 database gains the Navidrome owner columns, and its
+    users and playlists keep everything they had: an existing playlist is
+    not private."""
+
+    def test_a_version_4_database_gains_the_columns(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        fixture = (Path(__file__).parent / "testdata" / "schema-v4.sql").read_text()
+        with mock.patch.object(db, "DATA_DIR", Path(tmp.name)), \
+                mock.patch.object(db, "DB_PATH", Path(tmp.name) / "old.db"):
+            with db.connection() as conn:
+                conn.executescript(fixture)
+                conn.execute("PRAGMA user_version = 4")
+                conn.execute("INSERT INTO users (username) VALUES ('alice')")
+                conn.execute("INSERT INTO playlists (title, source_provider) VALUES ('Road Trip', 'subsonic')")
+                conn.commit()
+            db.init_db()
+            with db.connection() as conn:
+                user = conn.execute("SELECT username, subsonic_username FROM users "
+                                    "WHERE username = 'alice'").fetchone()
+                playlist = conn.execute("SELECT title, source_owner, source_private FROM playlists "
+                                        "WHERE title = 'Road Trip'").fetchone()
+        self.assertEqual(tuple(user), ("alice", None))
+        self.assertEqual(tuple(playlist), ("Road Trip", None, 0))
+
+
 class SetupCompletedForOldInstallsTests(unittest.TestCase):
     """An install older than the setup wizard, on a real version-4 database,
     and every install that must keep going through the wizard."""

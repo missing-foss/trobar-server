@@ -67,7 +67,7 @@ import requests
 
 import db
 from artist_image_keys import ArtistImageKeys
-from mediabrowser_client import MediaBrowserClient
+from mediabrowser_client import MediaBrowserClient, copy_item
 
 _log = logging.getLogger(__name__)
 
@@ -217,7 +217,9 @@ def mirror_create_or_replace_playlist(
     name: str, song_ids: list[str], remote_id: str | None, user_id: str | None = None
 ) -> dict:
     """Creates (remote_id is None) or FULLY REPLACES (remote_id given) a
-    playlist's song list. Returns {"status": "ok", "remote_id": str} or
+    playlist's song list. Returns {"status": "ok", "remote_id": str,
+    "previous": the replaced copy's items as {"id", "artist", "title"}, or
+    None for a new playlist} or
     {"status": "error", "reason": str, "code": int | None} — `code` is the
     HTTP status Jellyfin returned when there was one (confirmed live: a
     stale/nonexistent playlistId gives a clean 404 with body "Playlist not
@@ -300,7 +302,7 @@ def mirror_create_or_replace_playlist(
         )
         if status is None or status >= 400 or not body or "Id" not in body:
             return {"status": "error", "reason": "create failed", "code": status}
-        return {"status": "ok", "remote_id": body["Id"]}
+        return {"status": "ok", "remote_id": body["Id"], "previous": None}
 
     status, current = _request_as(
         "GET", f"/Playlists/{remote_id}/Items", api_key, url, params={"userId": user_id})
@@ -324,7 +326,8 @@ def mirror_create_or_replace_playlist(
         )
         if status is None or status >= 400:
             return {"status": "error", "reason": "failed to add items", "code": status}
-    return {"status": "ok", "remote_id": remote_id}
+    return {"status": "ok", "remote_id": remote_id,
+            "previous": [copy_item(i) for i in current.get("Items", []) if i.get("Id")]}
 
 
 # The definitions both servers share live in mediabrowser_client.py; each

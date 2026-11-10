@@ -163,7 +163,10 @@ def test_connection(url: str, username: str, password: str) -> dict:
     the answer under."""
     resp = _request_as(url, username, password, "ping.view")
     if resp is not None and resp.get("status") == "ok":
-        return {"state": "paired", "url": url, "provider": "subsonic"}
+        # Whether it is a Navidrome admin, which members' own playlists and
+        # mirror copies need (None when the server doesn't say).
+        return {"state": "paired", "url": url, "provider": "subsonic",
+                "is_admin": is_admin(url, username, password)}
     return {"state": "disconnected", "url": url, "provider": "subsonic"}
 
 
@@ -194,10 +197,106 @@ def list_playlists() -> dict:
     if resp.get("status") != "ok":
         return {"status": "error", "reason": resp.get("error", {}).get("message", "unknown error")}
     playlists = _as_list(resp.get("playlists", {}).get("playlist"))
+    # `owner` (the server's username) and `public` as the server gives them:
+    # Navidrome lists every user's playlists to an admin account, private
+    # ones included, so the sync needs both to attribute and protect them.
+    # A server that sends no owner gives None, and nothing changes for it.
     return {"status": "ok", "playlists": [
-        {"id": str(p["id"]), "title": p["name"]}
+        {"id": str(p["id"]), "title": p["name"], "owner": p.get("owner") or None,
+         "public": bool(p.get("public"))}
         for p in playlists if p.get("name") and p.get("id") is not None
     ]}
+
+
+def account_username() -> str:
+    """The library account's own username, as configured."""
+    return _current_config()[1]
+
+
+def check_login(url: str, username: str, password: str) -> bool | None:
+    """Whether the server accepts this username and password: one ping,
+    nothing kept. None when the server can't be reached (or answers with
+    something other than a Subsonic response)."""
+    resp = _request_as(url, username, password, "ping.view")
+    if resp is None:
+        return None
+    return resp.get("status") == "ok"
+
+
+def is_admin(url: str, username: str, password: str) -> bool | None:
+    """Whether this account is an admin on its server: Subsonic's getUser on
+    the account itself, whose `adminRole` Navidrome reports. None when the
+    server can't be asked or doesn't say."""
+    resp = _request_as(url, username, password, "getUser", {"username": username})
+    if resp is None or resp.get("status") != "ok":
+        return None
+    role = resp.get("user", {}).get("adminRole")
+    return role if isinstance(role, bool) else None
+
+
+def _navidrome_token(url: str, username: str, password: str) -> str | None:
+    """A session token for Navidrome's own API, which an admin needs for
+    what the Subsonic API won't do (listing users, giving a playlist to its
+    owner). None if the login fails or the server isn't Navidrome."""
+    if not url or not username:
+        return None
+    try:
+        resp = requests.post(f"{url.rstrip('/')}/auth/login",
+                             json={"username": username, "password": password}, timeout=10)
+        resp.raise_for_status()
+        token = resp.json().get("token")
+    except (requests.RequestException, ValueError, AttributeError):
+        return None
+    return token if isinstance(token, str) and token else None
+
+
+def _navidrome_users(url: str, token: str) -> list[dict] | None:
+    try:
+        resp = requests.get(f"{url.rstrip('/')}/api/user",
+                            headers={"X-ND-Authorization": f"Bearer {token}"}, timeout=10)
+        resp.raise_for_status()
+        users = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+    if not isinstance(users, list):
+        return None
+    return [u for u in users if isinstance(u, dict) and isinstance(u.get("userName"), str)
+            and isinstance(u.get("id"), str)]
+
+
+def navidrome_give_playlist(url: str, username: str, password: str, playlist_id: str,
+                            owner: str) -> bool:
+    """Moves a playlist into `owner`'s account on a Navidrome server, with
+    an admin account, through its own API: the Subsonic API can't, and
+    Navidrome ignores an owner given at creation. Name and tracks stay, and
+    the admin account can go on writing it. False when it can't be done
+    (not Navidrome, not an admin, no such user)."""
+    token = _navidrome_token(url, username, password)
+    if token is None:
+        return False
+    users = _navidrome_users(url, token)
+    target = next((u["id"] for u in users or [] if u["userName"].casefold() == owner.casefold()), None)
+    if target is None:
+        return False
+    try:
+        resp = requests.put(f"{url.rstrip('/')}/api/playlist/{playlist_id}", json={"ownerId": target},
+                            headers={"X-ND-Authorization": f"Bearer {token}"}, timeout=10)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return False
+    return True
+
+
+def navidrome_usernames(url: str, username: str, password: str) -> set[str] | None:
+    """Every username on a Navidrome server, case-folded, read through its
+    own API with an admin account (Subsonic's getUser and getUsers won't
+    name other users, even to an admin). None when that can't be read: not
+    Navidrome, not an admin, or not reachable."""
+    token = _navidrome_token(url, username, password)
+    users = _navidrome_users(url, token) if token is not None else None
+    if users is None:
+        return None
+    return {u["userName"].casefold() for u in users}
 
 
 def _first_isrc(value) -> str | None:
@@ -450,6 +549,22 @@ def mirror_create_or_replace_playlist(
         return {"status": "error", "reason": error.get("message", "request failed"),
                 "code": error.get("code")}
     return {"status": "ok", "remote_id": str(resp["playlist"]["id"])}
+
+
+def mirror_read_items(remote_id: str) -> list[dict] | None:
+    """The copy's entries as they stand, in order, as {"id", "artist",
+    "title"}, or None when it can't be read (not configured, gone, or no
+    answer). Read before a replace, so the sink can say what the replace
+    overwrote; a failed read only means nothing is said."""
+    config = db.get_mirror_subsonic_config()
+    if config is None:
+        return None
+    url, username, password = config
+    resp = _request_as(url, username, password, "getPlaylist", {"id": remote_id})
+    if resp is None or resp.get("status") != "ok" or "playlist" not in resp:
+        return None
+    return [{"id": str(e.get("id")), "artist": e.get("artist") or "", "title": e.get("title") or ""}
+            for e in _as_list(resp["playlist"].get("entry")) if e.get("id") is not None]
 
 
 def mirror_set_playlist_metadata(remote_id: str, name: str, comment: str) -> None:

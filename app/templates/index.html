@@ -241,6 +241,16 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       </template>
     </nav>
   </div>
+  <!-- A playlist source that keeps failing (source_health.py's rule): one
+       line for admins, on every page, until its first success. -->
+  <div x-show="profile.is_admin && alertingSources().length" x-cloak role="status" data-source-alert
+    class="border-t border-gray-200 bg-yellow-100 text-yellow-700">
+    <div class="max-w-screen-xl mx-auto px-3 sm:px-4 py-1.5 text-sm flex items-start gap-2">
+      <svg viewBox="0 0 24 24" class="w-4 h-4 shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+      <span><span x-text="sourceAlertText()"></span> —
+        <button type="button" class="underline font-semibold" @click="openSourceHealth()">{{ _("see Administration") }}</button></span>
+    </div>
+  </div>
 </header>
 
 <main id="main" x-ref="main" tabindex="-1" class="max-w-screen-xl mx-auto px-3 sm:px-4 py-4">
@@ -911,6 +921,17 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
   <!-- ============ PLAYLISTS ============ -->
   <section x-show="tab==='playlists'" x-cloak class="bg-panel rounded-lg border border-gray-200 p-3">
+    <div class="flex gap-1 flex-wrap">
+      <button @click="setSubTab('playlists', 'list')" data-playlists-subtab="list"
+        :class="subTab('playlists')==='list' ? 'bg-indigo-50 text-pill-active' : 'text-gray-600 hover:bg-gray-100'"
+        class="text-sm px-3 py-1 rounded-md" x-text="t('playlistsListTab')"></button>
+      <button @click="setSubTab('playlists', 'gaps'); loadGaps()" data-playlists-subtab="gaps"
+        :class="subTab('playlists')==='gaps' ? 'bg-indigo-50 text-pill-active' : 'text-gray-600 hover:bg-gray-100'"
+        class="text-sm px-3 py-1 rounded-md"><span x-text="t('gapsTab')"></span>
+        <span x-show="gaps.open_count > 0" class="text-xs text-gray-500" data-gaps-count x-text="gaps.open_count"></span></button>
+    </div>
+    <hr class="border-gray-200 mb-3">
+    <div x-show="subTab('playlists')==='list'">
     <!-- #411: the tab's first filter/toggle UI — a single inline checkbox,
          not a filter bar, since one option doesn't justify one. Persisted
          per-user (hide_zero_match_playlists), matching how the other view
@@ -926,6 +947,16 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       <button @click="openRuleDialog()" data-new-rule-playlist
         class="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
         x-text="t('newRulePlaylist')"></button>
+      <label class="flex items-center gap-1.5 text-xs text-gray-600">
+        <span>{{ _("Sort") }}</span>
+        <select x-model="playlistSort" @change="savePlaylistSort()" data-playlist-sort
+          class="text-xs border border-gray-300 rounded px-1 py-0.5 bg-panel">
+          <option value="availability">{{ _("Availability") }}</option>
+          <option value="tracks">{{ _("Most tracks") }}</option>
+          <option value="newest">{{ _("Newest in Trobar") }}</option>
+          <option value="name">{{ _("Name (A–Z)") }}</option>
+        </select>
+      </label>
       <label class="flex items-center gap-1.5 text-xs text-gray-600">
         <input type="checkbox" x-model="profile.hide_zero_match_playlists" @change="saveProfile()">
         <span>{{ _("Hide playlists with no local tracks") }}</span>
@@ -992,7 +1023,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
         </button>
       </div>
       <p class="mt-1 text-xs text-gray-500">
-        {{ _("Public YouTube Music and Spotify playlists only — no account and no sign-in. Trobar reads the playlist and matches its tracks against your own library; nothing is sent to either service and nothing is downloaded from it.") }}
+        {{ _("Public YouTube Music, Spotify and Tidal playlists only — no account and no sign-in. Trobar reads the playlist and matches its tracks against your own library; nothing is sent to these services and nothing is downloaded from them.") }}
       </p>
       <p x-show="subscriptionError" class="mt-1 text-xs text-red-600" x-text="subscriptionError"></p>
       <template x-for="sub in playlistSubscriptions" :key="sub.id">
@@ -1024,7 +1055,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
     </div>
     <div class="divide-y divide-gray-100">
       <template x-for="p in sortedPlaylists()" :key="p.id">
-        <div data-playlist-row :data-new-playlist="p.id === newPlaylistPin ? '' : null"
+        <div data-playlist-row :data-playlist-id="p.id" :data-new-playlist="p.id === newPlaylistPin ? '' : null"
           :class="p.id === newPlaylistPin ? 'bg-indigo-50 border-l-4 border-indigo-600 pl-2' : ''">
           <!-- #410: the row ran out of horizontal room once "Mirror to…"
                (#285) made it a third fixed-width action button — nothing
@@ -1053,7 +1084,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                 </span>
                 <!-- #89: NULL/unrecognized source_provider falls back to a neutral music glyph instead of a blank SVG -->
                 <span x-show="p.source_provider !== 'device'" class="inline-flex shrink-0"
-                  :title="({roon: 'Roon', subsonic: 'Subsonic', jellyfin: 'Jellyfin', emby: 'Emby', plex: 'Plex', lms: 'Lyrion Music Server', filesystem: 'Filesystem', tidal: 'Tidal', spotify: 'Spotify', spotify_public: 'Spotify', ytmusic: 'YouTube Music', music_assistant: 'Music Assistant', trobar: t('playlistSourceTrobar'), upload: t('playlistSourceUpload'), rule: t('playlistSourceRule')}[p.source_provider] || p.source_provider || t('unknownProvider'))">
+                  :title="playlistSourceLabel(p.source_provider)">
                   <svg viewBox="0 0 24 24" class="w-3.5 h-3.5 text-gray-400" x-html="ICONS['provider-' + p.source_provider] || ICONS['source-recent']"></svg>
                 </span>
                 <!-- #95: the golden "shared by <owner>" badge is the stronger, owner-attributed signal — suppress the weaker #72 inferred-origin icon when it's present -->
@@ -1293,7 +1324,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
               download class="font-medium underline" x-text="t('downloadPlaylistM3u8')"></a>
           </div>
           <!-- #200: review + exclude this playlist's unresolved tracks -->
-          <div x-show="unresolvedReviewFor === p.id"
+          <div x-show="unresolvedReviewFor === p.id" data-unresolved-review
             class="mb-2 border border-amber-200 rounded bg-amber-50 p-2 text-xs">
             <div class="flex items-center justify-between mb-1">
               <span class="font-medium text-amber-800" x-text="t('unresolvedTracksReviewTitle')"></span>
@@ -1357,7 +1388,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
             <div x-show="unresolvedReviewRows.some(r => !r.excluded && !r.suggested)" class="mt-2">
               <button @click="excludeUnresolvedTracks(p, unresolvedReviewRows.filter(r => !r.excluded && !r.suggested).map(r => r.id), true)"
                 :disabled="unresolvedExcludeBusy"
-                class="px-2 py-0.5 rounded bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
+                class="px-2 py-0.5 rounded border border-amber-600 text-yellow-700 hover:bg-amber-100 disabled:opacity-50"
                 x-text="t('unresolvedTracksExcludeAll')"></button>
             </div>
           </div>
@@ -1367,6 +1398,93 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       <p x-show="playlistsLoaded && playlists.length===0" class="text-sm text-gray-400 py-2" data-playlists-empty>
         {{ _("No synced playlists yet — click \"Refresh playlists\".") }}
       </p>
+    </div>
+    </div>
+    <!-- Gaps: every visible playlist's unresolved tracks, grouped by album
+         (the source's, or MusicBrainz's), with bulk exclude and a Lidarr
+         request for the ticked albums. -->
+    <div x-show="subTab('playlists')==='gaps'" data-gaps>
+      <div class="flex items-center mb-2 gap-2 flex-wrap">
+        <label class="flex items-center gap-1.5 text-xs text-gray-600"><span x-text="t('gapsOwner')"></span>
+          <select x-model="gapsFilter.owner" @change="loadGaps()" data-gaps-owner
+            class="text-xs border border-gray-300 rounded px-1 py-0.5 bg-panel">
+            <option value="*" x-text="t('gapsEveryone')"></option>
+            <template x-for="o in gaps.owners" :key="o">
+              <option :value="o" x-text="o || t('gapsNoOwner')"></option>
+            </template>
+          </select></label>
+        <label class="flex items-center gap-1.5 text-xs text-gray-600"><span x-text="t('gapsSource')"></span>
+          <select x-model="gapsFilter.source" @change="loadGaps()" data-gaps-source
+            class="text-xs border border-gray-300 rounded px-1 py-0.5 bg-panel">
+            <option value="" x-text="t('gapsAllSources')"></option>
+            <template x-for="src in gaps.sources" :key="src">
+              <option :value="src" x-text="playlistSourceLabel(src)"></option>
+            </template>
+          </select></label>
+        <label class="flex items-center gap-1.5 text-xs text-gray-600">
+          <input type="checkbox" x-model="gapsFilter.showExcluded" @change="loadGaps()" data-gaps-show-excluded>
+          <span x-text="t('gapsShowExcluded')"></span></label>
+        <span class="ml-auto text-xs text-gray-500" x-show="gaps.groups.length"
+          x-text="t('gapsTotal', {tracks: gapsTrackTotal(), playlists: gapsPlaylistTotal()})"></span>
+      </div>
+      <p class="text-xs text-gray-500 mb-3" x-text="t('gapsIntro')"></p>
+      <p x-show="gapsError" role="alert" class="text-xs text-red-600" x-text="t('gapsLoadError')"></p>
+      <p x-show="gapsNotice" role="status" class="text-xs text-gray-600 mb-2" x-text="gapsNotice"></p>
+      <p x-show="gapsLoaded && !gapsError && !gaps.groups.length" class="text-sm text-gray-500" data-gaps-empty
+        x-text="gapsFiltered() ? t('gapsEmptyFiltered') : t('gapsEmpty')"></p>
+      <div class="space-y-2">
+        <template x-for="g in gaps.groups" :key="gapKey(g)">
+          <div class="rounded border border-gray-200 px-3 py-2" data-gap-group :data-gap-album="g.album || ''">
+            <div class="flex items-start gap-2">
+              <input type="checkbox" class="mt-1" :checked="!!gapsTicked[gapKey(g)]" @change="toggleGap(g)"
+                :aria-label="g.album ? (g.artist + ' — ' + g.album) : t('gapsNoAlbum')" data-gap-tick>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="text-sm font-medium" :class="g.album ? '' : 'text-gray-600'"
+                    x-text="g.album ? (g.artist + ' — ' + g.album) : t('gapsNoAlbum')"></span>
+                  <span x-show="g.album_from === 'musicbrainz'" class="text-xs text-gray-500" x-text="t('gapsFromMusicBrainz')"></span>
+                  <span class="text-xs text-gray-500"
+                    x-text="(g.open_count === 1 ? t('gapsOneTrack') : t('gapsTracks', {n: g.open_count})) + (g.album ? '' : ' · ' + t('gapsNoAlbumHint'))"></span>
+                  <span x-show="g.lidarr" class="text-xs px-1.5 py-0.5 rounded" data-gap-lidarr
+                    :class="g.lidarr && g.lidarr.status === 'requested' ? 'bg-indigo-50 text-pill-active' : 'text-red-600'"
+                    x-text="gapLidarrText(g)"></span>
+                </div>
+                <div class="text-xs text-gray-600 mt-0.5">
+                  <template x-for="(tr, i) in g.tracks" :key="tr.id">
+                    <span><span x-show="i" aria-hidden="true"> · </span><span :class="tr.excluded ? 'line-through text-gray-500' : ''"
+                      x-text="(g.album ? tr.title : tr.artist + ' — ' + tr.title) + (tr.excluded ? ' (' + t('gapsExcludedTag') + ')' : '')"></span></span>
+                  </template>
+                </div>
+                <div class="text-xs text-gray-500 mt-0.5"><span x-text="t('gapsIn')"></span>
+                  <template x-for="(p, i) in g.playlists" :key="p.id">
+                    <span><span x-show="i" aria-hidden="true"> · </span><a href="#" class="underline" @click.prevent="openGapPlaylist(p.id)"
+                      x-text="p.title"></a><span x-show="p.owner" x-text="' (' + p.owner + (p.shared && p.owner ? ', ' + t('gapsShared') : '') + ')'"></span></span>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+      <div x-show="gapsTickedGroups().length" data-gaps-actions
+        class="sticky bottom-0 z-10 mt-3 py-2 bg-panel-b border-t border-gray-200 flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span class="text-xs text-gray-600"
+          x-text="t('gapsSelected', {albums: gapsTickedGroups().length, tracks: gapsTickedOpenIds().length})"></span>
+        <button x-show="gaps.lidarr_configured" @click="requestTickedGaps()" data-gaps-request
+          :disabled="gapsBusy || !gapsTickedGroups().some(g => g.requestable)"
+          class="text-xs px-2 py-1 rounded bg-indigo-600 text-on-primary hover:bg-indigo-700 disabled:opacity-40"
+          x-text="t('gapsRequest')"></button>
+        <button @click="excludeTickedGaps(true)" data-gaps-exclude :disabled="gapsBusy || !gapsTickedOpenIds().length"
+          class="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-40"
+          x-text="t('gapsExclude')"></button>
+        <button x-show="gapsFilter.showExcluded" @click="excludeTickedGaps(false)" data-gaps-include
+          :disabled="gapsBusy || !gapsTickedExcludedIds().length"
+          class="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-40"
+          x-text="t('gapsInclude')"></button>
+        <button @click="gapsTicked = {}" data-gaps-cancel
+          class="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+          x-text="t('gapsCancel')"></button>
+      </div>
     </div>
   </section>
 
@@ -1821,6 +1939,50 @@ SPDX-License-Identifier: AGPL-3.0-or-later
           </a>
         </div>
         <p x-show="profile.spotify_experimental_enabled && spotifyConnectError" class="text-xs text-red-600 mt-1">{{ _("Connecting to Spotify failed. Please try again.") }}</p>
+        <!-- Navidrome: only when the library source or a mirror target is a
+             Subsonic/Navidrome server. The password proves the username is
+             theirs; the server checks it once and never stores it. -->
+        <div x-show="profile.subsonic_available" class="mt-3 pt-3 border-t border-gray-100" data-subsonic-username>
+          <div class="flex flex-wrap items-center gap-2 text-sm">
+            <svg viewBox="0 0 24 24" class="w-4 h-4 text-gray-400 shrink-0" x-html="ICONS['provider-subsonic']"></svg>
+            <span>Navidrome</span>
+            <template x-if="profile.subsonic_username && !subsonicClaim.editing">
+              <span class="flex flex-wrap items-center gap-2">
+                <span :class="profile.subsonic_user_state === 'unknown' ? 'text-red-600' : 'text-green-600'"
+                  x-text="profile.subsonic_user_state === 'unknown' ? t('subsonicNoSuchUser', {name: profile.subsonic_username}) : t('subsonicUser', {name: profile.subsonic_username})"></span>
+                <button type="button" @click="subsonicClaim.editing = true"
+                  class="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50">{{ _("Change") }}</button>
+                <button type="button" @click="removeSubsonicUsername()" :disabled="subsonicClaim.busy"
+                  class="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50">{{ _("Remove") }}</button>
+              </span>
+            </template>
+          </div>
+          <p x-show="profile.subsonic_username && !subsonicClaim.editing && profile.subsonic_user_state === 'known'"
+            class="text-xs text-gray-500 mt-1" x-text="t('subsonicPlaylistsOwned', {n: profile.subsonic_playlists_owned})"></p>
+          <p x-show="profile.subsonic_username && !subsonicClaim.editing && profile.subsonic_user_state === 'unknown'"
+            class="text-xs text-gray-600 mt-1">{{ _("Check the spelling: it's the name you sign in to Navidrome with.") }}</p>
+          <form x-show="!profile.subsonic_username || subsonicClaim.editing" @submit.prevent="saveSubsonicUsername()"
+            class="mt-2">
+            <div class="flex flex-wrap items-end gap-2">
+              <div>
+                <label for="profile-subsonic-username" class="block text-xs text-gray-500 mb-1">{{ _("Your Navidrome username") }}</label>
+                <input id="profile-subsonic-username" x-model="subsonicClaim.username" autocomplete="off"
+                  class="text-sm px-2 py-1 rounded border border-gray-300 bg-panel w-40">
+              </div>
+              <div>
+                <label for="profile-subsonic-password" class="block text-xs text-gray-500 mb-1">{{ _("Your Navidrome password") }}</label>
+                <input id="profile-subsonic-password" type="password" x-model="subsonicClaim.password" autocomplete="off"
+                  class="text-sm px-2 py-1 rounded border border-gray-300 bg-panel w-40">
+              </div>
+              <button type="submit" :disabled="subsonicClaim.busy || !subsonicClaim.username.trim() || !subsonicClaim.password"
+                class="text-xs px-2 py-1 rounded bg-indigo-600 text-on-primary font-semibold hover:bg-indigo-700 disabled:opacity-50">{{ _("Save") }}</button>
+              <button type="button" x-show="subsonicClaim.editing" @click="subsonicClaim = {...subsonicClaim, editing: false, password: '', error: ''}"
+                class="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50">{{ _("Cancel") }}</button>
+            </div>
+            <p x-show="subsonicClaim.error" class="text-xs text-red-600 mt-1" role="alert" x-text="subsonicClaim.error"></p>
+            <p class="text-xs text-gray-500 mt-2">{{ _("So the playlists you keep in Navidrome sync as yours, private ones staying private, and your mirror copies go into your Navidrome account. The password proves the username is yours: it is checked once and never stored.") }}</p>
+          </form>
+        </div>
       </div>
 
       <!-- Tidal shares: hidden while the admin hasn't enabled sharing
@@ -2287,7 +2449,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
               <div x-show="unknownReviewRows.some(r => !r.adopted)" class="mt-2">
                 <button @click="adoptUnknownTracks(d, unknownReviewRows.filter(r => !r.adopted).map(r => r.path), true)"
                   :disabled="unknownAdoptBusy"
-                  class="px-2 py-0.5 rounded bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
+                  class="px-2 py-0.5 rounded border border-amber-600 text-yellow-700 hover:bg-amber-100 disabled:opacity-50"
                   x-text="t('unknownTracksAdoptAll')"></button>
               </div>
             </div>
@@ -2584,6 +2746,8 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                 <span x-show="liveCheck.subsonic?.status === 'invalid_url'" x-text="t('invalidUrlMessage')"></span>
                 <span x-show="liveCheck.subsonic?.status === 'error'" x-text="t('connectionCheckFailed')"></span>
               </p>
+              <p x-show="liveCheck.subsonic?.status === 'ok' && liveCheck.subsonic?.isAdmin === true" class="mt-1 text-xs text-green-700" data-subsonic-admin="subsonic">✓ {{ _("A Navidrome admin account: members who give their Navidrome username get their own playlists as theirs.") }}</p>
+              <p x-show="liveCheck.subsonic?.status === 'ok' && liveCheck.subsonic?.isAdmin === false" class="mt-1 text-xs text-yellow-700" data-subsonic-admin="subsonic">⚠ {{ _("Not a Navidrome admin account: only the shared library pass runs. Members' own playlists and mirror copies need an admin account here and on the mirror target.") }}</p>
               <div x-show="adminConfig.provider === 'jellyfin'" class="flex flex-wrap items-end gap-2">
                 <div>
                   <label for="cfg-jellyfin-url" class="block text-xs text-gray-500 mb-1">{{ _("Jellyfin URL") }}</label>
@@ -2804,6 +2968,42 @@ SPDX-License-Identifier: AGPL-3.0-or-later
               </label>
               <p class="text-xs text-gray-400 mt-1">{{ _("After a scan that added, changed or removed tracks, one playlist sync follows, so playlists, devices and mirrors pick up the new files without waiting for the schedule. A scan that changed nothing starts no sync.") }}</p>
             </div>
+            <div class="bg-panel-b rounded-lg border border-gray-200 p-3" data-source-health>
+              <h3 class="text-sm font-semibold text-gray-900 mb-1">{{ _("Source health") }}</h3>
+              <p class="text-xs text-gray-400" x-text="t('sourceHealthHint', {runs: sourceHealth.alert_runs, hours: sourceHealth.alert_hours})"></p>
+              <p x-show="!sourceHealth.sources.length" class="text-xs text-gray-500 mt-2">{{ _("No playlist sync has run yet.") }}</p>
+              <div x-show="sourceHealth.sources.length" class="overflow-x-auto mt-2">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="text-left text-xs text-gray-500 border-b border-gray-200">
+                      <th class="py-1 pr-3 font-medium">{{ _("Source") }}</th>
+                      <th class="py-1 pr-3 font-medium">{{ _("Account") }}</th>
+                      <th class="py-1 pr-3 font-medium">{{ _("State") }}</th>
+                      <th class="py-1 font-medium">{{ _("Details") }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="(s, i) in sourceHealth.sources" :key="i">
+                      <tr class="border-b border-gray-100" data-source-row>
+                        <td class="py-1.5 pr-3">
+                          <span class="inline-flex items-center gap-1.5">
+                            <svg viewBox="0 0 24 24" class="w-3.5 h-3.5 text-gray-400" aria-hidden="true" x-html="ICONS['provider-' + s.provider] || ICONS['source-recent']"></svg>
+                            <span x-text="sourceProviderName(s.provider)"></span>
+                          </span>
+                        </td>
+                        <td class="py-1.5 pr-3" x-text="sourceAccountText(s)"></td>
+                        <td class="py-1.5 pr-3 whitespace-nowrap">
+                          <span x-show="!s.runs" class="text-green-700">{{ _("OK") }}</span>
+                          <span x-show="s.runs" :class="s.alerting ? 'text-red-600 font-medium' : 'text-yellow-700'">{{ _("Failing") }}</span>
+                          <span x-show="s.alerting" class="ml-1 text-xs px-1.5 py-0.5 rounded-full bg-red-50 text-red-600">{{ _("alerting") }}</span>
+                        </td>
+                        <td class="py-1.5 text-xs text-gray-500" x-text="sourceDetailText(s)"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </div>
             <div class="bg-panel-b rounded-lg border border-gray-200 p-3">
               <h3 class="text-sm font-semibold text-gray-900 mb-2">{{ _("Artist images") }}</h3>
               <div>
@@ -2881,6 +3081,54 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                 <span x-show="liveCheck.music_assistant?.status === 'error'" x-text="t('connectionCheckFailed')"></span>
               </p>
               <p class="text-xs text-gray-400 mt-1">{{ _("Optional. One connection for everything Trobar does with Music Assistant: as the library source, its playlists; with another source active, its playlists added alongside; and as a mirror target. In Music Assistant, create a long-lived token and paste it here; it expires after a year. A token from an admin account lets Trobar delete the copies it mirrored when you stop mirroring; with a user account's token they are emptied instead. Clear both fields and save to disconnect.") }}</p>
+              <!-- Which member each streaming account in Music Assistant belongs
+                   to: its playlists become theirs, private to them. -->
+              <div x-show="maAccounts.accounts.length" class="mt-3" data-ma-accounts>
+                <h4 class="text-sm font-semibold text-gray-900">{{ _("Streaming accounts in Music Assistant") }}</h4>
+                <p class="text-xs text-gray-400 mt-0.5">{{ _("Playlists that come from one member's account belong to that member: private to them, and they can share each one from its row. \"Everyone\" keeps an account's playlists visible to all, as today. A playlist in more than one account stays visible to all.") }}</p>
+                <table class="w-full text-sm mt-2">
+                  <thead>
+                    <tr class="text-left text-xs text-gray-500 border-b border-gray-200">
+                      <th class="py-1 pr-3 font-medium">{{ _("Service") }}</th>
+                      <th class="py-1 pr-3 font-medium">{{ _("Account in Music Assistant") }}</th>
+                      <th class="py-1 pr-3 font-medium"><span class="sr-only">{{ _("Playlists") }}</span></th>
+                      <th class="py-1 font-medium">{{ _("Belongs to") }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="a in maAccounts.accounts" :key="a.instance_id">
+                      <tr class="border-b border-gray-100" data-ma-account>
+                        <td class="py-1.5 pr-3">
+                          <span class="inline-flex items-center gap-1.5">
+                            <svg viewBox="0 0 24 24" class="w-3.5 h-3.5 text-gray-400" aria-hidden="true" x-html="ICONS['provider-' + a.domain] || ICONS['source-recent']"></svg>
+                            <span x-text="maServiceName(a.domain)"></span>
+                          </span>
+                        </td>
+                        <td class="py-1.5 pr-3" x-text="a.name"></td>
+                        <td class="py-1.5 pr-3 text-xs text-gray-500" x-text="t('maAccountPlaylists', {n: a.playlists})"></td>
+                        <td class="py-1.5">
+                          <select class="border border-gray-300 rounded px-1 py-0.5 text-sm" :aria-label="t('maAccountBelongsTo', {account: a.name})"
+                            :value="a.owner_user_id === null ? '' : String(a.owner_user_id)"
+                            @change="chooseMaOwner(a, $event.target.value)">
+                            <option value="">{{ _("Everyone (as today)") }}</option>
+                            <template x-for="u in maAccounts.users" :key="u.id">
+                              <option :value="String(u.id)" x-text="u.username" :selected="a.owner_user_id === u.id"></option>
+                            </template>
+                          </select>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+                <div x-show="maPending" role="alert" class="mt-2 rounded border border-gray-300 bg-yellow-100 text-yellow-700 px-3 py-2 text-sm" data-ma-warning>
+                  <div class="font-semibold" x-text="maPendingHeadline()"></div>
+                  <div x-text="maPendingDetail()"></div>
+                  <div class="flex justify-end gap-2 mt-2">
+                    <button type="button" @click="cancelMaOwner()" class="text-xs px-3 py-1 rounded border border-gray-300 hover:bg-gray-50">{{ _("Cancel") }}</button>
+                    <button type="button" @click="saveMaOwner(maPending.account, maPending.owner)" class="text-xs px-3 py-1 rounded bg-metal text-on-metal hover:bg-metal-hi">{{ _("Save") }}</button>
+                  </div>
+                </div>
+              </div>
             </div>
             <div class="bg-panel-b rounded-lg border border-gray-200 p-3">
               <h3 class="text-sm font-semibold text-gray-900 mb-2">{{ _("Tidal (direct playlist provider)") }}</h3>
@@ -3019,6 +3267,8 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                   <span x-show="liveCheck.mirror_subsonic?.status === 'invalid_url'" x-text="t('invalidUrlMessage')"></span>
                   <span x-show="liveCheck.mirror_subsonic?.status === 'error'" x-text="t('connectionCheckFailed')"></span>
                 </p>
+                <p x-show="liveCheck.mirror_subsonic?.status === 'ok' && liveCheck.mirror_subsonic?.isAdmin === true" class="mt-1 text-xs text-green-700" data-subsonic-admin="mirror_subsonic">✓ {{ _("A Navidrome admin account: members who give their Navidrome username get their own playlists as theirs.") }}</p>
+                <p x-show="liveCheck.mirror_subsonic?.status === 'ok' && liveCheck.mirror_subsonic?.isAdmin === false" class="mt-1 text-xs text-yellow-700" data-subsonic-admin="mirror_subsonic">⚠ {{ _("Not a Navidrome admin account: only the shared library pass runs. Members' own playlists and mirror copies need an admin account here and on the mirror target.") }}</p>
                 <p class="mt-1 text-xs text-gray-500">{{ _("Optional — lets any user mirror a playlist to a playlist on this Subsonic/Navidrome server instead of (or alongside) the .m3u file above. Matches tracks on the target server by artist/album/title, so it works best when it indexes the same music library. Clear all three fields and save to stop mirroring to it entirely.") }}</p>
               </div>
               <!-- #189: the third sink — a Jellyfin server as a WRITE target,
@@ -3633,6 +3883,11 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                         <button x-show="line.short" type="button" @click="toggleMirrorMissing(p, line.key)"
                           :aria-expanded="line.open ? 'true' : 'false'"
                           class="text-pill-active underline min-h-[24px] px-0.5" x-text="line.open ? t('mirrorHideMissing') : t('mirrorShowMissing')"></button>
+                        <span x-show="line.overwrites" class="text-gray-600" aria-hidden="true">·</span>
+                        <span x-show="line.overwrites" class="font-medium text-gray-800" x-text="line.overwrites"></span>
+                        <button x-show="line.overwrites" type="button" @click="toggleMirrorMissing(p, line.key, 'ow')"
+                          :aria-expanded="line.owOpen ? 'true' : 'false'"
+                          class="text-pill-active underline min-h-[24px] px-0.5" x-text="line.owOpen ? t('mirrorHideMissing') : t('mirrorShowMissing')"></button>
                       </div>
                       <div x-show="line.open" class="ml-6 rounded-md border border-gray-100 bg-panel-b px-2.5 py-2 text-xs space-y-1.5">
                         <p x-show="line.history" class="text-gray-600" x-text="line.history"></p>
@@ -3663,6 +3918,35 @@ SPDX-License-Identifier: AGPL-3.0-or-later
                           </div>
                         </template>
                       </div>
+                      <div x-show="line.owOpen" class="ml-6 rounded-md border border-gray-100 bg-panel-b px-2.5 py-2 text-xs space-y-1.5" data-mirror-overwritten>
+                        <p class="text-gray-600" x-text="line.owExplain"></p>
+                        <p x-show="line.ow.loading" class="text-gray-500" x-text="t('loading')"></p>
+                        <p x-show="line.ow.failed" class="text-red-600" x-text="t('mirrorMissingFailed')"></p>
+                        <template x-if="line.ow.run">
+                          <div class="space-y-1.5">
+                            <table class="w-full text-left">
+                              <thead>
+                                <tr class="text-gray-700">
+                                  <th scope="col" class="font-semibold pr-3">{{ _("Artist") }}</th>
+                                  <th scope="col" class="font-semibold pr-3">{{ _("Title") }}</th>
+                                  <th scope="col" class="font-semibold">{{ _("What happened") }}</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <template x-for="(c, i) in line.ow.run.overwritten" :key="i">
+                                  <tr class="text-gray-900">
+                                    <td class="pr-3 align-top break-words" x-text="c.artist"></td>
+                                    <td class="pr-3 align-top break-words" x-text="c.title"></td>
+                                    <td class="align-top text-gray-600" x-text="mirrorChangeText(c)"></td>
+                                  </tr>
+                                </template>
+                              </tbody>
+                            </table>
+                            <p x-show="line.ow.run.discarded + line.ow.run.restored > line.ow.run.overwritten.length" class="text-gray-500"
+                              x-text="t('mirrorMissingCap', {shown: line.ow.run.overwritten.length, n: line.ow.run.discarded + line.ow.run.restored, max: line.ow.run.list_max})"></p>
+                          </div>
+                        </template>
+                      </div>
                       </div>
                     </template>
                   </div>
@@ -3676,6 +3960,9 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
     <div x-show="subTab('admin')==='jobs'" class="space-y-2 text-xs">
       <div x-show="jobsLoading" class="text-gray-400">{{ _("Loading…") }}</div>
+      <!-- Outside the x-if below: when the first load fails there are no jobs,
+           and the error is all there is to show. -->
+      <p x-show="jobsError" role="alert" class="text-red-600" x-text="jobsError" data-jobs-error></p>
       <template x-if="!jobsLoading && jobs">
         <div>
           <div class="flex items-center gap-3 mb-2 text-gray-500">
@@ -3685,7 +3972,6 @@ SPDX-License-Identifier: AGPL-3.0-or-later
               x-text="t('jobsFailed') + ': ' + jobs.counts.failed"></span>
             <button @click="loadJobs()" class="ml-auto text-indigo-600 hover:underline">{{ _("Refresh") }}</button>
           </div>
-          <span x-show="jobsError" class="text-red-600" x-text="jobsError"></span>
           <div class="divide-y divide-gray-100 border border-gray-200 rounded-lg">
             <template x-for="j in jobs.jobs" :key="j.id">
               <div class="px-3 py-2">
@@ -3837,6 +4123,13 @@ SPDX-License-Identifier: AGPL-3.0-or-later
               <!-- Who this user manages, or is managed by: read here, created
                    and revoked in the Delegations section. -->
               <div x-show="userDelegationLine(u)" class="text-xs text-gray-500 mt-0.5" x-text="userDelegationLine(u)"></div>
+              <!-- #225: the Navidrome user they proved on Profile. An admin
+                   can take it back; only the member can set it. -->
+              <div x-show="u.subsonic_username" class="text-xs text-gray-500 mt-0.5 flex items-center gap-2" data-user-subsonic>
+                <span x-text="t('subsonicUser', {name: u.subsonic_username})"></span>
+                <button type="button" @click="clearUserSubsonicUsername(u)"
+                  class="text-pill-active underline min-h-[24px] px-0.5">{{ _("Clear") }}</button>
+              </div>
             </div>
             <div class="flex items-center gap-1 shrink-0">
               <button x-show="u.has_local_password && (adminConfig.auth_mode !== 'oidc' || u.is_admin)"
@@ -4894,7 +5187,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       <button type="button" @click="confirmDeleteUser()"
         x-show="deleteUserModal.user && deleteUserBlockers(deleteUserModal.user).length === 0"
         :disabled="deleteUserModal.busy"
-        class="text-sm px-3 py-1 rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50">
+        class="text-sm px-3 py-1 rounded bg-red-600 text-on-primary font-semibold disabled:opacity-50">
         <span x-text="deleteUserModal.busy ? t('deleting') : t('deleteAccount')"></span>
       </button>
     </div>
@@ -4994,6 +5287,7 @@ const SECTION_TABS = {
 // Each tabbed page's sub-tabs; the first is the default.
 const SUB_TABS = {
   selections: ['albums', 'artists', 'playlists'],
+  playlists: ['list', 'gaps'],
   profile: ['prefs', 'account', 'integrations'],
   admin: ['config', 'health', 'mirrors', 'jobs', 'users'],
 };
@@ -5442,6 +5736,9 @@ function app() {
     loadingPlaylists: false,
     playlistsLoaded: false,  // the first answer is in; until then, no empty message
     playlistSubscriptions: [],
+    sourceHealth: {sources: [], alert_runs: 3, alert_hours: 12},
+    maAccounts: {accounts: [], users: []},
+    maPending: null,
     subscriptionUrl: '',
     subscriptionBusy: false,
     subscriptionError: '',
@@ -5484,6 +5781,15 @@ function app() {
     unknownAdoptBusy: false,
     // #200: review + exclude a playlist's unresolved (unmatched) tracks
     unresolvedReviewFor: null, // playlist id whose review panel is open
+    // The Gaps sub-tab: what the server answered, the filters, and which
+    // groups are ticked (by gapKey).
+    gaps: {groups: [], open_count: 0, owners: [], sources: [], lidarr_configured: false},
+    gapsFilter: {owner: '*', source: '', showExcluded: false},
+    gapsTicked: {},
+    gapsLoaded: false,
+    gapsError: false,
+    gapsBusy: false,
+    gapsNotice: '',
     // Playlists made in Trobar: the one being edited, and its tracks as
     // loaded from the server; every change writes the whole list back.
     editingPlaylistId: null,
@@ -5506,6 +5812,7 @@ function app() {
     playlistSourceFailures: [],
     newPlaylistDialog: {open: false, name: '', busy: false, created: null},
     newPlaylistPin: null,
+    playlistSort: (() => { try { return localStorage.getItem('playlistSort') || 'availability'; } catch { return 'availability'; } })(),
     unresolvedReviewRows: [],
     unresolvedReviewLoading: false,
     unresolvedReviewError: false,
@@ -5603,6 +5910,9 @@ function app() {
     ruleCountTimer: null,
     deletePlaysOpen: false,
     sendCredentials: {maloja_api_key: '', listenbrainz_token: ''},
+    // The Navidrome username form: the password is only ever held here,
+    // sent once with Save and then cleared.
+    subsonicClaim: {username: '', password: '', editing: false, busy: false, error: ''},
     devicePlaysBusy: false,
     ruleCountSeq: 0,
     shareSent: '',
@@ -5972,6 +6282,7 @@ function app() {
         return;
       }
       if (this.profile.is_admin) {
+        this.loadSourceHealth();
         await this.loadAdminConfig();
         await this.loadAdminUsers();
         await this.loadDelegations();
@@ -6017,6 +6328,108 @@ function app() {
         showApiError(e);
       }
     },
+    async loadSourceHealth() {
+      try {
+        this.sourceHealth = await api('/api/admin/source-health');
+      } catch {
+        // Leave the last answer: a failed read must not raise or hide the line.
+      }
+    },
+    // The header line's link: Administration, its Library section open, and
+    // the Source health list in view.
+    openSourceHealth() {
+      this.goToTab('admin');
+      this.setSections('config', {...this.sections.config, library: true});
+      this.$nextTick(() => document.querySelector('[data-source-health]')?.scrollIntoView({block: 'start'}));
+    },
+    alertingSources() {
+      return (this.sourceHealth.sources || []).filter((s) => s.alerting);
+    },
+    sourceProviderName(provider) {
+      return ({...PROVIDER_NAMES, tidal: 'Tidal', spotify: 'Spotify', spotify_public: 'Spotify',
+               tidal_public: 'Tidal', ytmusic: 'YouTube Music'})[provider] || provider;
+    },
+    sourceAccountText(s) {
+      if (s.kind === 'library_source') return t('sourceHealthLibrary');
+      if (s.kind === 'member_listing') return t('sourceHealthOwnListing', {user: s.account || '?'});
+      return s.account || '';
+    },
+    sourceAlertName(s) {
+      const name = this.sourceProviderName(s.provider);
+      return s.kind === 'library_source' ? name : t('sourceAccountFor', {provider: name, account: s.account || '?'});
+    },
+    sourceAlertText() {
+      const alerting = this.alertingSources();
+      if (alerting.length === 1) {
+        return t('sourceAlertOne', {source: this.sourceAlertName(alerting[0]),
+                                    since: this.localTime(alerting[0].failing_since)});
+      }
+      return t('sourceAlertMany', {n: alerting.length,
+                                   names: alerting.map((s) => this.sourceAlertName(s)).join(', ')});
+    },
+    sourceDetailText(s) {
+      if (!s.runs) return t('sourceHealthSynced', {when: this.relativeTime(s.last_success_at)});
+      const line = t('sourceHealthDetail', {n: s.runs, since: this.localTime(s.failing_since),
+                                            reason: s.reason || ''});
+      return s.alerting ? line : line + ' — ' + t('sourceHealthWillAlert',
+        {runs: this.sourceHealth.alert_runs, hours: this.sourceHealth.alert_hours});
+    },
+    async loadMaAccounts() {
+      if (!this.adminConfig.music_assistant_url) return;
+      try {
+        this.maAccounts = await api('/api/admin/music-assistant/accounts');
+      } catch {
+        this.maAccounts = {accounts: [], users: []};
+      }
+    },
+    // Giving an account to a member makes its playlists private to them:
+    // say what that does before saving. Back to everyone saves at once.
+    async chooseMaOwner(account, value) {
+      const owner = value === '' ? null : Number(value);
+      if (owner === null) return this.saveMaOwner(account, null);
+      try {
+        const preview = await api('/api/admin/music-assistant/accounts/' + encodeURIComponent(account.instance_id) + '/preview',
+          {method: 'POST', json: {owner_user_id: owner}});
+        this.maPending = {account, owner, preview};
+      } catch (e) {
+        showApiError(e);
+      }
+    },
+    cancelMaOwner() {
+      this.maPending = null;
+      // Put the menu back to what is saved.
+      this.maAccounts = {...this.maAccounts, accounts: [...this.maAccounts.accounts]};
+    },
+    async saveMaOwner(account, owner) {
+      try {
+        await api('/api/admin/music-assistant/accounts/' + encodeURIComponent(account.instance_id),
+          {method: 'PUT', json: {owner_user_id: owner}});
+      } catch (e) {
+        showApiError(e);
+      }
+      this.maPending = null;
+      await this.loadMaAccounts();
+    },
+    maServiceName(domain) {
+      return ({tidal: 'Tidal', spotify: 'Spotify', qobuz: 'Qobuz', deezer: 'Deezer', ytmusic: 'YouTube Music',
+               soundcloud: 'SoundCloud'})[domain] || domain;
+    },
+    maOwnerName(id) {
+      return ((this.maAccounts.users || []).find((u) => u.id === id) || {}).username || '?';
+    },
+    maPendingHeadline() {
+      if (!this.maPending) return '';
+      return t('maPendingHeadline', {n: this.maPending.preview.playlists, account: this.maPending.account.name,
+                                     user: this.maOwnerName(this.maPending.owner)});
+    },
+    maPendingDetail() {
+      if (!this.maPending) return '';
+      const revoked = this.maPending.preview.revoked || [];
+      const user = this.maOwnerName(this.maPending.owner);
+      if (!revoked.length) return t('maPendingNoSelections', {user});
+      const total = revoked.reduce((sum, r) => sum + r.count, 0);
+      return t('maPendingRevoked', {n: total, who: revoked.map((r) => r.username + ': ' + r.count).join(', '), user});
+    },
     async loadAdminConfig() {
       try {
         this.adminConfig = await api('/api/admin/config');
@@ -6024,6 +6437,7 @@ function app() {
       } catch (e) {
         showApiError(e);
       }
+      this.loadMaAccounts();
     },
     async loadAdminUsers() {
       try {
@@ -6446,7 +6860,8 @@ function app() {
         const data = await api('/api/admin/config/test-connection', {method: 'POST', json: {provider, ...values}});
         if (this.liveCheckGeneration[provider] !== generation) return;
         const status = data.state === 'paired' ? 'ok' : (data.state === 'invalid_url' ? 'invalid_url' : 'error');
-        this.liveCheck = {...this.liveCheck, [provider]: {status}};
+        // Subsonic says whether the account is a Navidrome admin (#225).
+        this.liveCheck = {...this.liveCheck, [provider]: {status, isAdmin: data.is_admin}};
       } catch {
         if (this.liveCheckGeneration[provider] !== generation) return;
         this.liveCheck = {...this.liveCheck, [provider]: {status: 'error'}};
@@ -6915,9 +7330,16 @@ function app() {
         const short = cov ? [cov.lacked ? t('mirrorNotOnTarget', {n: cov.lacked, sink}) : '',
           cov.refused ? t('mirrorRefusedBy', {n: cov.refused, sink}) : ''].filter(Boolean).join(', ') : '';
         const missing = this.mirrorMissing[p.id + ':' + def.key] || {};
+        // What the last write overwrote there, the folder included.
+        const ow = !failed && p.overwrites && p.overwrites[def.key];
+        const owN = ow ? ow.discarded + ow.restored : 0;
+        const owState = this.mirrorMissing[p.id + ':' + def.key + ':ow'] || {};
         return {key: def.key, name: sink, error: failed,
           coverage: cov ? t('mirrorOnTarget', {on: cov.on_target, total: cov.total, sink}) : '',
           short, open: !!(short && missing.open), missing,
+          overwrites: owN ? t('mirrorOverwritten', {n: owN}) : '', owTotal: owN,
+          owOpen: !!(owN && owState.open), ow: owState,
+          owExplain: def.key === 'filesystem' ? t('mirrorOverwrittenExplainFile') : t('mirrorOverwrittenExplain', {sink}),
           history: cov && cov.history.length > 1 ? t('mirrorRecentWrites', {list: cov.history.join(', '), sink}) : '',
           text: failed ? this.mirrorErrorText(p, def.key)
             : [cov ? '' : where, written ? t('mirrorLastWritten', {when: this.localTime(written)}) : ''].filter(Boolean).join(' · ')};
@@ -6944,8 +7366,10 @@ function app() {
     },
     // Show / Hide under a mirror line: the tracks its last write left off
     // the target, fetched when first opened.
-    async toggleMirrorMissing(p, key) {
-      const id = p.id + ':' + key;
+    // `part` 'ow' is the same for what the write overwrote: its own open
+    // state, the same route.
+    async toggleMirrorMissing(p, key, part) {
+      const id = p.id + ':' + key + (part ? ':' + part : '');
       const cur = this.mirrorMissing[id] || {};
       if (cur.open) { this.mirrorMissing = {...this.mirrorMissing, [id]: {...cur, open: false}}; return; }
       this.mirrorMissing = {...this.mirrorMissing, [id]: {...cur, open: true, loading: true, failed: false}};
@@ -6954,6 +7378,9 @@ function app() {
         run = await api(`/api/admin/mirrors/${p.id}/${key}/missing`);
       } catch { failed = true; }
       this.mirrorMissing = {...this.mirrorMissing, [id]: {...this.mirrorMissing[id], loading: false, failed, run}};
+    },
+    mirrorChangeText(c) {
+      return c.change === 'restored' ? t('mirrorChangeRestored') : t('mirrorChangeDiscarded');
     },
     mirrorMissingReason(m, sinkName) {
       return m.reason === 'refused' ? t('mirrorReasonRefused') : t('mirrorReasonNotOn', {sink: sinkName});
@@ -7680,6 +8107,9 @@ function app() {
         showApiError(e);
       }
       this.playlistsLoaded = true;
+      // The Gaps pill's count follows the list: an action that changed one
+      // can have changed the other.
+      this.loadGaps();
       await this.loadPlaylistSubscriptions();
     },
     async loadPlaylistSubscriptions() {
@@ -7859,6 +8289,37 @@ function app() {
       if (!Object.keys(typed).length) return;
       this.profile = await api('/api/profile/send-credentials', {method: 'PUT', json: typed});
       this.sendCredentials = {maloja_api_key: '', listenbrainz_token: ''};
+    },
+    async clearUserSubsonicUsername(u) {
+      if (!confirm(t('subsonicClearConfirm', {name: u.subsonic_username, user: u.username}))) return;
+      try {
+        await api(`/api/admin/users/${u.id}/subsonic-username`, {method: 'DELETE'});
+        this.adminUsers = await api('/api/admin/users');
+      } catch (e) {
+        showApiError(e);
+      }
+    },
+    async saveSubsonicUsername() {
+      const c = this.subsonicClaim;
+      if (c.busy) return;
+      this.subsonicClaim = {...c, busy: true, error: ''};
+      try {
+        this.profile = await api('/api/profile/subsonic-username', {method: 'PUT',
+          json: {username: c.username.trim(), password: c.password}});
+        this.subsonicClaim = {username: '', password: '', editing: false, busy: false, error: ''};
+      } catch (e) {
+        this.subsonicClaim = {...this.subsonicClaim, password: '', busy: false, error: e.message};
+      }
+    },
+    async removeSubsonicUsername() {
+      this.subsonicClaim = {...this.subsonicClaim, busy: true};
+      try {
+        this.profile = await api('/api/profile/subsonic-username', {method: 'PUT', json: {username: ''}});
+      } catch (e) {
+        showApiError(e);
+      } finally {
+        this.subsonicClaim = {username: '', password: '', editing: false, busy: false, error: ''};
+      }
     },
     async removeSendCredential(name) {
       try {
@@ -8210,14 +8671,14 @@ function app() {
     },
     // Only a public link makes a playlist from these providers.
     isPublicLink(p) {
-      return p.source_provider === 'ytmusic' || p.source_provider === 'spotify_public';
+      return ['ytmusic', 'spotify_public', 'tidal_public'].includes(p.source_provider);
     },
     subscriptionProviderName(sub) {
-      return {ytmusic: 'YouTube Music', spotify_public: 'Spotify'}[sub.provider] || sub.provider;
+      return {ytmusic: 'YouTube Music', spotify_public: 'Spotify', tidal_public: 'Tidal'}[sub.provider] || sub.provider;
     },
     subscriptionStateText(sub) {
       if (sub.last_error === 'unavailable') return t('subscriptionUnavailable');
-      if (sub.last_error) return t(sub.provider === 'spotify_public' ? 'subscriptionFetchFailedSpotify' : 'subscriptionFetchFailed');
+      if (sub.last_error) return t({spotify_public: 'subscriptionFetchFailedSpotify', tidal_public: 'subscriptionFetchFailedTidal'}[sub.provider] || 'subscriptionFetchFailed');
       if (sub.track_count === null || sub.track_count === undefined) return '';
       if (sub.track_count > 0 && sub.matched_count === 0) return t('subscriptionNoMatches');
       return t('subscriptionMatchCount', {matched: sub.matched_count, total: sub.track_count});
@@ -8250,6 +8711,7 @@ function app() {
         } else {
           this.loadingPlaylists = false;
           this.playlistSourceFailures = (st.last_result || {}).source_failures || [];
+          if (this.profile.is_admin) this.loadSourceHealth();
         }
       } catch (e) {
         this.loadingPlaylists = false;
@@ -8364,10 +8826,14 @@ function app() {
       const base = t('mirroredToHint', {provider});
       if (this.mirrorSinkHasError(p, sink)) return base + ' — ' + this.mirrorErrorText(p, sink);
       const cov = p.mirror_coverage && p.mirror_coverage[sink];
-      if (!cov) return base;
-      return base + ' — ' + (cov.on_target === cov.total && cov.total > 1
+      // Only the owner (or an admin) is sent this count.
+      const ow = p.mirror_overwritten && p.mirror_overwritten[sink];
+      const parts = [];
+      if (cov) parts.push(cov.on_target === cov.total && cov.total > 1
         ? t('mirrorAllOnTarget', {n: cov.total, provider})
         : t('mirrorSomeOnTarget', {on: cov.on_target, n: cov.total, provider}));
+      if (ow) parts.push(t('mirrorOverwritten', {n: ow}));
+      return parts.length ? base + ' — ' + parts.join(', ') : base;
     },
     // #494: same busy-guard shape as toggleMirror above, keyed on just the
     // playlist id (there's only ever one Lidarr-requests toggle per row,
@@ -8683,6 +9149,112 @@ function app() {
     // missed every tier) and exclude them — acknowledge as "not actually a
     // gap" so they stop being flagged. Same shape as the device
     // unknown-tracks review above.
+    playlistSourceLabel(provider) {
+      return {roon: 'Roon', subsonic: 'Subsonic', jellyfin: 'Jellyfin', emby: 'Emby', plex: 'Plex',
+        lms: 'Lyrion Music Server', filesystem: 'Filesystem', tidal: 'Tidal', spotify: 'Spotify',
+        spotify_public: 'Spotify', tidal_public: 'Tidal', ytmusic: 'YouTube Music', music_assistant: 'Music Assistant',
+        trobar: t('playlistSourceTrobar'), upload: t('playlistSourceUpload'),
+        rule: t('playlistSourceRule')}[provider] || provider || t('unknownProvider');
+    },
+    // The Gaps sub-tab. One group per album, or one for every track with
+    // none; a group is ticked as a whole.
+    gapKey(g) {
+      return g.album === null ? '\u0000none' : (g.artist + '\u0000' + g.album).toLowerCase();
+    },
+    gapsFiltered() {
+      return this.gapsFilter.owner !== '*' || !!this.gapsFilter.source;
+    },
+    async loadGaps() {
+      const q = new URLSearchParams();
+      if (this.gapsFilter.owner !== '*') q.set('owner', this.gapsFilter.owner);
+      if (this.gapsFilter.source) q.set('source', this.gapsFilter.source);
+      if (this.gapsFilter.showExcluded) q.set('show_excluded', '1');
+      try {
+        this.gaps = await api('/api/provider/playlists/gaps' + (q.toString() ? '?' + q : ''));
+        this.gapsError = false;
+        // A ticked group that is no longer listed is no longer ticked.
+        const keys = new Set(this.gaps.groups.map(g => this.gapKey(g)));
+        this.gapsTicked = Object.fromEntries(Object.entries(this.gapsTicked).filter(([k]) => keys.has(k)));
+      } catch {
+        this.gapsError = true;
+      } finally {
+        this.gapsLoaded = true;
+      }
+    },
+    toggleGap(g) {
+      const k = this.gapKey(g);
+      const next = {...this.gapsTicked};
+      if (next[k]) delete next[k]; else next[k] = true;
+      this.gapsTicked = next;
+    },
+    gapsTickedGroups() {
+      return this.gaps.groups.filter(g => this.gapsTicked[this.gapKey(g)]);
+    },
+    gapsTickedOpenIds() {
+      return this.gapsTickedGroups().flatMap(g => g.tracks.filter(tr => !tr.excluded).map(tr => tr.id));
+    },
+    gapsTickedExcludedIds() {
+      return this.gapsTickedGroups().flatMap(g => g.tracks.filter(tr => tr.excluded).map(tr => tr.id));
+    },
+    gapsTrackTotal() {
+      return this.gaps.groups.reduce((n, g) => n + g.open_count, 0);
+    },
+    gapsPlaylistTotal() {
+      return new Set(this.gaps.groups.flatMap(g => g.playlists.map(p => p.id))).size;
+    },
+    gapLidarrText(g) {
+      const l = g.lidarr;
+      if (!l) return '';
+      if (l.status === 'requested') return t('gapsRequested', {when: this.localTime(l.at)});
+      if (l.status === 'failed' && l.error === 'no_artist_match') return t('gapsNoSuchArtist');
+      return (l.status === 'partial' ? t('lidarrRequestErrorPartial') : t('lidarrRequestErrorFailed'))
+        + ' ' + (l.error || '');
+    },
+    async excludeTickedGaps(excluded) {
+      const ids = excluded ? this.gapsTickedOpenIds() : this.gapsTickedExcludedIds();
+      if (this.gapsBusy || !ids.length) return;
+      this.gapsBusy = true;
+      this.gapsNotice = '';
+      try {
+        await api('/api/provider/playlists/gaps/exclude', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ids, excluded})});
+        this.gapsTicked = {};
+        await this.loadGaps();
+        // The list's per-playlist counts changed too.
+        this.loadPlaylists();
+      } catch {
+        this.gapsNotice = t('gapsActionError');
+      } finally {
+        this.gapsBusy = false;
+      }
+    },
+    async requestTickedGaps() {
+      const albums = this.gapsTickedGroups().filter(g => g.requestable)
+        .map(g => ({artist: g.artist, album: g.album}));
+      if (this.gapsBusy || !albums.length) return;
+      this.gapsBusy = true;
+      this.gapsNotice = '';
+      try {
+        const out = await api('/api/provider/playlists/gaps/request', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({albums})});
+        this.gapsTicked = {};
+        this.gapsNotice = out.albums ? t('gapsRequestQueued', {n: out.albums}) : t('gapsRequestNothing');
+      } catch {
+        this.gapsNotice = t('gapsActionError');
+      } finally {
+        this.gapsBusy = false;
+      }
+    },
+    // A playlist named in a gap: its own review, in the list.
+    async openGapPlaylist(id) {
+      const p = this.playlists.find(x => x.id === id);
+      if (!p) return;
+      this.setSubTab('playlists', 'list');
+      if (this.unresolvedReviewFor !== id) await this.toggleUnresolvedReview(p);
+      this.$nextTick(() => document.querySelector(`[data-playlist-id="${id}"]`)?.scrollIntoView({block: 'start'}));
+    },
     async toggleUnresolvedReview(playlist) {
       if (this.unresolvedReviewFor === playlist.id) { this.unresolvedReviewFor = null; return; }
       this.unresolvedReviewFor = playlist.id;
@@ -8889,7 +9461,7 @@ function app() {
       try {
         this.jobs = await api('/api/admin/jobs');
       } catch {
-        this.jobsError = this.t('jobsError');
+        this.jobsError = t('jobsError');
       } finally {
         this.jobsLoading = false;
       }
@@ -8902,12 +9474,12 @@ function app() {
           await api(`/api/admin/jobs/${id}/retry`, {method: 'POST'});
         } catch (e) {
           if (!(e instanceof ApiError)) throw e;
-          this.jobsError = e.serverMessage || this.t('jobsError');
+          this.jobsError = e.serverMessage || t('jobsError');
           return;
         }
         await this.loadJobs();
       } catch {
-        this.jobsError = this.t('jobsError');
+        this.jobsError = t('jobsError');
       } finally {
         this.jobBusy = null;
       }
@@ -8924,12 +9496,12 @@ function app() {
           stopping = (await api(`/api/admin/jobs/${id}`, {method: 'DELETE'})).status === 'cancelling';
         } catch (e) {
           if (!(e instanceof ApiError)) throw e;
-          this.jobsError = e.serverMessage || this.t('jobsError');
+          this.jobsError = e.serverMessage || t('jobsError');
           return;
         }
         await this.loadJobs();
       } catch {
-        this.jobsError = this.t('jobsError');
+        this.jobsError = t('jobsError');
       } finally {
         this.jobBusy = null;
       }
@@ -9604,8 +10176,19 @@ function app() {
       if (!key) return detail || '';
       return t(key) + (detail ? ' ' + detail : '');
     },
+    savePlaylistSort() {
+      try { localStorage.setItem('playlistSort', this.playlistSort); } catch { /* private mode: this visit only */ }
+    },
     sortedPlaylists() {
-      const sorted = [...this.playlists].sort((a, b) => this.availabilityPct(b) - this.availabilityPct(a));
+      const byName = (a, b) => (a.title || '').localeCompare(b.title || '', undefined, {sensitivity: 'base'});
+      const keys = {
+        availability: (a, b) => this.availabilityPct(b) - this.availabilityPct(a),
+        tracks: (a, b) => (b.track_count || 0) - (a.track_count || 0),
+        newest: (a, b) => b.id - a.id,
+        name: byName,
+      };
+      const key = keys[this.playlistSort] || keys.availability;
+      const sorted = [...this.playlists].sort((a, b) => key(a, b) || byName(a, b));
       // #411: matched_count === 0, not a percentage threshold — zero is the
       // unambiguous "nothing to act on here" case; a 200-track playlist
       // with 5 matches is arguably still worth seeing.

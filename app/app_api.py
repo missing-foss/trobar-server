@@ -427,9 +427,10 @@ def api_app_library_stats():
 @bp.route("/api/app/suggestions")
 def api_app_suggestions():
     with db.connection() as conn:
-        _, user_id, _ = _authenticated_app_user(conn)
+        device, user_id, _ = _authenticated_app_user(conn)
         period = _validated_period(request.args.get("period", "6month"))
-        items, sources = _suggestions_for(conn, user_id, period)
+        # Level 7: what is already on the phone asking is not a suggestion for it.
+        items, sources = _suggestions_for(conn, user_id, period, {device["id"]})
         return jsonify({"configured": _scrobble_configured(conn, user_id),
                         "items": items, "sources": sources})
 
@@ -448,15 +449,17 @@ def api_app_most_played():
 @bp.route("/api/app/library/recently-added")
 def api_app_library_recently_added():
     with db.connection() as conn:
-        _, user_id, _ = _authenticated_app_user(conn)
-        return jsonify(_recently_added_for(conn, user_id, request.args.get("months", 3, type=int)))
+        device, user_id, _ = _authenticated_app_user(conn)
+        return jsonify(_recently_added_for(
+            conn, user_id, request.args.get("months", 3, type=int), {device["id"]}))
 
 
 @bp.route("/api/app/library/recently-released")
 def api_app_library_recently_released():
     with db.connection() as conn:
-        _, user_id, _ = _authenticated_app_user(conn)
-        return jsonify(_recently_released_for(conn, user_id, request.args.get("months", 3, type=int)))
+        device, user_id, _ = _authenticated_app_user(conn)
+        return jsonify(_recently_released_for(
+            conn, user_id, request.args.get("months", 3, type=int), {device["id"]}))
 
 
 @bp.route("/api/app/profile")

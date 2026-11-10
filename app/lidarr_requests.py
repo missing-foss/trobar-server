@@ -34,6 +34,8 @@ request or a sync: each album is a Lidarr round trip, and a playlist can
 have dozens. The loop holds no write transaction across those calls; each
 album's outcome is written and committed on its own, after its call."""
 
+import hashlib
+
 import db
 import jobs
 import lidarr_client
@@ -178,34 +180,9 @@ def run_for_playlist(conn, playlist_id: int, report=None) -> None:
         (playlist_id,),
     ).fetchall()
 
-    attempted = 0
-    requested_count = 0
-    last_error: str | None = None
-    last_error_code: str | None = None
-    cancelled: jobs.JobCancelled | None = None
-    for done, entry in enumerate(eligible):
-        # Each album's outcome is committed before the next one starts, so the
-        # top of the loop is a safe point to stop at. A cancel still records
-        # the run below, for the albums it did ask for, before it ends the job.
-        if report is not None:
-            try:
-                report(done, len(eligible))
-            except jobs.JobCancelled as exc:
-                cancelled = exc
-                break
-        artist, album = entry["artist"], entry["album"]
-        if _already_attempted(conn, artist, album):
-            continue
-        status, error, lidarr_artist_id, lidarr_album_id = _attempt_one(artist, album)
-        attempted += 1
-        if not (status == "failed" and error in TRANSIENT_REASONS):
-            with db.write(conn):
-                _record_outcome(conn, artist, album, status, lidarr_artist_id, lidarr_album_id, error)
-        if status == "requested":
-            requested_count += 1
-        else:
-            last_error_code = status  # 'partial' or 'failed'
-            last_error = error
+    run = _request_albums(conn, [(e["artist"], e["album"]) for e in eligible], report)
+    attempted, requested_count = run.attempted, run.requested
+    last_error, last_error_code = run.last_error, run.last_error_code
 
     with db.write(conn):
         if attempted:
@@ -220,15 +197,77 @@ def run_for_playlist(conn, playlist_id: int, report=None) -> None:
                 "UPDATE playlists SET lidarr_request_last_run_at = datetime('now') WHERE id = ?",
                 (playlist_id,),
             )
-    if cancelled is not None:
-        raise cancelled
+    if run.cancelled is not None:
+        raise run.cancelled
+
+
+class _Run:
+    """What one pass over a list of albums did."""
+
+    def __init__(self) -> None:
+        self.attempted = 0
+        self.requested = 0
+        self.last_error: str | None = None
+        self.last_error_code: str | None = None
+        self.cancelled: jobs.JobCancelled | None = None
+
+
+def _request_albums(conn, albums: list[tuple[str, str]], report=None) -> _Run:
+    """Asks Lidarr for each (artist, album) not already attempted, recording
+    each outcome as it comes. Shared by a playlist's run and a run for
+    albums chosen by hand, so both keep to the same dedupe. A cancel stops
+    the loop and is returned in `cancelled`, not raised: the caller records
+    the run first."""
+    run = _Run()
+    for done, (artist, album) in enumerate(albums):
+        # Each album's outcome is committed before the next one starts, so the
+        # top of the loop is a safe point to stop at.
+        if report is not None:
+            try:
+                report(done, len(albums))
+            except jobs.JobCancelled as exc:
+                run.cancelled = exc
+                break
+        if _already_attempted(conn, artist, album):
+            continue
+        status, error, lidarr_artist_id, lidarr_album_id = _attempt_one(artist, album)
+        run.attempted += 1
+        if not (status == "failed" and error in TRANSIENT_REASONS):
+            with db.write(conn):
+                _record_outcome(conn, artist, album, status, lidarr_artist_id, lidarr_album_id, error)
+        if status == "requested":
+            run.requested += 1
+        else:
+            run.last_error_code = status  # 'partial' or 'failed'
+            run.last_error = error
+    return run
+
+
+def run_for_albums(conn, albums: list[tuple[str, str]], report=None) -> dict:
+    """Requests the given (artist, album) pairs, chosen by hand rather than
+    taken from one playlist: the Gaps view's "Request from Lidarr". Same
+    dedupe as a playlist's run: a pair attempted before, from anywhere, is
+    skipped. No-op when Lidarr isn't set up. Records nothing on any
+    playlist, since no single playlist asked. Returns what it did."""
+    if db.get_lidarr_config() is None:
+        return {"status": "unset_target", "attempted": 0, "requested": 0}
+    run = _request_albums(conn, albums, report)
+    if run.cancelled is not None:
+        raise run.cancelled
+    return {"status": "ok", "attempted": run.attempted, "requested": run.requested,
+            "last_error": run.last_error}
 
 
 def run_job(payload: dict | None = None, report=None) -> dict:
-    """Job handler: one playlist's requests, on a connection of its own."""
-    playlist_id = int((payload or {}).get("playlist_id", 0))
+    """Job handler, on a connection of its own: one playlist's requests, or
+    a list of albums chosen by hand ({"albums": [[artist, album], ...]})."""
+    payload = payload or {}
     conn = db.get_conn()
     try:
+        if "albums" in payload:
+            albums = [(str(a), str(b)) for a, b in payload["albums"]]
+            return run_for_albums(conn, albums, report)
+        playlist_id = int(payload.get("playlist_id", 0))
         run_for_playlist(conn, playlist_id, report)
     finally:
         conn.close()
@@ -246,4 +285,16 @@ def enqueue(conn, playlist_id: int) -> bool:
         return False
     jobs.enqueue(conn, JOB_TYPE, {"playlist_id": playlist_id},
                  dedupe_key=f"{JOB_TYPE}:{playlist_id}")
+    return True
+
+
+def enqueue_albums(conn, albums: list[tuple[str, str]]) -> bool:
+    """Queues a run for albums chosen by hand. False, and nothing queued,
+    when the list is empty or Lidarr isn't set up. The same list already
+    pending isn't queued twice. Commits, as jobs.enqueue does."""
+    if not albums or db.get_lidarr_config() is None:
+        return False
+    key = "|".join(sorted(f"{matching.normalize(a)}\x1f{matching.normalize(b)}" for a, b in albums))
+    jobs.enqueue(conn, JOB_TYPE, {"albums": [list(p) for p in albums]},
+                 dedupe_key=f"{JOB_TYPE}:albums:{hashlib.sha256(key.encode()).hexdigest()[:16]}")
     return True

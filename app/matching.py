@@ -51,7 +51,8 @@ def _register_fold(conn: sqlite3.Connection) -> None:
     conn.create_function("pynorm", 1, normalize, deterministic=True)
 
 
-_TRAILING_ANNOTATION = re.compile(r"\s*[\(\[][^)\]]*[\)\]]\s*$")
+_OPENERS = "(["
+_CLOSERS = ")]"
 
 
 def _strip_annotations(title: str) -> str:
@@ -61,13 +62,34 @@ def _strip_annotations(title: str) -> str:
     the single biggest remaining cause of misses after fixing the
     credits-list artist issue — exact title match fails, and even fuzzy
     matching (0.88 cutoff) scores ~0.58 against the same song with a bare
-    title. Applied repeatedly in case of multiple trailing annotations."""
-    prev = title
+    title. Applied repeatedly in case of multiple trailing annotations.
+
+    One backward scan, linear in the title's length: titles come from
+    playlist providers and tags, so their length is not ours to bound. An
+    annotation is an opener, then anything but a closer, then a closer, then
+    only whitespace; an opener and a closer need not be a pair, and an
+    annotation may hold more openers ("(a (b)" goes whole), as the regular
+    expression this replaced had it (test_matching keeps that expression,
+    to check the scan against it)."""
+    end = len(title)
     while True:
-        stripped = _TRAILING_ANNOTATION.sub("", prev).strip()
-        if stripped == prev:
-            return prev
-        prev = stripped
+        close = end
+        while close > 0 and title[close - 1].isspace():
+            close -= 1
+        if close == 0 or title[close - 1] not in _CLOSERS:
+            break
+        # The annotation's body runs back to the previous closer; it opens
+        # at the first opener after that one.
+        body_start = close - 1
+        while body_start > 0 and title[body_start - 1] not in _CLOSERS:
+            body_start -= 1
+        opener = next((i for i in range(body_start, close - 1) if title[i] in _OPENERS), None)
+        if opener is None:
+            break
+        end = opener
+        while end > 0 and title[end - 1].isspace():
+            end -= 1
+    return title[:end].strip()
 
 
 def _artist_candidates(artist: str) -> list[str]:

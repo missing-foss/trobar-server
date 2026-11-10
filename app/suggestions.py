@@ -71,9 +71,8 @@ def recently_added(conn: sqlite3.Connection, user_device_ids: set[int] | None = 
     covered = covered_devices(conn, library)
     rows = conn.execute(
         "SELECT artist, album, MIN(scanned_at) AS added_at FROM tracks "
-        "WHERE deleted_at IS NULL GROUP BY artist, album ORDER BY added_at DESC LIMIT ?",
-        (limit * 3,),  # overfetch — some will drop out via the coverage filter below
-    ).fetchall()
+        "WHERE deleted_at IS NULL GROUP BY artist, album ORDER BY added_at DESC",
+    )  # read until `limit` survive the coverage filter, so a filter never shrinks the list
     out = []
     for row in rows:
         key = (row["artist"].lower(), row["album"].lower())
@@ -107,9 +106,9 @@ def recently_added_widget(conn: sqlite3.Connection, since: str,
     rows = conn.execute(
         "SELECT artist, album, MIN(scanned_at) AS added_at FROM tracks "
         "WHERE deleted_at IS NULL GROUP BY artist, album HAVING added_at >= ? "
-        "ORDER BY added_at DESC LIMIT ?",
-        (since, limit * 3),  # overfetch — some will drop out via the coverage filter below
-    ).fetchall()
+        "ORDER BY added_at DESC",
+        (since,),
+    )  # read until `limit` survive the coverage filter, so a filter never shrinks the list
     out = []
     for row in rows:
         key = (row["artist"].lower(), row["album"].lower())
@@ -142,9 +141,9 @@ def recently_released_widget(conn: sqlite3.Connection, since: str,
         "SELECT artist, album, MAX(release_date) AS released_at FROM tracks "
         "WHERE deleted_at IS NULL AND release_date IS NOT NULL "
         "GROUP BY artist, album HAVING released_at >= ? "
-        "ORDER BY released_at DESC LIMIT ?",
-        (since, limit * 3),
-    ).fetchall()
+        "ORDER BY released_at DESC",
+        (since,),
+    )  # read until `limit` survive the coverage filter
     out = []
     for row in rows:
         key = (row["artist"].lower(), row["album"].lower())

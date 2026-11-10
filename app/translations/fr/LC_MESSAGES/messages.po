@@ -1912,6 +1912,30 @@ msgstr "{shown} sur {n} affichés : chaque écriture conserve les {max} premiers
 msgid "The list could not be loaded."
 msgstr "La liste n'a pas pu être chargée."
 
+#, python-brace-format
+msgid "{n} edit overwritten"
+msgstr "{n} modification écrasée"
+
+#, python-brace-format
+msgid "{n} edits overwritten"
+msgstr "{n} modifications écrasées"
+
+#, python-brace-format
+msgid "Changed in {sink} since Trobar last wrote this copy, and undone by this write. Trobar's playlist is the source: edit it there to keep a change."
+msgstr "Modifié dans {sink} depuis la dernière écriture de cette copie par Trobar, et annulé par cette écriture. La playlist de Trobar fait foi : modifiez-la pour garder un changement."
+
+msgid "Changed in the .m3u file since Trobar last wrote it, and undone by this write. Trobar's playlist is the source: edit it there to keep a change."
+msgstr "Modifié dans le fichier .m3u depuis sa dernière écriture par Trobar, et annulé par cette écriture. La playlist de Trobar fait foi : modifiez-la pour garder un changement."
+
+msgid "Added there, removed"
+msgstr "Ajouté là-bas, retiré"
+
+msgid "Removed there, put back"
+msgstr "Retiré là-bas, remis"
+
+msgid "What happened"
+msgstr "Ce qui s'est passé"
+
 #: main.py:1703
 #, python-brace-format
 msgid "{n} playlist short on a target"
@@ -2358,6 +2382,90 @@ msgstr ""
 #: main.py:1857
 msgid "Failed to request an album from Lidarr:"
 msgstr "Échec de la demande d'un album à Lidarr :"
+
+msgid "Gaps"
+msgstr "Manques"
+
+msgid "Tracks in the playlists you can see that don't match anything in your library, grouped by album. Exclude one to stop flagging it: it doesn't change what syncs to a device."
+msgstr "Les titres des playlists que vous voyez qui ne correspondent à rien dans votre bibliothèque, regroupés par album. Excluez-en un pour ne plus le signaler : cela ne change pas ce qui se synchronise sur un appareil."
+
+msgid "{tracks} tracks in {playlists} playlists"
+msgstr "{tracks} titres dans {playlists} playlists"
+
+msgid "Nothing missing: every track in the playlists you can see is in your library, or excluded."
+msgstr "Rien ne manque : chaque titre des playlists que vous voyez est dans votre bibliothèque, ou exclu."
+
+msgid "No gaps match these filters."
+msgstr "Aucun manque ne correspond à ces filtres."
+
+msgid "Couldn't load the gaps."
+msgstr "Impossible de charger les manques."
+
+msgid "Owner"
+msgstr "Propriétaire"
+
+msgid "Everyone"
+msgstr "Tout le monde"
+
+msgid "No owner"
+msgstr "Sans propriétaire"
+
+msgid "All sources"
+msgstr "Toutes les sources"
+
+msgid "Show excluded"
+msgstr "Afficher les exclus"
+
+msgid "(from MusicBrainz)"
+msgstr "(d'après MusicBrainz)"
+
+msgid "1 track"
+msgstr "1 titre"
+
+msgid "No album known"
+msgstr "Album inconnu"
+
+msgid "can be excluded, not requested"
+msgstr "peut être exclu, pas demandé"
+
+msgid "In"
+msgstr "Dans"
+
+msgid "shared"
+msgstr "partagée"
+
+msgid "excluded"
+msgstr "exclu"
+
+msgid "{albums} albums selected ({tracks} tracks)"
+msgstr "{albums} albums sélectionnés ({tracks} titres)"
+
+msgid "Request from Lidarr"
+msgstr "Demander à Lidarr"
+
+msgid "Include again"
+msgstr "Inclure à nouveau"
+
+msgid "Requested from Lidarr, {when}"
+msgstr "Demandé à Lidarr, {when}"
+
+msgid "Lidarr found no such artist"
+msgstr "Lidarr ne connaît pas cet artiste"
+
+msgid "Asked Lidarr for {n} albums. Each one shows here once Lidarr has answered."
+msgstr "{n} albums demandés à Lidarr. Chacun s'affiche ici une fois que Lidarr a répondu."
+
+msgid "Nothing was asked: none of those albums is an open gap any more."
+msgstr "Rien n'a été demandé : aucun de ces albums n'est plus un manque."
+
+msgid "That didn't work. Try again."
+msgstr "Cela n'a pas fonctionné. Réessayez."
+
+msgid "Lidarr isn't set up."
+msgstr "Lidarr n'est pas configuré."
+
+msgid "albums must be a list of {artist, album}."
+msgstr "albums doit être une liste de {artist, album}."
 
 #: main.py:1859
 msgid "Running"
@@ -3218,15 +3326,8 @@ msgstr ""
 
 #: main.py:2052
 #, python-brace-format
-msgid ""
-"Re-pair \"{name}\" with a fresh app install? The app keeps this device's "
-"music, settings and history. Whatever is currently paired stops working "
-"and must be re-paired too."
-msgstr ""
-"Réappairer \"{name}\" avec une nouvelle installation de l'application ? "
-"L'application conserve la musique, les réglages et l'historique de cet "
-"appareil. Ce qui est actuellement pairé cessera de fonctionner et devra "
-"être réappairé aussi."
+msgid "Re-pair \"{name}\" with a fresh app install? The app keeps this device's music, settings and history. Whatever is paired now keeps working until the new app uses the code, within the 20 minutes before it expires; from then on, only the new app can sync."
+msgstr "Réappairer \"{name}\" avec une nouvelle installation de l'application ? L'application conserve la musique, les réglages et l'historique de cet appareil. Ce qui est appairé maintenant continue de fonctionner jusqu'à ce que la nouvelle application utilise le code, dans les 20 minutes avant qu'il n'expire ; à partir de là, seule la nouvelle application peut se synchroniser."
 
 #: main.py:2053
 #, python-brace-format
@@ -3616,13 +3717,8 @@ msgid "Unauthorized access to this playlist subscription"
 msgstr "Accès non autorisé à cet abonnement"
 
 #: main.py:3131
-msgid ""
-"That doesn't look like a YouTube Music or Spotify playlist link. Copy the"
-" playlist's Share link, or the address bar while it's open."
-msgstr ""
-"Ce lien ne ressemble pas à celui d'une playlist YouTube Music ou Spotify."
-" Copiez le lien de partage de la playlist, ou la barre d'adresse pendant "
-"qu'elle est ouverte."
+msgid "That doesn't look like a YouTube Music, Spotify or Tidal playlist link. Copy the playlist's Share link, or the address bar while it's open."
+msgstr "Ce lien ne ressemble pas à celui d'une playlist YouTube Music, Spotify ou Tidal. Copiez le lien de partage de la playlist, ou la barre d'adresse pendant qu'elle est ouverte."
 
 #: main.py:3277 main.py:5576
 msgid "No file received."
@@ -4319,6 +4415,26 @@ msgstr "Figure aussi sur"
 msgid "by"
 msgstr "par"
 
+#: templates/index.html
+msgid "Sort"
+msgstr "Trier"
+
+#: templates/index.html
+msgid "Availability"
+msgstr "Disponibilité"
+
+#: templates/index.html
+msgid "Most tracks"
+msgstr "Plus de titres"
+
+#: templates/index.html
+msgid "Newest in Trobar"
+msgstr "Plus récentes dans Trobar"
+
+#: templates/index.html
+msgid "Name (A–Z)"
+msgstr "Nom (A–Z)"
+
 #: templates/index.html:895
 msgid "Hide playlists with no local tracks"
 msgstr "Masquer les playlists sans piste locale"
@@ -4340,16 +4456,8 @@ msgid "Add"
 msgstr "Ajouter"
 
 #: templates/index.html:947
-msgid ""
-"Public YouTube Music and Spotify playlists only — no account and no sign-"
-"in. Trobar reads the playlist and matches its tracks against your own "
-"library; nothing is sent to either service and nothing is downloaded from"
-" it."
-msgstr ""
-"Playlists YouTube Music et Spotify publiques uniquement — sans compte ni "
-"connexion. Trobar lit la playlist et associe ses titres à votre propre "
-"bibliothèque ; rien n'est envoyé à l'un ou l'autre service et rien n'en "
-"est téléchargé."
+msgid "Public YouTube Music, Spotify and Tidal playlists only — no account and no sign-in. Trobar reads the playlist and matches its tracks against your own library; nothing is sent to these services and nothing is downloaded from them."
+msgstr "Playlists YouTube Music, Spotify et Tidal publiques uniquement — sans compte ni connexion. Trobar lit la playlist et associe ses titres à votre propre bibliothèque ; rien n'est envoyé à ces services et rien n'en est téléchargé."
 
 #: templates/index.html:1228 templates/index.html:1948
 #: templates/index.html:1984 templates/index.html:3896
@@ -6538,3 +6646,217 @@ msgstr "Créez un compte d'API sur last.fm/api. Les membres pourront alors conne
 #: app/templates/index.html
 msgid "Last.fm wasn't connected. Try again."
 msgstr "Last.fm n'a pas été connecté. Réessayez."
+
+#: templates/index.html
+msgid "since {since} · {n} runs · {reason}"
+msgstr "depuis {since} · {n} passages · {reason}"
+
+#: templates/index.html
+msgid "since {since} · {n} run · {reason}"
+msgstr "depuis {since} · {n} passage · {reason}"
+
+#: templates/index.html
+msgid "Every place a playlist sync reads from, and how its runs have gone. A source that fails {runs} runs in a row, for at least {hours} hours, shows in the header for admins until it recovers."
+msgstr "Chaque endroit où la synchronisation des playlists lit, et comment ses passages se sont déroulés. Une source qui échoue {runs} passages de suite, pendant au moins {hours} heures, s'affiche dans l'en-tête pour les administrateurs jusqu'à ce qu'elle se rétablisse."
+
+#: templates/index.html
+msgid "synced {when}"
+msgstr "synchronisée {when}"
+
+#: templates/index.html
+msgid "Source health"
+msgstr "État des sources"
+
+#: templates/index.html
+msgid "{provider} for {account}"
+msgstr "{provider} pour {account}"
+
+#: templates/index.html
+msgid "{user} (own listing)"
+msgstr "{user} (sa propre liste)"
+
+#: templates/index.html
+msgid "{n} playlist sources are failing: {names}"
+msgstr "{n} sources de playlists échouent : {names}"
+
+#: templates/index.html
+msgid "{n} playlist source is failing: {names}"
+msgstr "{n} source de playlists échoue : {names}"
+
+#: templates/index.html
+msgid "alerting"
+msgstr "en alerte"
+
+#: templates/index.html
+msgid "Details"
+msgstr "Détails"
+
+#: templates/index.html
+msgid "alerts after {runs} runs and {hours} hours"
+msgstr "alerte après {runs} passages et {hours} heures"
+
+#: templates/index.html
+msgid "Failing"
+msgstr "En échec"
+
+#: templates/index.html
+msgid "Account"
+msgstr "Compte"
+
+#: templates/index.html
+msgid "OK"
+msgstr "OK"
+
+#: templates/index.html
+msgid "{source} has failed since {since}"
+msgstr "{source} échoue depuis {since}"
+
+#: templates/index.html
+msgid "Source"
+msgstr "Source"
+
+#: templates/index.html
+msgid "see Administration"
+msgstr "voir l'administration"
+
+#: templates/index.html
+msgid "State"
+msgstr "État"
+
+#: templates/index.html
+msgid "No playlist sync has run yet."
+msgstr "Aucune synchronisation des playlists n'a encore eu lieu."
+
+#: templates/index.html
+msgid "Unknown user."
+msgstr "Utilisateur inconnu."
+
+#: admin.py
+msgid "Say who the account belongs to: a member, or null for everyone."
+msgstr "Indiquez à qui appartient le compte : un membre, ou null pour tout le monde."
+
+#: templates/index.html
+msgid "{account} → {user}: {n} playlists become private to {user}."
+msgstr "{account} → {user} : {n} playlists deviennent privées pour {user}."
+
+#: templates/index.html
+msgid "{account} → {user}: {n} playlist becomes private to {user}."
+msgstr "{account} → {user} : {n} playlist devient privée pour {user}."
+
+#: templates/index.html
+msgid "Belongs to"
+msgstr "Appartient à"
+
+#: templates/index.html
+msgid "Service"
+msgstr "Service"
+
+#: templates/index.html
+msgid "No other member has them on a device. {user} can share any of them again from its row."
+msgstr "Aucun autre membre ne les a sur un appareil. {user} peut partager à nouveau chacune depuis sa ligne."
+
+#: templates/index.html
+msgid "{n} device selections by other members ({who}) are removed at the next sync, as when an owner stops sharing. {user} can share any of them again from its row."
+msgstr "{n} sélections d'autres membres sur leurs appareils ({who}) sont retirées à la prochaine synchronisation, comme quand un propriétaire arrête de partager. {user} peut partager à nouveau chacune depuis sa ligne."
+
+#: templates/index.html
+msgid "{n} device selection by other members ({who}) is removed at the next sync, as when an owner stops sharing. {user} can share any of them again from its row."
+msgstr "{n} sélection d'autres membres sur leurs appareils ({who}) est retirée à la prochaine synchronisation, comme quand un propriétaire arrête de partager. {user} peut partager à nouveau chacune depuis sa ligne."
+
+#: templates/index.html
+msgid "Account in Music Assistant"
+msgstr "Compte dans Music Assistant"
+
+#: templates/index.html
+msgid "Streaming accounts in Music Assistant"
+msgstr "Comptes de streaming dans Music Assistant"
+
+#: templates/index.html
+msgid "Playlists that come from one member's account belong to that member: private to them, and they can share each one from its row. \"Everyone\" keeps an account's playlists visible to all, as today. A playlist in more than one account stays visible to all."
+msgstr "Les playlists qui viennent du compte d'un seul membre lui appartiennent : privées pour lui, et il peut partager chacune depuis sa ligne. « Tout le monde » garde les playlists d'un compte visibles par tous, comme aujourd'hui. Une playlist présente dans plusieurs comptes reste visible par tous."
+
+#: templates/index.html
+msgid "Who {account} belongs to"
+msgstr "À qui appartient {account}"
+
+#: templates/index.html
+msgid "Everyone (as today)"
+msgstr "Tout le monde (comme aujourd'hui)"
+
+msgid "Tidal links need the server's Tidal app to be set up first: an admin enters its client ID and secret under Admin, Tidal."
+msgstr "Les liens Tidal demandent d'abord que l'application Tidal du serveur soit configurée : un administrateur saisit son identifiant client et son secret dans Admin, Tidal."
+
+msgid "Tidal playlist links"
+msgstr "les liens de playlists Tidal"
+
+msgid "Couldn't read this playlist from Tidal. Nothing already imported was changed."
+msgstr "Impossible de lire cette playlist sur Tidal. Rien de ce qui a déjà été importé n'a été modifié."
+
+msgid "A Navidrome admin account: members who give their Navidrome username get their own playlists as theirs."
+msgstr "Un compte administrateur Navidrome : les membres qui donnent leur nom d'utilisateur Navidrome reçoivent leurs propres playlists comme les leurs."
+
+msgid "Another member already has that Navidrome user."
+msgstr "Un autre membre a déjà cet utilisateur Navidrome."
+
+msgid "Change"
+msgstr "Modifier"
+
+msgid "Check the spelling: it's the name you sign in to Navidrome with."
+msgstr "Vérifiez l'orthographe : c'est le nom avec lequel vous vous connectez à Navidrome."
+
+#, python-brace-format
+msgid "Clear {user}'s Navidrome user {name}? Their Navidrome playlists stop being theirs at the next sync."
+msgstr "Retirer l'utilisateur Navidrome {name} de {user} ? Ses playlists Navidrome cesseront d'être les siennes à la prochaine synchronisation."
+
+msgid "Navidrome couldn't be reached."
+msgstr "Navidrome est injoignable."
+
+msgid "Navidrome didn't accept that username and password."
+msgstr "Navidrome n'a pas accepté ce nom d'utilisateur et ce mot de passe."
+
+#, python-brace-format
+msgid "Navidrome user {name}"
+msgstr "Utilisateur Navidrome {name}"
+
+msgid "No Navidrome server is set up."
+msgstr "Aucun serveur Navidrome n'est configuré."
+
+#, python-brace-format
+msgid "No Navidrome user called {name}"
+msgstr "Aucun utilisateur Navidrome nommé {name}"
+
+msgid "Not a Navidrome admin account: only the shared library pass runs. Members' own playlists and mirror copies need an admin account here and on the mirror target."
+msgstr "Pas un compte administrateur Navidrome : seule la synchronisation de la bibliothèque commune a lieu. Les playlists propres aux membres et les copies miroir demandent un compte administrateur ici et sur la cible du miroir."
+
+msgid "So the playlists you keep in Navidrome sync as yours, private ones staying private, and your mirror copies go into your Navidrome account. The password proves the username is yours: it is checked once and never stored."
+msgstr "Pour que les playlists que vous gardez dans Navidrome se synchronisent comme les vôtres, les privées restant privées, et que vos copies miroir aillent dans votre compte Navidrome. Le mot de passe prouve que ce nom d'utilisateur est le vôtre : il est vérifié une fois et jamais conservé."
+
+msgid "Too many attempts. Try again later."
+msgstr "Trop de tentatives. Réessayez plus tard."
+
+msgid "Your Navidrome password"
+msgstr "Votre mot de passe Navidrome"
+
+msgid "Your Navidrome username"
+msgstr "Votre nom d'utilisateur Navidrome"
+
+#, python-brace-format
+msgid "{n} of your Navidrome playlists sync as yours."
+msgstr "{n} de vos playlists Navidrome se synchronisent comme les vôtres."
+
+#, python-brace-format
+msgid "{n} of your Navidrome playlists syncs as yours."
+msgstr "{n} de vos playlists Navidrome se synchronise comme la vôtre."
+
+msgid "That is the account Trobar uses on Navidrome, not a member's."
+msgstr "C'est le compte qu'utilise Trobar sur Navidrome, pas celui d'un membre."
+
+msgid "No cover for this album"
+msgstr "Pas de pochette pour cet album"
+
+#, python-brace-format
+msgid "The size must be between {min} and {max} pixels."
+msgstr "La taille doit être comprise entre {min} et {max} pixels."
+
+msgid "This cover address is not valid."
+msgstr "Cette adresse de pochette n'est pas valable."

@@ -27,6 +27,18 @@ Trobar's own copies, from [mirroring into Plex](#mirroring-into-plex), are
 never read back as source playlists: they're the ones whose name ends in
 `_Trobar_`.
 
+## Members' own playlists
+
+Plex has **no per-member mapping**, unlike Jellyfin, Emby and
+[Navidrome](subsonic.md#members-own-playlists-navidrome). Every playlist comes
+from the one account whose token Trobar uses, as household playlists, and that
+account's playlists are the only ones the server lists to it.
+
+Reading or writing another person's playlists would need the server owner's
+plex.tv account token, which covers their whole Plex account and not just this
+server, and plex.tv calls that Plex doesn't document. Trobar holds neither. If
+you need per-member Plex playlists, say so in an issue.
+
 ## Mirroring into Plex
 
 Any Trobar playlist can be mirrored into a Plex Media Server as a Plex music

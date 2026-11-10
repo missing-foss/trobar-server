@@ -14,6 +14,7 @@ its unknown tracks. device_path names a track's file on the device, the
 contract every client matches by. Split out of sync_state, which re-exports
 these names for now.
 """
+import hashlib
 import logging
 import posixpath
 import re
@@ -536,6 +537,52 @@ def _device_playlists_by_id(conn: sqlite3.Connection, device_id: int,
         out.append((pl["id"], {"name": pl["title"], "filename": filename,
                                "content": "\n".join(lines) + "\n"}))
     return out
+
+
+# The most album covers a device is offered (trobar-garmin#54): what a watch
+# was measured to hold.
+COVER_ALBUMS_MAX = 60
+
+
+def cover_albums(conn: sqlite3.Connection, device_id: int) -> list[dict]:
+    """The albums of the tracks on (or coming to) this device, for their
+    covers: {"key", "track_ids", "track_id"}, at most COVER_ALBUMS_MAX.
+    Albums with a track in one of the device's playlists come first, in the
+    playlists' title order, then the rest by their most recent sync. `key`
+    is stable and short (the album artist, else the artist, and the album),
+    `track_ids` the device's tracks in it, so a device that never stored
+    which album a track belongs to learns it here; `track_id` is the one the
+    cover is fetched by."""
+    rows = conn.execute(
+        "SELECT t.id, COALESCE(NULLIF(t.album_artist, ''), t.artist) AS artist, t.album, "
+        "dts.updated_at FROM device_track_state dts JOIN tracks t ON t.id = dts.track_id "
+        "WHERE dts.device_id = ? AND dts.status IN ('pending', 'downloaded') "
+        "AND t.deleted_at IS NULL AND COALESCE(t.album, '') != '' ORDER BY t.id",
+        (device_id,)).fetchall()
+    in_playlists = [r["id"] for r in conn.execute(
+        "SELECT pt.matched_track_id AS id FROM selections s "
+        "JOIN selection_devices sd ON sd.selection_id = s.id "
+        "JOIN playlists p ON p.id = CAST(s.target AS INTEGER) "
+        "JOIN playlist_tracks pt ON pt.playlist_id = p.id "
+        "WHERE s.type = 'playlist' AND sd.device_id = ? AND pt.matched_track_id IS NOT NULL "
+        "ORDER BY p.title, pt.position", (device_id,))]
+    albums: dict[str, dict] = {}
+    for r in rows:
+        key = hashlib.sha256(f"{r['artist'] or ''}\x1f{r['album']}".encode("utf-8")).hexdigest()[:16]
+        album = albums.setdefault(key, {"key": key, "track_ids": [], "track_id": r["id"], "latest": ""})
+        album["track_ids"].append(r["id"])
+        album["latest"] = max(str(album["latest"]), str(r["updated_at"] or ""))
+    by_track = {tid: a["key"] for a in albums.values() for tid in a["track_ids"]}
+    order: list[str] = []
+    for tid in in_playlists:
+        album_key = by_track.get(tid)
+        if album_key is not None and album_key not in order:
+            order.append(album_key)
+    rest = sorted((a for a in albums.values() if a["key"] not in order),
+                  key=lambda a: (a["latest"], a["key"]), reverse=True)
+    order += [a["key"] for a in rest]
+    return [{k: albums[key][k] for k in ("key", "track_ids", "track_id")}
+            for key in order[:COVER_ALBUMS_MAX]]
 
 
 def get_changes(conn: sqlite3.Connection, device_id: int) -> dict:

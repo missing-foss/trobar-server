@@ -81,7 +81,7 @@ Every route under `/api/device/` takes the device's Bearer token:
 | Route | What it is for |
 |---|---|
 | `GET /api/device/info` | The device's own record as the server holds it (its name, limit and settings), so a client can show what was set in the web UI. |
-| `GET /api/device/changes` | What to download and delete, the playlist files, and `play_playlist` (step 1). |
+| `GET /api/device/changes` | What to download and delete, the playlist files, and `play_playlist` (step 1). With `?cover_size=N` (32 to 256) it also lists `covers`: up to 60 albums on the device, its playlists' albums first, then the most recently synced, each with a short `key`, the device's `track_ids` in it and a signed `url` for its cover. |
 | `GET /api/device/file/<id>` | One track, transcoded on the fly when the device's format is set (step 2). |
 | `POST /api/device/ack` | A track downloaded or removed, with the bytes written; ignored if the track's state changed since `changes` said so. |
 | `POST /api/device/missing-tracks` | Tracks the client found missing from disk: `redownload` queues them again, `exclude` stops them being queued again (step 3). |
@@ -89,12 +89,14 @@ Every route under `/api/device/` takes the device's Bearer token:
 | `POST /api/device/sync-completed` | A sync finished with no error. It only adds one to a count for the whole server, which decides when administrators see the thank-you card; nothing about the device is kept. |
 | `PATCH /api/device/limit` | The device sets its own storage limit, as the web UI can. |
 | `PATCH /api/device/source-of-truth` | The device sets *Keep device content* (`"device"`) or not (`"server"`). |
+| `PATCH /api/device/artist-images` | The device sets its own *Artist images*: `null` (off), `"small"` or `"full"`. A server without it answers `404`. |
 | `POST /api/device/manifest` | The paths the device already holds, after pairing again: matching tracks are marked downloaded instead of fetched again, and the rest are recorded as its unknown tracks. The Android and desktop apps send it only then, after turning *Keep device content* on. |
 | `GET /api/device/fingerprints` | The server's audio fingerprint for each track the device holds or will hold, paged, for the client's own record of where its files came from. |
 | `POST /api/device/provenance` | That record sent back (track id, fingerprint, path), so a fresh server database can recognise the device's files by fingerprint. |
 | `POST /api/device/plays` | Plays on the device, stored only if its owner keeps a play history. |
 | `POST /api/device/playlists` | The playlists made on the device (step 4). |
 | `GET /api/device/artist-image` | An artist's picture for the device's folders, `?size=small` for a downscaled one. |
+| `GET /api/device/cover/<id>` | The album cover of a track offered to this device, `?size=` 32 to 256 pixels on its longer side, as JPEG and never enlarged; `404` when the album has none. For a device whose player shows only the covers the app sets, such as a Garmin watch, which can't send its token with an image request: so this route takes no token, only a **signed address** from the device's own `/api/device/changes` answer. An address works for one device, track and size, for 6 hours; anything else is `403`. |
 
 Transcoding to MP3 happens **on the server**, on the fly at
 `GET /api/device/file/<id>` for any device whose format is set — never cached

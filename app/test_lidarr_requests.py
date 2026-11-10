@@ -531,3 +531,78 @@ class JobTests(_LidarrRequestsTestBase):
             self.assertEqual(lidarr_requests.run_job({"playlist_id": pid}), {"playlist_id": pid})
         attempt.assert_called_once_with("Artist", "Album")
         self.assertEqual(self._row(pid)["lidarr_request_last_count"], 1)
+
+
+class ChosenAlbumsTests(_LidarrRequestsTestBase):
+    """The Gaps view's "Request from Lidarr": albums chosen by hand, through
+    the same job and the same dedupe as a playlist's run."""
+
+    def _ok_client(self, client, artist):
+        client.lookup_album.return_value = {"status": "ok", "candidates": [self._candidate(artist)]}
+        client.add_and_monitor_album.return_value = {"status": "ok", "artist_id": 1, "album_id": 2}
+
+    def test_requests_each_album_and_records_it(self):
+        with mock.patch("lidarr_requests.lidarr_client") as client:
+            self._ok_client(client, "Aphelion")
+            out = lidarr_requests.run_for_albums(self.conn, [("Aphelion", "Parallax")])
+        self.assertEqual(out["requested"], 1)
+        self.assertEqual(self._requested_row("Aphelion", "Parallax")["status"], "requested")
+
+    def test_an_album_a_playlist_run_already_asked_for_is_not_asked_again(self):
+        pid = self._make_playlist("Chill")
+        self._add_unresolved(pid, "Aphelion", "Parallax")
+        with mock.patch("lidarr_requests.lidarr_client") as client:
+            self._ok_client(client, "Aphelion")
+            lidarr_requests.run_for_playlist(self.conn, pid)
+            client.reset_mock()
+            out = lidarr_requests.run_for_albums(self.conn, [("aphelion", "PARALLAX")])
+        client.lookup_album.assert_not_called()
+        self.assertEqual(out["attempted"], 0)
+
+    def test_and_a_chosen_album_is_not_asked_again_by_a_playlist_run(self):
+        pid = self._make_playlist("Chill")
+        self._add_unresolved(pid, "Aphelion", "Parallax")
+        with mock.patch("lidarr_requests.lidarr_client") as client:
+            self._ok_client(client, "Aphelion")
+            lidarr_requests.run_for_albums(self.conn, [("Aphelion", "Parallax")])
+            client.reset_mock()
+            lidarr_requests.run_for_playlist(self.conn, pid)
+        client.lookup_album.assert_not_called()
+
+    def test_records_nothing_on_any_playlist(self):
+        pid = self._make_playlist("Chill")
+        with mock.patch("lidarr_requests.lidarr_client") as client:
+            self._ok_client(client, "Aphelion")
+            lidarr_requests.run_for_albums(self.conn, [("Aphelion", "Parallax")])
+        self.assertIsNone(self._row(pid)["lidarr_request_last_run_at"])
+
+    def test_not_configured_asks_nothing(self):
+        self._clear_lidarr_config()
+        with mock.patch("lidarr_requests.lidarr_client") as client:
+            out = lidarr_requests.run_for_albums(self.conn, [("Aphelion", "Parallax")])
+        client.lookup_album.assert_not_called()
+        self.assertEqual(out["status"], "unset_target")
+
+    def test_the_job_runs_an_album_list_payload(self):
+        # run_job opens its own connection, to this test's database.
+        with mock.patch("lidarr_requests.lidarr_client") as client:
+            self._ok_client(client, "Aphelion")
+            out = lidarr_requests.run_job({"albums": [["Aphelion", "Parallax"]]})
+        self.assertEqual(out["requested"], 1)
+        self.assertEqual(self._requested_row("Aphelion", "Parallax")["status"], "requested")
+
+    def test_enqueue_albums_queues_one_job_for_the_same_list(self):
+        self.assertTrue(lidarr_requests.enqueue_albums(self.conn, [("Aphelion", "Parallax")]))
+        self.assertTrue(lidarr_requests.enqueue_albums(self.conn, [("APHELION", "parallax")]))
+        n = self.conn.execute("SELECT COUNT(*) FROM jobs WHERE type = ?", (lidarr_requests.JOB_TYPE,)).fetchone()[0]
+        self.assertEqual(n, 1)
+        self.assertTrue(lidarr_requests.enqueue_albums(self.conn, [("Wren", "Kite")]))
+        n = self.conn.execute("SELECT COUNT(*) FROM jobs WHERE type = ?", (lidarr_requests.JOB_TYPE,)).fetchone()[0]
+        self.assertEqual(n, 2)
+
+    def test_enqueue_albums_queues_nothing_when_empty_or_not_set_up(self):
+        self.assertFalse(lidarr_requests.enqueue_albums(self.conn, []))
+        self._clear_lidarr_config()
+        self.assertFalse(lidarr_requests.enqueue_albums(self.conn, [("Aphelion", "Parallax")]))
+        n = self.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        self.assertEqual(n, 0)

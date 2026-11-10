@@ -24,7 +24,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       </div>
       <span class="font-display font-semibold text-xl">Trob<span class="text-accent">ar</span></span>
     </div>
-    <div class="bg-panel rounded-lg border border-gray-300/30 p-5">
+    <div class="bg-panel rounded-lg border border-gray-200 p-5">
       <h1 class="font-semibold mb-3">{{ _("Create admin account") if bootstrap else _("Login") }}</h1>
       {% if bootstrap %}
       <p class="text-xs text-gray-400 mb-3">{{ _("First launch — this account will have admin access.") }}</p>
@@ -38,9 +38,9 @@ SPDX-License-Identifier: AGPL-3.0-or-later
         {{ _("Sign in with SSO") }}
       </a>
       <div class="flex items-center gap-2 my-4">
-        <div class="flex-1 h-px bg-gray-300/30"></div>
+        <div class="flex-1 h-px bg-gray-200"></div>
         <span class="text-xs text-gray-400">{{ _("or use a local account") }}</span>
-        <div class="flex-1 h-px bg-gray-300/30"></div>
+        <div class="flex-1 h-px bg-gray-200"></div>
       </div>
       {% endif %}
       <form method="post" class="space-y-3">
@@ -55,7 +55,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
             class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm bg-transparent">
         </div>
         <button type="submit"
-          class="w-full text-sm px-3 py-2 rounded {% if auth_mode == 'oidc' %}border border-gray-300 hover:bg-gray-100/10{% else %}bg-burgundy text-on-primary hover:bg-burgundy-lo{% endif %}">
+          class="w-full text-sm px-3 py-2 rounded {% if auth_mode == 'oidc' %}border border-gray-300 hover:bg-gray-100{% else %}bg-burgundy text-on-primary hover:bg-burgundy-lo{% endif %}">
           {{ _("Create account") if bootstrap else _("Log in") }}
         </button>
       </form>

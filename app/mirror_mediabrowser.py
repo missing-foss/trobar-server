@@ -23,6 +23,8 @@ from collections.abc import Callable
 from types import ModuleType
 
 import matching
+import mirror_notes
+import mirror_copies
 import mirror_runs
 
 _log = logging.getLogger(__name__)
@@ -45,12 +47,14 @@ class MediaBrowserMirror:
     mirror_emby.emby_client) still reaches the calls made here."""
 
     def __init__(self, name: str, label: str, client: Callable[[], ModuleType],
-                 config: Callable[[], tuple | None]) -> None:
+                 config: Callable[[], tuple | None], *, rewrite_notes: bool = False) -> None:
         assert name in ("jellyfin", "emby"), name  # a column prefix: never from input
         self.name = name
         self.label = label
         self.client = client
         self.config = config
+        # Emby resets the note a few seconds after a write: see mirror_notes.
+        self.rewrite_notes = rewrite_notes
 
     def _set_error(self, conn, playlist_id: int, code: str, detail: str | None = None) -> None:
         conn.execute(
@@ -161,6 +165,7 @@ class MediaBrowserMirror:
             f"UPDATE playlists SET {self.name}_mirror_remote_id = NULL, {self.name}_mirror_owner_id = NULL, "
             f"{self.name}_mirror_last_written_at = NULL WHERE id = ?", (playlist_id,),
         )
+        mirror_copies.forget(conn, playlist_id, self.name)
 
 
     def write_mirror(self, conn, playlist_id: int, tag_index_cache: dict | None = None) -> None:
@@ -210,12 +215,15 @@ class MediaBrowserMirror:
         # scope for v1, not a failure of this write.
         song_ids = []
         lacked = []
+        placed: dict = {}  # target item id -> the local track placed there
         for e in entries:
             key = (matching.normalize(e["artist"]), matching.normalize(e["album"]),
                    matching.normalize(e["title"]))
             candidates = tag_index.get(key)
             if candidates:
-                song_ids.append(self._select_song_id(candidates, e["track_no"]))
+                song_id = self._select_song_id(candidates, e["track_no"])
+                song_ids.append(song_id)
+                placed.setdefault(str(song_id), e)
             else:
                 lacked.append(e)
 
@@ -266,10 +274,18 @@ class MediaBrowserMirror:
             return
 
         remote_id = result["remote_id"]
-        self.client().mirror_set_playlist_metadata(
-            remote_id, row["title"],
-            f"Trobar mirror — {len(song_ids)} of {total} present, grows with your library",
-        )
+        # Edits made to the copy on the target that this write undid: the
+        # client read the copy to clear it, and hands it back as "previous".
+        discarded, restored = mirror_copies.overwritten(
+            conn, playlist_id, self.name, result.get("previous"), song_ids)
+        note = f"Trobar mirror — {len(song_ids)} of {total} present, grows with your library"
+        self.client().mirror_set_playlist_metadata(remote_id, row["title"], note)
+        if self.rewrite_notes:
+            # The client as it is now, not when the timer fires: the same
+            # module in the app, and in a test the test's own stub.
+            client, title = self.client(), row["title"]
+            mirror_notes.note_written(
+                self.name, remote_id, lambda: client.mirror_set_playlist_metadata(remote_id, title, note))
 
         conn.execute(
             f"UPDATE playlists SET {self.name}_mirror_remote_id = ?, {self.name}_mirror_owner_id = ?, "
@@ -278,5 +294,11 @@ class MediaBrowserMirror:
             "WHERE id = ?",
             (remote_id, target, playlist_id),
         )
-        mirror_runs.record(conn, playlist_id, self.name, len(entries), len(song_ids), lacked)
+        # Nothing reads the copy back after the write, so the next baseline is
+        # what was written.
+        mirror_copies.remember(conn, playlist_id, self.name, [
+            {"id": sid, "artist": placed[sid]["artist"], "title": placed[sid]["title"]}
+            for sid in dict.fromkeys(str(i) for i in song_ids)])
+        mirror_runs.record(conn, playlist_id, self.name, len(entries), len(song_ids), lacked,
+                           discarded=discarded, restored=restored)
 

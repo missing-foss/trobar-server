@@ -52,15 +52,21 @@ import mirror_emby  # noqa: F401
 import mirror_jellyfin  # noqa: F401
 import mirror_music_assistant  # noqa: F401
 import mirror_plex  # noqa: F401
+import mirror_notes
 import mirror_sinks
 import mirror_subsonic  # noqa: F401
 import music_assistant_client
 import roon_client
 import rule_playlists
+import source_health
 import spotify_client
 import spotify_public_client
+import subsonic_client
+import tidal_public_client
 import sync_state
+import credential_store
 import tidal_client
+import tidal_token
 import tidal_shares
 import ytmusic_client
 
@@ -205,7 +211,8 @@ def start_sync(provider, provider_id: str) -> dict:
 
 
 _SUBSCRIPTION_CLIENTS = {ytmusic_client.PROVIDER_ID: ytmusic_client,
-                         spotify_public_client.PROVIDER_ID: spotify_public_client}
+                         spotify_public_client.PROVIDER_ID: spotify_public_client,
+                         tidal_public_client.PROVIDER_ID: tidal_public_client}
 
 
 def subscription_playlist_key(sub_id: int) -> str:
@@ -362,7 +369,7 @@ def _carry_selections_from_mirror_copy(conn, row) -> None:
         # the default pass is unowned, so anyone could select it, including
         # a copy of someone else's private playlist. Such a selection is
         # left on the duplicate and goes with it, as before.
-        "AND (u.is_admin OR o.owner_user_id IS NULL OR o.shared = 1 "
+        "AND (u.is_admin OR (o.source_private = 0 AND (o.owner_user_id IS NULL OR o.shared = 1)) "
         "OR o.owner_user_id = s.created_by_user_id)",
         (original, str(row["id"])),
     ).fetchall():
@@ -591,7 +598,8 @@ def _matched_track_ids(conn, playlist_id: int) -> set[int]:
 def _sync_one_playlist(
     conn, provider, provider_id: str, title: str, source_playlist_id: str | None = None,
     owner_user_id: int | None = None, mirror_caches: dict[str, dict] | None = None,
-    prefetched: dict | None = None, **provider_kwargs
+    prefetched: dict | None = None, source_owner: str | None = None,
+    source_private: bool = False, **provider_kwargs
 ) -> tuple[int, int] | None:
     """Syncs a single playlist's tracks from `provider` into
     playlists/playlist_tracks. Returns (track_count, matched_count), or None
@@ -644,7 +652,8 @@ def _sync_one_playlist(
 
     if source_playlist_id is not None:
         row = conn.execute(
-            "SELECT id, owner_user_id FROM playlists WHERE source_provider = ? AND source_playlist_id = ?",
+            "SELECT id, owner_user_id, source_private FROM playlists "
+            "WHERE source_provider = ? AND source_playlist_id = ?",
             (provider_id, source_playlist_id),
         ).fetchone()
         if row is None:
@@ -660,13 +669,13 @@ def _sync_one_playlist(
             # source_playlist_id, so next sync matches by id directly and
             # this branch never fires again for it.
             row = conn.execute(
-                "SELECT id, owner_user_id FROM playlists "
+                "SELECT id, owner_user_id, source_private FROM playlists "
                 "WHERE source_provider = ? AND source_playlist_id IS NULL AND title = ?",
                 (provider_id, title),
             ).fetchone()
     else:
         row = conn.execute(
-            "SELECT id, owner_user_id FROM playlists "
+            "SELECT id, owner_user_id, source_private FROM playlists "
             "WHERE source_provider = ? AND source_playlist_id IS NULL AND title = ?",
             (provider_id, title),
         ).fetchone()
@@ -685,9 +694,11 @@ def _sync_one_playlist(
         # `shared` is ever consulted anyway.
         initial_shared = 0 if owner_user_id is not None else 1
         cur = conn.execute(
-            "INSERT INTO playlists (title, source_provider, source_playlist_id, owner_user_id, shared, last_synced_at) "
-            "VALUES (?, ?, ?, ?, ?, datetime('now'))",
-            (title, provider_id, source_playlist_id, owner_user_id, initial_shared),
+            "INSERT INTO playlists (title, source_provider, source_playlist_id, owner_user_id, shared, "
+            "source_owner, source_private, last_synced_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            (title, provider_id, source_playlist_id, owner_user_id, initial_shared,
+             source_owner, int(source_private)),
         )
         playlist_id = cur.lastrowid
     else:
@@ -718,11 +729,19 @@ def _sync_one_playlist(
         # (its key is now the id) and leaves its selections/ownership alone.
         owner_changed = row["owner_user_id"] != owner_user_id
         shared_clause = ", shared = 0" if owner_changed else ""
+        became_private = bool(source_private) and not row["source_private"]
         conn.execute(
             f"UPDATE playlists SET title = ?, source_provider = ?, source_playlist_id = ?, "
-            f"owner_user_id = ?{shared_clause}, last_synced_at = datetime('now') WHERE id = ?",
-            (title, provider_id, source_playlist_id, owner_user_id, playlist_id),
+            f"owner_user_id = ?{shared_clause}, source_owner = ?, source_private = ?, "
+            f"last_synced_at = datetime('now') WHERE id = ?",
+            (title, provider_id, source_playlist_id, owner_user_id, source_owner,
+             int(source_private), playlist_id),
         )
+        if (owner_changed and owner_user_id is not None) or became_private:
+            # Now private to its new owner, or to admins: whoever else had it
+            # on a device can no longer see it, so it goes from there, as
+            # when an owner stops sharing.
+            revoke_non_owner_selections(conn, playlist_id, owner_user_id)
 
     matched_before = _matched_track_ids(conn, playlist_id)
     conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))
@@ -1109,6 +1128,73 @@ def _link_music_assistant_copies(conn, ma_sources: dict[str, list[tuple[str, str
                 break
 
 
+def _linked_account_health(health: list[dict], provider_id: str, linked, failures: list[dict]) -> None:
+    """One source_health outcome per linked account this run tried: failed
+    with its first recorded reason if _source_failed recorded one, else ok."""
+    for user_row in linked:
+        reasons = [f["reason"] for f in failures
+                   if f["provider"] == provider_id and f["user_id"] == user_row["id"]]
+        health.append(source_health.outcome(
+            source_health.LINKED_ACCOUNT, provider_id, not reasons,
+            reasons[0] if reasons else None, user_id=user_row["id"]))
+
+
+def ma_account_owners(conn) -> dict[str, int]:
+    """Music Assistant streaming account (provider instance id) -> the member
+    it belongs to, as an admin set it."""
+    return {r["instance_id"]: r["user_id"] for r in conn.execute(
+        "SELECT instance_id, user_id FROM ma_account_owners")}
+
+
+def ma_playlist_owner(pl: dict, owners: dict[str, int]) -> int | None:
+    """The member a Music Assistant playlist belongs to: its one account's
+    owner. A playlist several accounts carry, or none, stays everyone's."""
+    accounts = pl.get("accounts") or []
+    return owners.get(accounts[0]) if len(accounts) == 1 else None
+
+
+def subsonic_owners(conn) -> dict[str, int]:
+    """Navidrome username (case-folded) -> the member who gave it on Profile."""
+    return {r["subsonic_username"].casefold(): r["id"] for r in conn.execute(
+        "SELECT id, subsonic_username FROM users WHERE subsonic_username IS NOT NULL "
+        "AND subsonic_username != ''")}
+
+
+def subsonic_playlist_owner(pl: dict, owners: dict[str, int], account: str) -> tuple[int | None, bool]:
+    """(owner_user_id, source_private) for one Subsonic playlist. Its owner
+    on the server, if a member gave that username, owns it in Trobar too. A
+    private playlist of someone else on the server who isn't a member yet is
+    visible to admins only. The library account's own playlists, and every
+    playlist from a server that names no owner, stay everyone's as before."""
+    server_owner = (pl.get("owner") or "").casefold()
+    # The library account's own come first: they are the household's, even
+    # if a member's username somehow matches it.
+    if not server_owner or server_owner == (account or "").casefold():
+        return None, False
+    owner = owners.get(server_owner)
+    if owner is not None:
+        return owner, False
+    return None, not pl.get("public")
+
+
+def revoke_non_owner_selections(conn, playlist_id: int, owner_user_id: int | None) -> int:
+    """Deletes every selection of this playlist made by someone other than
+    its owner or an admin: they can no longer see it, so their devices must
+    not go on pulling it. delete_selection() tells each device to remove the
+    files. Used when a playlist turns private: its owner un-sharing it, or a
+    sync giving it a new owner. Returns how many went."""
+    # With no owner (a playlist visible to admins only), every non-admin's
+    # selection goes: IS NOT, so a NULL owner excludes nobody.
+    rows = conn.execute(
+        "SELECT s.id FROM selections s JOIN users u ON u.id = s.created_by_user_id "
+        "WHERE s.type = 'playlist' AND s.target = ? AND s.created_by_user_id IS NOT ? AND u.is_admin = 0",
+        (str(playlist_id), owner_user_id),
+    ).fetchall()
+    for row in rows:
+        sync_state.delete_selection(conn, row["id"])
+    return len(rows)
+
+
 def _source_failed(failures: list[dict], provider_id: str, user_row, reason) -> None:
     """Records that one linked account's source failed this run, for the job's
     result and the log. A linked account that fails every sync must not look
@@ -1299,6 +1385,13 @@ def sync_status_for(conn, user_id: int, is_admin: bool) -> dict:
 
 
 def sync_playlists(provider, provider_id: str, report=None) -> dict:
+    """One sync, as _sync_playlists does it, and one mirror run: the notes Emby
+    drops after a write are written again once, after the run (see mirror_notes)."""
+    with mirror_notes.run():
+        return _sync_playlists(provider, provider_id, report)
+
+
+def _sync_playlists(provider, provider_id: str, report=None) -> dict:
     """Returns {"status": "ok", "playlists": n, "tracks": n, "matched": n,
     "removed": n}.
 
@@ -1346,6 +1439,11 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
     # pass skips their owner_user_id-tagged rows so one user's failure never
     # deletes their still-valid playlists (see the Tidal block below).
     source_failures: list[dict] = []
+    # Every source this run tries, ok or not, for source_health: written once
+    # the run finishes, so a cancelled run records nothing.
+    health: list[dict] = [source_health.outcome(
+        source_health.LIBRARY_SOURCE, provider_id, primary_ok,
+        listing.get("reason") or listing.get("error"))]
     tidal_failed_user_ids: set[int] = set()
     # This pass's Tidal access token per linked user, reused by the share
     # sync below rather than refreshed a second time.
@@ -1365,6 +1463,9 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
     # — created once here rather than once per _sync_one_playlist() call.
     mirror_caches = mirror_sinks.new_caches()
     try:
+        ma_owners = ma_account_owners(conn)
+        sub_owners = subsonic_owners(conn) if provider is subsonic_client else {}
+        sub_account = subsonic_client.account_username() if provider is subsonic_client else ""
         if primary_ok:
             provider_ids.add(provider_id)
             for pl in listing["playlists"]:
@@ -1372,9 +1473,15 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
                 key = _playlist_key(provider_id, src_id, title)
                 listed_keys.add(key)
                 checkpoint()
+                owner, source_private = None, False
+                if provider is music_assistant_client:
+                    owner = ma_playlist_owner(pl, ma_owners)
+                elif provider is subsonic_client:
+                    owner, source_private = subsonic_playlist_owner(pl, sub_owners, sub_account)
                 outcome = _sync_one_playlist(
                     conn, provider, provider_id, title, source_playlist_id=src_id,
-                    mirror_caches=mirror_caches)
+                    owner_user_id=owner, source_owner=pl.get("owner"),
+                    source_private=source_private, mirror_caches=mirror_caches)
                 if outcome is None:
                     continue
                 seen_keys.add(key)
@@ -1413,6 +1520,12 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
         # filesystem listing.
         ma_listing: dict = (music_assistant_client.list_playlists()
                       if provider is not music_assistant_client else {"status": "skipped"})
+        if ma_listing["status"] != "skipped" and db.get_config(conn, "music_assistant_url"):
+            # Configured as an extra source: it counts. Unconfigured, its
+            # "not_paired" is only "not set up", never a failure.
+            health.append(source_health.outcome(
+                source_health.LIBRARY_SOURCE, "music_assistant", ma_listing["status"] == "ok",
+                ma_listing.get("reason")))
         if ma_listing["status"] == "ok":
             provider_ids.add("music_assistant")
             for pl in ma_listing["playlists"]:
@@ -1424,7 +1537,7 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
                 checkpoint()
                 outcome = _sync_one_playlist(
                     conn, music_assistant_client, "music_assistant", title, source_playlist_id=src_id,
-                    mirror_caches=mirror_caches)
+                    owner_user_id=ma_playlist_owner(pl, ma_owners), mirror_caches=mirror_caches)
                 if outcome is None:
                     continue
                 seen_keys.add(key)
@@ -1448,6 +1561,9 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
             for user_row in mapped:
                 profile = user_row["roon_profile"]
                 profile_listing = roon_client.list_playlists(roon_profile=profile)
+                health.append(source_health.outcome(
+                    source_health.MEMBER_LISTING, "roon", profile_listing["status"] == "ok",
+                    profile_listing.get("reason"), user_id=user_row["id"]))
                 if profile_listing["status"] != "ok":
                     continue  # profile not found / transient error — retry next sync
                 for pl in profile_listing["playlists"]:
@@ -1493,6 +1609,9 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
             for user_row in mapped:
                 mapped_user_id = user_row["jellyfin_user_id"]
                 user_listing = jellyfin_client.list_playlists(user_id=mapped_user_id)
+                health.append(source_health.outcome(
+                    source_health.MEMBER_LISTING, "jellyfin", user_listing["status"] == "ok",
+                    user_listing.get("reason"), user_id=user_row["id"]))
                 if user_listing["status"] != "ok":
                     continue  # mapped user id stale / transient error — retry next sync
                 for pl in user_listing["playlists"]:
@@ -1523,6 +1642,9 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
             for user_row in mapped:
                 mapped_user_id = user_row["emby_user_id"]
                 user_listing = emby_client.list_playlists(user_id=mapped_user_id)
+                health.append(source_health.outcome(
+                    source_health.MEMBER_LISTING, "emby", user_listing["status"] == "ok",
+                    user_listing.get("reason"), user_id=user_row["id"]))
                 if user_listing["status"] != "ok":
                     continue  # mapped user id stale / transient error — retry next sync
                 for pl in user_listing["playlists"]:
@@ -1578,8 +1700,23 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
             ).fetchall()
             for user_row in linked:
                 try:
+                    refresh_token = tidal_token.unseal(user_row["tidal_refresh_token"], user_row["id"])
+                except credential_store.CredentialKeyError:
+                    # The key file exists and can't be used: a fault to fix,
+                    # not a lost key. The token is kept, as for a transient
+                    # failure, and the next sync tries again.
+                    tidal_failed_user_ids.add(user_row["id"])
+                    _source_failed(source_failures, "tidal", user_row, "credential_key_unusable")
+                    continue
+                try:
+                    if refresh_token is None:
+                        # Stored, but it can't be decrypted: the credential key
+                        # was lost or changed. Handled like a token Tidal
+                        # rejects, below, under a reason of its own: the link
+                        # is cleared and the Profile asks to connect again.
+                        raise tidal_client.TidalAuthError("the stored refresh token can't be decrypted")
                     access_token, new_refresh_token = tidal_client.refresh_access_token(
-                        client_id, client_secret, user_row["tidal_refresh_token"]
+                        client_id, client_secret, refresh_token
                     )
                 except tidal_client.TidalAuthError:
                     # Revoked/expired at Tidal's end (or the admin's app
@@ -1597,7 +1734,8 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
                     )
                     conn.commit()
                     tidal_failed_user_ids.add(user_row["id"])
-                    _source_failed(source_failures, "tidal", user_row, "token_rejected")
+                    _source_failed(source_failures, "tidal", user_row,
+                                   "token_unreadable" if refresh_token is None else "token_rejected")
                     continue
                 except tidal_client.TidalTransientError as e:
                     # Network/5xx/timeout — nothing wrong with the stored
@@ -1606,10 +1744,10 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
                     tidal_failed_user_ids.add(user_row["id"])
                     _source_failed(source_failures, "tidal", user_row, e)
                     continue
-                if new_refresh_token != user_row["tidal_refresh_token"]:
+                if new_refresh_token != refresh_token:
                     conn.execute(
                         "UPDATE users SET tidal_refresh_token = ? WHERE id = ?",
-                        (new_refresh_token, user_row["id"]),
+                        (tidal_token.seal_for_rotation(new_refresh_token, user_row["id"]), user_row["id"]),
                     )
                     conn.commit()
                 tidal_tokens[user_row["id"]] = access_token
@@ -1648,6 +1786,7 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
                 if unread:
                     _source_failed(source_failures, "tidal", user_row,
                                    f"{unread} of {len(tidal_listing['playlists'])} playlists not read")
+            _linked_account_health(health, "tidal", linked, source_failures)
             if linked:
                 provider_ids.add("tidal")
             # Shares run after every linked account is read, on this pass's
@@ -1732,6 +1871,7 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
                 if unread:
                     _source_failed(source_failures, "spotify", user_row,
                                    f"{unread} of {len(sp_listing['playlists'])} playlists not read")
+            _linked_account_health(health, "spotify", linked, source_failures)
             if linked:
                 provider_ids.add("spotify")
 
@@ -1762,6 +1902,9 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
             # summary dict, and they are in the same function scope.
             sub_outcome = sync_one_subscription(
                 conn, sub, mirror_caches=mirror_caches)
+            health.append(source_health.outcome(
+                source_health.PUBLIC_LINK, sub["provider"], sub_outcome["status"] == "ok",
+                sub_outcome["status"], user_id=sub["owner_user_id"], subscription_id=sub["id"]))
             if sub_outcome["status"] != "ok":
                 # #71's lesson, and the one this source is most exposed to:
                 # an unofficial endpoint refusing us today must not read as
@@ -1826,6 +1969,7 @@ def sync_playlists(provider, provider_id: str, report=None) -> dict:
         # can't see (selection-safe — see the helper).
         removed_count += _cleanup_ghost_playlists(conn)
         conn.commit()
+        source_health.record(conn, health)
     finally:
         conn.close()
 

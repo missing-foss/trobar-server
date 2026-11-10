@@ -123,7 +123,7 @@ class SubsonicTests(_Base):
         with mock.patch("mirror_subsonic.subsonic_client", client):
             mirror_sinks.write_all(self.conn, playlist_id)
         self.assertEqual(client.calls, [
-            "mirror_build_tag_index", "mirror_create_or_replace_playlist",
+            "mirror_build_tag_index", "mirror_read_items", "mirror_create_or_replace_playlist",
             "mirror_create_or_replace_playlist", "mirror_set_playlist_metadata"])
         self.assertEqual(self._value(playlist_id, "subsonic_mirror_remote_id"), "new")
 
@@ -200,7 +200,8 @@ class PlexTests(_Base):
         fake.mirror_build_index.return_value = _PLEX_INDEX
         fake.mirror_name.return_value = "P"
         fake.mirror_create.return_value = "new"
-        fake.mirror_read.return_value = {"title": "P", "summary": "", "keys": ["k1"]}
+        fake.mirror_read.return_value = {"title": "P", "summary": "", "keys": ["k1"],
+                                         "items": [{"id": "k1", "artist": "a", "title": "t"}]}
         fake.mirror_set_metadata.return_value = True
         fake.mirror_machine.return_value = "m1"
         return fake
@@ -223,7 +224,8 @@ class PlexTests(_Base):
         playlist_id = self._playlist(plex_mirror_enabled=1, plex_mirror_remote_id="old",
                                      plex_mirror_machine="m1")
         fake = self._client()
-        fake.mirror_read.side_effect = [None, {"title": "P", "summary": "", "keys": ["k1"]}]
+        fake.mirror_read.side_effect = [None, {"title": "P", "summary": "", "keys": ["k1"],
+                                               "items": [{"id": "k1", "artist": "a", "title": "t"}]}]
         fake.mirror_exists.return_value = False
         client = self._run(playlist_id, fake)
         self.assertIn("mirror_exists", client.calls)
@@ -250,7 +252,7 @@ class MusicAssistantTests(_Base):
         playlist_id = self._playlist(music_assistant_mirror_enabled=1,
                                      music_assistant_mirror_remote_id="old")
         fake = self._client()
-        fake.mirror_read.side_effect = [None, ["A/B/t.flac"]]
+        fake.mirror_read_items.side_effect = [None, [{"id": "A/B/t.flac", "artist": "a", "title": "t"}]]
         fake.mirror_listed.return_value = False
         fake.mirror_create.return_value = "new"
         fake.mirror_replace.return_value = True
@@ -258,8 +260,8 @@ class MusicAssistantTests(_Base):
         with mock.patch("mirror_music_assistant.music_assistant_client", client):
             mirror_sinks.write_all(self.conn, playlist_id)
         self.assertEqual(client.calls, [
-            "mirror_build_index", "mirror_read", "mirror_listed", "mirror_create",
-            "mirror_replace", "mirror_read"])
+            "mirror_build_index", "mirror_read_items", "mirror_listed", "mirror_create",
+            "mirror_replace", "mirror_read_items"])
         self.assertEqual(self._value(playlist_id, "music_assistant_mirror_remote_id"), "new")
 
     def test_delete(self):

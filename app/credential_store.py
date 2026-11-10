@@ -32,6 +32,8 @@ _log = logging.getLogger(__name__)
 _KEY_BYTES = 32
 _NONCE_BYTES = 12
 _VERSION = "v1:"
+# What every stored value starts with, so a caller can tell one from cleartext.
+VERSION_PREFIX = _VERSION
 
 
 class CredentialKeyError(RuntimeError):
@@ -98,20 +100,32 @@ def encrypt(value: str, user_id: int, field: str) -> str:
     return _VERSION + base64.b64encode(nonce + sealed).decode()
 
 
-def decrypt(stored: str | None, user_id: int, field: str) -> str | None:
-    """The value, or None if there is none or it can't be decrypted."""
+def decrypt_strict(stored: str | None, user_id: int, field: str) -> str | None:
+    """As decrypt(), but a key file that exists and can't be used raises
+    CredentialKeyError instead of reading as None: the value may still be
+    good once the key is fixed, so a caller can keep it. None still means
+    there is no value, no key file, or one that doesn't open it."""
     if not stored:
         return None
+    key = _read_key(_key_path())
+    if key is None or not stored.startswith(_VERSION):
+        return None
     try:
-        key = _read_key(_key_path())
-        if key is None or not stored.startswith(_VERSION):
-            return None
         raw = base64.b64decode(stored[len(_VERSION):], validate=True)
         plain = AESGCM(key).decrypt(raw[:_NONCE_BYTES], raw[_NONCE_BYTES:], _context(user_id, field))
-    except (CredentialKeyError, InvalidTag, ValueError) as e:
+    except (InvalidTag, ValueError) as e:
         _log.warning("A stored credential can't be read: %s", type(e).__name__)
         return None
     return plain.decode()
+
+
+def decrypt(stored: str | None, user_id: int, field: str) -> str | None:
+    """The value, or None if there is none or it can't be decrypted."""
+    try:
+        return decrypt_strict(stored, user_id, field)
+    except CredentialKeyError as e:
+        _log.warning("A stored credential can't be read: %s", type(e).__name__)
+        return None
 
 
 def state(stored: str | None, user_id: int, field: str) -> str:

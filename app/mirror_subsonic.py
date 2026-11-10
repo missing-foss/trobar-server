@@ -27,6 +27,7 @@ import logging
 
 import db
 import matching
+import mirror_copies
 import mirror_runs
 import subsonic_client
 
@@ -104,6 +105,35 @@ def delete_mirror(conn, playlist_id: int) -> None:
         "UPDATE playlists SET subsonic_mirror_remote_id = NULL, "
         "subsonic_mirror_last_written_at = NULL WHERE id = ?", (playlist_id,),
     )
+    mirror_copies.forget(conn, playlist_id, "subsonic")
+
+
+def _hand_over(remote_id: str, held_by: str | None, wanted: str | None,
+               cache: dict | None) -> str | None:
+    """Puts the copy in its owner's Navidrome account (their username from
+    Profile) when that user exists on the mirror server, through the mirror
+    account, which must be a Navidrome admin. Returns whose account it is in
+    now (None: the mirror account's). A copy whose owner gave no username,
+    or one the server doesn't know, stays where it is: moving it back would
+    take it out of someone's library without their asking. A failed move is
+    tried again on the next write."""
+    if not wanted or (held_by or "").casefold() == wanted.casefold():
+        return held_by
+    config = db.get_mirror_subsonic_config()
+    if config is None:
+        return held_by
+    if cache is None or "navidrome_users" not in cache:
+        users = subsonic_client.navidrome_usernames(*config)
+        if cache is not None:
+            cache["navidrome_users"] = users
+    else:
+        users = cache["navidrome_users"]
+    if not users or wanted.casefold() not in users:
+        return held_by
+    if subsonic_client.navidrome_give_playlist(*config, remote_id, wanted):
+        return wanted
+    _log.warning("Couldn't give Subsonic mirror copy %s to %s; trying again next write", remote_id, wanted)
+    return held_by
 
 
 def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) -> None:
@@ -117,8 +147,9 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
     dict across every playlist in one sync run to build the target index
     only once."""
     row = conn.execute(
-        "SELECT title, subsonic_mirror_enabled, subsonic_mirror_remote_id "
-        "FROM playlists WHERE id = ?", (playlist_id,),
+        "SELECT p.title, p.subsonic_mirror_enabled, p.subsonic_mirror_remote_id, "
+        "p.subsonic_mirror_owner, u.subsonic_username AS owner_subsonic_username "
+        "FROM playlists p LEFT JOIN users u ON u.id = p.owner_user_id WHERE p.id = ?", (playlist_id,),
     ).fetchone()
     if row is None or not row["subsonic_mirror_enabled"]:
         return
@@ -152,12 +183,15 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
     # scope for v1, not a failure of this write.
     song_ids = []
     lacked = []
+    placed: dict = {}  # target song id -> the local track placed there
     for e in entries:
         key = (matching.normalize(e["artist"]), matching.normalize(e["album"]),
                matching.normalize(e["title"]))
         candidates = tag_index.get(key)
         if candidates:
-            song_ids.append(_select_song_id(candidates, e["track_no"]))
+            song_id = _select_song_id(candidates, e["track_no"])
+            song_ids.append(song_id)
+            placed.setdefault(str(song_id), e)
         else:
             lacked.append(e)
 
@@ -175,6 +209,13 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
         _set_error(conn, playlist_id, "no_target_matches")
         return
 
+    # The copy as it stands, for what this write overwrites. One read per
+    # write; a copy that can't be read is written all the same.
+    current = None
+    if row["subsonic_mirror_remote_id"] is not None:
+        current = subsonic_client.mirror_read_items(row["subsonic_mirror_remote_id"])
+        if not isinstance(current, list):
+            current = None
     result = subsonic_client.mirror_create_or_replace_playlist(
         row["title"], song_ids, row["subsonic_mirror_remote_id"])
     if result["status"] != "ok" and result.get("code") == subsonic_client.ERROR_DATA_NOT_FOUND \
@@ -188,22 +229,33 @@ def write_mirror(conn, playlist_id: int, tag_index_cache: dict | None = None) ->
         conn.execute(
             "UPDATE playlists SET subsonic_mirror_remote_id = NULL WHERE id = ?", (playlist_id,))
         conn.commit()  # before calling out again
+        current = None  # a fresh copy overwrites nothing
         result = subsonic_client.mirror_create_or_replace_playlist(row["title"], song_ids, None)
     if result["status"] != "ok":
         _set_error(conn, playlist_id, "write_failed", result.get("reason"))
         return
 
     remote_id = result["remote_id"]
+    discarded, restored = mirror_copies.overwritten(conn, playlist_id, "subsonic", current, song_ids)
     subsonic_client.mirror_set_playlist_metadata(
         remote_id, row["title"],
         f"Trobar mirror — {len(song_ids)} of {total} present, grows with your library",
     )
+    # A fresh copy is in the mirror account; an old one is where we put it.
+    held_by = row["subsonic_mirror_owner"] if row["subsonic_mirror_remote_id"] == remote_id else None
+    held_by = _hand_over(remote_id, held_by, row["owner_subsonic_username"], tag_index_cache)
 
     conn.execute(
-        "UPDATE playlists SET subsonic_mirror_remote_id = ?, "
+        "UPDATE playlists SET subsonic_mirror_remote_id = ?, subsonic_mirror_owner = ?, "
         "subsonic_mirror_last_written_at = datetime('now'), "
         "subsonic_mirror_last_error = NULL, subsonic_mirror_last_error_code = NULL "
         "WHERE id = ?",
-        (remote_id, playlist_id),
+        (remote_id, held_by, playlist_id),
     )
-    mirror_runs.record(conn, playlist_id, "subsonic", len(entries), len(song_ids), lacked)
+    # Nothing reads the copy back after the write, so the next baseline is
+    # what was written; stored after the last call out.
+    mirror_copies.remember(conn, playlist_id, "subsonic", [
+        {"id": sid, "artist": placed[sid]["artist"], "title": placed[sid]["title"]}
+        for sid in dict.fromkeys(str(i) for i in song_ids)])
+    mirror_runs.record(conn, playlist_id, "subsonic", len(entries), len(song_ids), lacked,
+                       discarded=discarded, restored=restored)

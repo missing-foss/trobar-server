@@ -1764,6 +1764,30 @@ msgstr ""
 msgid "The list could not be loaded."
 msgstr ""
 
+#, python-brace-format
+msgid "{n} edit overwritten"
+msgstr ""
+
+#, python-brace-format
+msgid "{n} edits overwritten"
+msgstr ""
+
+#, python-brace-format
+msgid "Changed in {sink} since Trobar last wrote this copy, and undone by this write. Trobar's playlist is the source: edit it there to keep a change."
+msgstr ""
+
+msgid "Changed in the .m3u file since Trobar last wrote it, and undone by this write. Trobar's playlist is the source: edit it there to keep a change."
+msgstr ""
+
+msgid "Added there, removed"
+msgstr ""
+
+msgid "Removed there, put back"
+msgstr ""
+
+msgid "What happened"
+msgstr ""
+
 #: main.py:1703
 #, python-brace-format
 msgid "{n} playlist short on a target"
@@ -2162,6 +2186,90 @@ msgstr ""
 
 #: main.py:1857
 msgid "Failed to request an album from Lidarr:"
+msgstr ""
+
+msgid "Gaps"
+msgstr ""
+
+msgid "Tracks in the playlists you can see that don't match anything in your library, grouped by album. Exclude one to stop flagging it: it doesn't change what syncs to a device."
+msgstr ""
+
+msgid "{tracks} tracks in {playlists} playlists"
+msgstr ""
+
+msgid "Nothing missing: every track in the playlists you can see is in your library, or excluded."
+msgstr ""
+
+msgid "No gaps match these filters."
+msgstr ""
+
+msgid "Couldn't load the gaps."
+msgstr ""
+
+msgid "Owner"
+msgstr ""
+
+msgid "Everyone"
+msgstr ""
+
+msgid "No owner"
+msgstr ""
+
+msgid "All sources"
+msgstr ""
+
+msgid "Show excluded"
+msgstr ""
+
+msgid "(from MusicBrainz)"
+msgstr ""
+
+msgid "1 track"
+msgstr ""
+
+msgid "No album known"
+msgstr ""
+
+msgid "can be excluded, not requested"
+msgstr ""
+
+msgid "In"
+msgstr ""
+
+msgid "shared"
+msgstr ""
+
+msgid "excluded"
+msgstr ""
+
+msgid "{albums} albums selected ({tracks} tracks)"
+msgstr ""
+
+msgid "Request from Lidarr"
+msgstr ""
+
+msgid "Include again"
+msgstr ""
+
+msgid "Requested from Lidarr, {when}"
+msgstr ""
+
+msgid "Lidarr found no such artist"
+msgstr ""
+
+msgid "Asked Lidarr for {n} albums. Each one shows here once Lidarr has answered."
+msgstr ""
+
+msgid "Nothing was asked: none of those albums is an open gap any more."
+msgstr ""
+
+msgid "That didn't work. Try again."
+msgstr ""
+
+msgid "Lidarr isn't set up."
+msgstr ""
+
+msgid "albums must be a list of {artist, album}."
 msgstr ""
 
 #: main.py:1859
@@ -2955,10 +3063,7 @@ msgstr ""
 
 #: main.py:2052
 #, python-brace-format
-msgid ""
-"Re-pair \"{name}\" with a fresh app install? The app keeps this device's "
-"music, settings and history. Whatever is currently paired stops working "
-"and must be re-paired too."
+msgid "Re-pair \"{name}\" with a fresh app install? The app keeps this device's music, settings and history. Whatever is paired now keeps working until the new app uses the code, within the 20 minutes before it expires; from then on, only the new app can sync."
 msgstr ""
 
 #: main.py:2053
@@ -3303,9 +3408,7 @@ msgid "Unauthorized access to this playlist subscription"
 msgstr ""
 
 #: main.py:3131
-msgid ""
-"That doesn't look like a YouTube Music or Spotify playlist link. Copy the"
-" playlist's Share link, or the address bar while it's open."
+msgid "That doesn't look like a YouTube Music, Spotify or Tidal playlist link. Copy the playlist's Share link, or the address bar while it's open."
 msgstr ""
 
 #: main.py:3277 main.py:5576
@@ -3934,6 +4037,26 @@ msgstr ""
 msgid "by"
 msgstr ""
 
+#: templates/index.html
+msgid "Sort"
+msgstr ""
+
+#: templates/index.html
+msgid "Availability"
+msgstr ""
+
+#: templates/index.html
+msgid "Most tracks"
+msgstr ""
+
+#: templates/index.html
+msgid "Newest in Trobar"
+msgstr ""
+
+#: templates/index.html
+msgid "Name (A–Z)"
+msgstr ""
+
 #: templates/index.html:895
 msgid "Hide playlists with no local tracks"
 msgstr ""
@@ -3955,11 +4078,7 @@ msgid "Add"
 msgstr ""
 
 #: templates/index.html:947
-msgid ""
-"Public YouTube Music and Spotify playlists only — no account and no sign-"
-"in. Trobar reads the playlist and matches its tracks against your own "
-"library; nothing is sent to either service and nothing is downloaded from"
-" it."
+msgid "Public YouTube Music, Spotify and Tidal playlists only — no account and no sign-in. Trobar reads the playlist and matches its tracks against your own library; nothing is sent to these services and nothing is downloaded from them."
 msgstr ""
 
 #: templates/index.html:1228 templates/index.html:1948
@@ -5906,4 +6025,218 @@ msgstr ""
 
 #: app/templates/index.html
 msgid "Last.fm wasn't connected. Try again."
+msgstr ""
+
+#: templates/index.html
+msgid "since {since} · {n} runs · {reason}"
+msgstr ""
+
+#: templates/index.html
+msgid "since {since} · {n} run · {reason}"
+msgstr ""
+
+#: templates/index.html
+msgid "Every place a playlist sync reads from, and how its runs have gone. A source that fails {runs} runs in a row, for at least {hours} hours, shows in the header for admins until it recovers."
+msgstr ""
+
+#: templates/index.html
+msgid "synced {when}"
+msgstr ""
+
+#: templates/index.html
+msgid "Source health"
+msgstr ""
+
+#: templates/index.html
+msgid "{provider} for {account}"
+msgstr ""
+
+#: templates/index.html
+msgid "{user} (own listing)"
+msgstr ""
+
+#: templates/index.html
+msgid "{n} playlist sources are failing: {names}"
+msgstr ""
+
+#: templates/index.html
+msgid "{n} playlist source is failing: {names}"
+msgstr ""
+
+#: templates/index.html
+msgid "alerting"
+msgstr ""
+
+#: templates/index.html
+msgid "Details"
+msgstr ""
+
+#: templates/index.html
+msgid "alerts after {runs} runs and {hours} hours"
+msgstr ""
+
+#: templates/index.html
+msgid "Failing"
+msgstr ""
+
+#: templates/index.html
+msgid "Account"
+msgstr ""
+
+#: templates/index.html
+msgid "OK"
+msgstr ""
+
+#: templates/index.html
+msgid "{source} has failed since {since}"
+msgstr ""
+
+#: templates/index.html
+msgid "Source"
+msgstr ""
+
+#: templates/index.html
+msgid "see Administration"
+msgstr ""
+
+#: templates/index.html
+msgid "State"
+msgstr ""
+
+#: templates/index.html
+msgid "No playlist sync has run yet."
+msgstr ""
+
+#: templates/index.html
+msgid "Unknown user."
+msgstr ""
+
+#: admin.py
+msgid "Say who the account belongs to: a member, or null for everyone."
+msgstr ""
+
+#: templates/index.html
+msgid "{account} → {user}: {n} playlists become private to {user}."
+msgstr ""
+
+#: templates/index.html
+msgid "{account} → {user}: {n} playlist becomes private to {user}."
+msgstr ""
+
+#: templates/index.html
+msgid "Belongs to"
+msgstr ""
+
+#: templates/index.html
+msgid "Service"
+msgstr ""
+
+#: templates/index.html
+msgid "No other member has them on a device. {user} can share any of them again from its row."
+msgstr ""
+
+#: templates/index.html
+msgid "{n} device selections by other members ({who}) are removed at the next sync, as when an owner stops sharing. {user} can share any of them again from its row."
+msgstr ""
+
+#: templates/index.html
+msgid "{n} device selection by other members ({who}) is removed at the next sync, as when an owner stops sharing. {user} can share any of them again from its row."
+msgstr ""
+
+#: templates/index.html
+msgid "Account in Music Assistant"
+msgstr ""
+
+#: templates/index.html
+msgid "Streaming accounts in Music Assistant"
+msgstr ""
+
+#: templates/index.html
+msgid "Playlists that come from one member's account belong to that member: private to them, and they can share each one from its row. \"Everyone\" keeps an account's playlists visible to all, as today. A playlist in more than one account stays visible to all."
+msgstr ""
+
+#: templates/index.html
+msgid "Who {account} belongs to"
+msgstr ""
+
+#: templates/index.html
+msgid "Everyone (as today)"
+msgstr ""
+
+msgid "Tidal links need the server's Tidal app to be set up first: an admin enters its client ID and secret under Admin, Tidal."
+msgstr ""
+
+msgid "Tidal playlist links"
+msgstr ""
+
+msgid "Couldn't read this playlist from Tidal. Nothing already imported was changed."
+msgstr ""
+
+msgid "A Navidrome admin account: members who give their Navidrome username get their own playlists as theirs."
+msgstr ""
+
+msgid "Another member already has that Navidrome user."
+msgstr ""
+
+msgid "Change"
+msgstr ""
+
+msgid "Check the spelling: it's the name you sign in to Navidrome with."
+msgstr ""
+
+#, python-brace-format
+msgid "Clear {user}'s Navidrome user {name}? Their Navidrome playlists stop being theirs at the next sync."
+msgstr ""
+
+msgid "Navidrome couldn't be reached."
+msgstr ""
+
+msgid "Navidrome didn't accept that username and password."
+msgstr ""
+
+#, python-brace-format
+msgid "Navidrome user {name}"
+msgstr ""
+
+msgid "No Navidrome server is set up."
+msgstr ""
+
+#, python-brace-format
+msgid "No Navidrome user called {name}"
+msgstr ""
+
+msgid "Not a Navidrome admin account: only the shared library pass runs. Members' own playlists and mirror copies need an admin account here and on the mirror target."
+msgstr ""
+
+msgid "So the playlists you keep in Navidrome sync as yours, private ones staying private, and your mirror copies go into your Navidrome account. The password proves the username is yours: it is checked once and never stored."
+msgstr ""
+
+msgid "Too many attempts. Try again later."
+msgstr ""
+
+msgid "Your Navidrome password"
+msgstr ""
+
+msgid "Your Navidrome username"
+msgstr ""
+
+#, python-brace-format
+msgid "{n} of your Navidrome playlists sync as yours."
+msgstr ""
+
+#, python-brace-format
+msgid "{n} of your Navidrome playlists syncs as yours."
+msgstr ""
+
+msgid "That is the account Trobar uses on Navidrome, not a member's."
+msgstr ""
+
+msgid "No cover for this album"
+msgstr ""
+
+#, python-brace-format
+msgid "The size must be between {min} and {max} pixels."
+msgstr ""
+
+msgid "This cover address is not valid."
 msgstr ""

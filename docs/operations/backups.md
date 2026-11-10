@@ -20,15 +20,24 @@ session key, treat it like a password store — **back it up encrypted**, and
 restrict who can read it.
 
 **The credential key.** The Maloja API key, ListenBrainz user token and Last.fm
-session that send plays, and the Last.fm shared secret, are encrypted with a key in `credential_key`. A database snapshot doesn't
+session that send plays, the Last.fm shared secret, and each person's Tidal
+refresh token are encrypted with a key in `credential_key`. A database snapshot doesn't
 include that file, so a leaked snapshot doesn't give anyone those values, and a
 copy of all of `DATA_DIR` does include it. To keep it out, set
 `TROBAR_CREDENTIAL_KEY_FILE` to a path outside `DATA_DIR` and back that file up
-separately. If the key is lost or changes, nothing breaks: those two values read
-as gone, their owners see a request to enter them again, and plays and every
-other setting stay as they were. The same goes for a key file that is damaged:
-saving a token then fails until you delete that file, and Trobar makes a new key
-the next time one is saved.
+separately. If the key is lost or changes, nothing breaks: those values read
+as gone, their owners see a request to enter them again (for Tidal, Connect
+again on their Profile), and plays, playlists and every other setting stay as
+they were. A key file that is damaged is different:
+
+- the play-sending credentials read as gone, and saving one fails until you
+  delete that file; Trobar makes a new key the next time one is saved;
+- Tidal links are kept. Tidal syncs for those people stop until the key works
+  again, and linking Tidal is refused meanwhile. A token Tidal renews during a
+  sync in that time is stored unencrypted, until a start with a working key
+  encrypts it.
+  Restore the key from a backup if you have one: deleting the damaged file
+  makes it a lost key, and everyone connects Tidal again.
 
 !!! danger "Back it up to the NAS — don't run it from there"
 

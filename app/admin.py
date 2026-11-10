@@ -28,6 +28,7 @@ import album_lookup
 import artist_images
 import credential_store
 import db
+import source_health
 import emby_client
 import filesystem_client
 import jellyfin_client
@@ -1336,6 +1337,104 @@ def api_admin_health():
         })
 
 
+@bp.route("/api/admin/source-health")
+def api_admin_source_health():
+    """Every playlist source the last sync tried and how it has fared
+    (source_health.py), alerting ones first: the Source health list in
+    Administration, and the header line admins see while any alerts."""
+    with db.connection() as conn:
+        require_admin(conn)
+        return jsonify({"sources": source_health.rows(conn),
+                        "alert_runs": source_health.ALERT_RUNS,
+                        "alert_hours": source_health.ALERT_HOURS})
+
+
+def _ma_account_rows(conn, instance_id: str, listing: dict) -> list[int]:
+    """Trobar's rows for the Music Assistant playlists only this account
+    carries: the ones an owner mapping would give to a member."""
+    ids = [pl["id"] for pl in listing.get("playlists", []) if (pl.get("accounts") or []) == [instance_id]]
+    if not ids:
+        return []
+    return [r["id"] for r in conn.execute(
+        f"SELECT id FROM playlists WHERE source_provider = 'music_assistant' "
+        f"AND source_playlist_id IN ({','.join('?' * len(ids))})", ids)]
+
+
+@bp.route("/api/admin/music-assistant/accounts")
+def api_admin_ma_accounts():
+    """The streaming accounts Music Assistant has, each with how many of its
+    playlists Trobar holds and the member it belongs to (null: everyone),
+    and the members to choose from."""
+    with db.connection() as conn:
+        require_admin(conn)
+        accounts = music_assistant_client.streaming_accounts()
+        if accounts["status"] != "ok":
+            return jsonify({"status": "error", "accounts": [], "users": []})
+        listing = music_assistant_client.list_playlists()
+        owners = playlist_sync.ma_account_owners(conn)
+        users = [{"id": r["id"], "username": r["username"]}
+                 for r in conn.execute("SELECT id, username FROM users ORDER BY username")]
+        return jsonify({"status": "ok", "users": users, "accounts": [
+            {**a, "owner_user_id": owners.get(a["instance_id"]),
+             "playlists": len(_ma_account_rows(conn, a["instance_id"], listing))}
+            for a in accounts["accounts"]]})
+
+
+def _validated_ma_owner(conn, body) -> int | None:
+    owner = body.get("owner_user_id") if isinstance(body, dict) else None
+    if owner is None:
+        return None
+    if not isinstance(owner, int) or isinstance(owner, bool) \
+            or conn.execute("SELECT 1 FROM users WHERE id = ?", (owner,)).fetchone() is None:
+        abort(400, description=_("Unknown user."))
+    return owner
+
+
+@bp.route("/api/admin/music-assistant/accounts/<path:instance_id>/preview", methods=["POST"])
+def api_admin_ma_account_preview(instance_id):
+    """What giving this account to a member would do, before it is saved:
+    how many playlists become private to them, and whose device selections
+    of those go, per member. Nothing changes here."""
+    with db.connection() as conn:
+        require_admin(conn)
+        owner = _validated_ma_owner(conn, request.get_json(silent=True) or {})
+        rows = _ma_account_rows(conn, instance_id, music_assistant_client.list_playlists())
+        if owner is None or not rows:
+            return jsonify({"playlists": len(rows) if owner is not None else 0, "revoked": []})
+        revoked = conn.execute(
+            f"SELECT u.username, COUNT(*) AS n FROM selections s JOIN users u ON u.id = s.created_by_user_id "
+            f"WHERE s.type = 'playlist' AND s.target IN ({','.join('?' * len(rows))}) "
+            f"AND s.created_by_user_id != ? AND u.is_admin = 0 GROUP BY u.username ORDER BY u.username",
+            [str(r) for r in rows] + [owner]).fetchall()
+        return jsonify({"playlists": len(rows),
+                        "revoked": [{"username": r["username"], "count": r["n"]} for r in revoked]})
+
+
+@bp.route("/api/admin/music-assistant/accounts/<path:instance_id>", methods=["PUT"])
+def api_admin_ma_account_owner(instance_id):
+    """Gives a Music Assistant streaming account to a member, or back to
+    everyone (null). Takes effect at the next playlist sync, through the
+    owner change every sync already handles: private to the new owner, and
+    other members' selections of it removed."""
+    with db.connection() as conn:
+        require_admin(conn)
+        body = request.get_json(silent=True)
+        # Everyone is an explicit null, never a missing field or a body that
+        # isn't JSON: read as Everyone, those would make a member's private
+        # playlists visible to all from the next sync.
+        if not isinstance(body, dict) or "owner_user_id" not in body:
+            abort(400, description=_("Say who the account belongs to: a member, or null for everyone."))
+        owner = _validated_ma_owner(conn, body)
+        if owner is None:
+            conn.execute("DELETE FROM ma_account_owners WHERE instance_id = ?", (instance_id,))
+        else:
+            conn.execute("INSERT INTO ma_account_owners (instance_id, user_id) VALUES (?, ?) "
+                         "ON CONFLICT(instance_id) DO UPDATE SET user_id = excluded.user_id",
+                         (instance_id, owner))
+        conn.commit()
+        return jsonify({"status": "ok", "instance_id": instance_id, "owner_user_id": owner})
+
+
 @bp.route("/api/admin/mirrors")
 def api_admin_mirrors():
     """#285/#189: admin-only read-only overview of every playlist with ANY
@@ -1395,6 +1494,12 @@ def api_admin_mirrors():
             # api_admin_mirror_missing.
             d["coverage"] = {sink: coverage[(r["id"], sink)] for sink in mirror_runs.SINKS
                              if (r["id"], sink) in coverage}
+            # What the last write to each target overwrote there, the folder
+            # included; the tracks come from api_admin_mirror_missing too.
+            d["overwrites"] = {
+                sink: {"discarded": run["discarded"], "restored": run["restored"]}
+                for sink in mirror_runs.RECORDING_SINKS
+                if (run := coverage.get((r["id"], sink))) and (run["discarded"] or run["restored"])}
             d["mirror_enabled"] = bool(d["mirror_enabled"])
             d["subsonic_mirror_enabled"] = bool(d["subsonic_mirror_enabled"])
             d["jellyfin_mirror_enabled"] = bool(d["jellyfin_mirror_enabled"])
@@ -1424,11 +1529,12 @@ def api_admin_mirrors():
 @bp.route("/api/admin/mirrors/<int:playlist_id>/<sink>/missing")
 def api_admin_mirror_missing(playlist_id: int, sink: str):
     """The tracks the last write to one sink left off its target, each with
-    its reason (mirror_runs). Admin only, like the overview it opens from.
-    404 for an unknown sink or a pair with no recorded write."""
+    its reason, and the edits made there that it overwrote (mirror_runs).
+    The folder mirror has only the latter. Admin only, like the overview it
+    opens from. 404 for an unknown sink or a pair with no recorded write."""
     with db.connection() as conn:
         require_admin(conn)
-        if sink not in mirror_runs.SINKS:
+        if sink not in mirror_runs.RECORDING_SINKS:
             abort(404)
         run = mirror_runs.missing(conn, playlist_id, sink)
         if run is None:
@@ -1568,7 +1674,7 @@ def api_admin_users():
         # Correlated subqueries rather than joins: three independent one-to-many
         # counts would otherwise multiply each other, and a user list is small.
         rows = conn.execute(
-            "SELECT id, username, email, is_admin, "
+            "SELECT id, username, email, is_admin, subsonic_username, "
             "(password_hash IS NOT NULL) AS has_local_password, "
             "(SELECT COUNT(*) FROM devices WHERE owner_user_id = users.id) AS owned_devices, "
             "(SELECT COUNT(*) FROM selections WHERE created_by_user_id = users.id) "
@@ -1739,6 +1845,21 @@ def api_admin_user_jellyfin_user(target_user_id: int):
         body = request.get_json(force=True)
         mapped_id = (body.get("jellyfin_user_id") or "").strip() or None
         conn.execute("UPDATE users SET jellyfin_user_id = ? WHERE id = ?", (mapped_id, target_user_id))
+        conn.commit()
+        return jsonify({"status": "ok"})
+
+
+@bp.route("/api/admin/users/<int:target_user_id>/subsonic-username", methods=["DELETE"])
+def api_admin_user_subsonic_username(target_user_id: int):
+    """Clears a member's Navidrome username, for a claim made in error: the
+    member proved it with that user's password on Profile, and only an admin
+    can take it away from them. Their Navidrome playlists stop being theirs
+    at the next sync (a private one becomes visible to admins only)."""
+    with db.connection() as conn:
+        require_admin(conn)
+        cur = conn.execute("UPDATE users SET subsonic_username = NULL WHERE id = ?", (target_user_id,))
+        if cur.rowcount == 0:
+            abort(404, description=_("User not found"))
         conn.commit()
         return jsonify({"status": "ok"})
 

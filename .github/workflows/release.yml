@@ -47,6 +47,13 @@ jobs:
         env:
           REF: ${{ github.ref_name }}
         run: |
+          # A dispatch from a branch named like a version would otherwise pass,
+          # and the draft would then carry a tag GitHub creates on publish, on
+          # the default branch's head rather than on the commit checked here.
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::'$REF' is a $GITHUB_REF_TYPE, not a tag -- dispatch this from the tag"
+            exit 1
+          fi
           ref="$REF"
           case "$ref" in
             v*) ;;
@@ -93,8 +100,34 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0 # the previous tag, for the notes' starting point
+      - name: Release notes from CHANGELOG.md
+        # The draft's notes are this version's CHANGELOG.md section, written
+        # and reviewed in the version-bump pull request, then the fixed line(s)
+        # below. A missing or empty section stops the job before any draft
+        # exists. Its own step, so it can be run alone to see the body.
+        env:
+          TAG: ${{ github.ref_name }}
+          SUPPORT_LINE: "If Trobar is useful to you, you can support its development on Ko-fi: https://ko-fi.com/missingfoss"
+        run: |
+          version="${TAG#v}"
+          notes="$RUNNER_TEMP/release-notes.md"
+          # The lines after "## [X.Y.Z]" (a date after it optional), up to the
+          # next "## ", without the blank lines at either end.
+          awk -v h="## [$version]" '
+              index($0, h) == 1 && (length($0) == length(h) || substr($0, length(h) + 1, 1) == " ") { inside = 1; next }
+              inside && /^## / { exit }
+              inside { print }' CHANGELOG.md \
+            | sed -e '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > "$notes"
+          # A relative link (docs/..., README.md#...) would resolve against the
+          # release page; point it at the file as it is at this tag.
+          sed -i -E "s#\]\(([^)#:][^):]*)\)#](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/\1)#g" "$notes"
+          if ! grep -q '^- ' "$notes"; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section with an entry -- no draft without release notes"
+            exit 1
+          fi
+          printf '\n%s\n' "$SUPPORT_LINE" >> "$notes"
+          echo "--- release notes for $TAG ---"
+          cat "$notes"
       - name: Create the draft release, or leave an existing one alone
         # `gh` in a run: step rather than a third-party release action — the
         # organisation's Actions policy allows GitHub-owned and
@@ -102,25 +135,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-          SUPPORT_LINE: "If Trobar is useful to you, you can support its development on Ko-fi: https://ko-fi.com/missingfoss"
         run: |
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $TAG already exists — leaving it alone"
           else
-            previous="$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo '')"
-            if [ -n "$previous" ]; then
-              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --draft --generate-notes --notes-start-tag "$previous"
-            else
-              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --draft --generate-notes
-            fi
-            # The support line goes after the generated notes: gh's --notes
-            # beside --generate-notes would put it first. Two newlines, so it is
-            # its own paragraph whether or not the body ends in one. Only a
-            # draft this run just created gets it: a re-run never adds it twice.
-            notes="$RUNNER_TEMP/release-notes.md"
-            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$notes"
-            printf '\n\n%s\n' "$SUPPORT_LINE" >> "$notes"
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --draft \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
           cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
           ### $TAG — draft release created

@@ -49,14 +49,14 @@ Authorization: Bearer <device token>
 
 ```json
 {"user_id": 1, "username": "alice", "is_admin": false,
- "device_id": 3, "device_name": "Phone", "app_api": 6}
+ "device_id": 3, "device_name": "Phone", "app_api": 7}
 ```
 
 ## Versioning: the `app_api` level
 
 `GET /api/device/info` carries `"app_api": <integer>` beside the fields it
 always had. It is the level of this contract the server speaks —
-**6** today. A server from before the App API sends no such field.
+**7** today. A server from before the App API sends no such field.
 
 | level | brought |
 |---|---|
@@ -66,6 +66,7 @@ always had. It is the level of this contract the server speaks —
 | 4 | removing a selection from a device, and counting what that would delete |
 | 5 | an album's tracks |
 | 6 | the library by album artist |
+| 7 | the Home album widgets (suggestions, recently added, recently released) leave out an album already selected for the calling device, by album or whole artist |
 
 The rule for a client: read it as an integer and as nothing else — absent,
 `0` or anything that is not a number means *no App API*, and the screens
@@ -272,7 +273,7 @@ what are one rule for both, not two.
 | `POST /api/app/playlists/<id>/unresolved-tracks/exclude` `{ids, excluded}` | marks them as not a gap (or not any more); returns `{"unresolved_count"}` |
 | `POST /api/app/playlists/<id>/lidarr-requests` `{enabled}` | the per-playlist toggle: on, it requests the missing albums now and on each sync; off stops future requests only |
 | `GET /api/app/playlist-subscriptions` | `{"subscriptions": [...]}` — the owner's own, admin included |
-| `POST /api/app/playlist-subscriptions` `{url}` | subscribes and imports at once; returns `{"status", "subscription"}`. The link is a YouTube Music or Spotify playlist link; `400` for anything else. A subscription's `provider` is `ytmusic` or `spotify_public`, and its `track_limit` is the most tracks the source returns (`100` for Spotify), or `null` when it returns them all |
+| `POST /api/app/playlist-subscriptions` `{url}` | subscribes and imports at once; returns `{"status", "subscription"}`. The link is a YouTube Music, Spotify or Tidal playlist link; `400` for anything else, or for a Tidal link when the server's Tidal app isn't set up. A subscription's `provider` is `ytmusic`, `spotify_public` or `tidal_public`, and its `track_limit` is the most tracks the source returns (`100` for Spotify), or `null` when it returns them all |
 | `POST /api/app/playlist-subscriptions/<id>/refresh` | re-fetches one; owner or admin |
 | `DELETE /api/app/playlist-subscriptions/<id>` | unsubscribes and removes the playlist it produced; owner or admin |
 

@@ -19,6 +19,53 @@ history is in the git log.
 
 ## [Unreleased]
 
+## [2.18.0]
+
+### Added
+
+- Devices: album covers at the size a device asks for. `/api/device/changes?cover_size=N` lists up to 60 albums with a signed address each, and `GET /api/device/cover/<id>` answers those addresses, with no token, for a device that can't send one with an image request, such as a Garmin watch.
+- Navidrome: each member can give their Navidrome username on Profile, proved once with their Navidrome password, which is never stored. Their Navidrome playlists then sync as theirs, private ones staying private, and their mirror copies go into their own Navidrome account. The account Trobar uses must be a Navidrome admin, and Administration says whether it is. A private Navidrome playlist whose owner isn't a member yet is visible to administrators only. See [Subsonic](docs/providers/subsonic.md#members-own-playlists-navidrome).
+- Mirrors: when a write undoes edits made on a mirror's copy since the last one (a track added there, or one removed), Administration > Playlist mirrors says how many, the `.m3u` folder included, and **Show** lists them. The playlist's owner sees the count on its mirror icon. See [Playlists](docs/using/playlists.md).
+- Integrations: `GET /api/integrations/playlists` says which playlists each device has and how complete each is, with the server's totals; `POST /api/integrations/actions/playlist-sync` starts a playlist sync, as the web UI's button does. Private playlists are listed without their titles. For Home Assistant playlist entities and a sync button. See the [integration API](docs/reference/integration-api.md#device-playlists).
+- Source health: a playlist source that fails 3 syncs in a row, for at least 12 hours, shows in the header for admins until it recovers, and Administration lists every source and how it has fared. Integrations read it from `GET /api/integrations/playlist-sources`.
+- Music Assistant: an admin can give each streaming account Music Assistant holds (a member's Tidal favourites, say) to that member, in Administration. Its playlists become theirs and private to them, and other members' device selections of them are removed at the next sync, after a warning that says how many.
+- A device can set its own Artist images (Off, Small or Full) from the app, as the web UI can.
+- A Sort choice on the Playlists tab: Availability, Most tracks, Newest in Trobar or Name. Each browser remembers its own.
+- Public Tidal playlists by link, in the same box as Spotify and YouTube Music links: no Tidal account, read with the server's Tidal app, in full, with each track's ISRC for exact matching. See [Tidal links](docs/providers/tidal-links.md).
+
+### Fixed
+
+- Navidrome: when the account Trobar reads through is a Navidrome admin, other users' private Navidrome playlists were synced as household playlists every member could see. A private one whose owner isn't a member is now visible to administrators only, and members' selections of it are removed at the next sync.
+- The Re-pair confirmation no longer says the current pairing stops working at once.
+  It keeps working until the new app uses the code, within its 20 minutes.
+- Signing in with SSO right after logging out no longer fails on the first try
+  when another Trobar tab is busy: the sign-in keeps its state in a cookie of
+  its own, which no other page can overwrite.
+- A playlist mirrored to Emby keeps its note ("Trobar mirror — N of M present").
+  Emby reset it a few seconds after each write; the note is now written again
+  once after each sync or edit, 6 s after its last write.
+- The login page's "or" divider and the setup steps' dots and connectors show
+  in every theme, and the sign-in and setup buttons show their hover. They were
+  invisible.
+- The unmatched-tracks panel on a playlist, a device's unknown-files panel and
+  the Shared badge follow the theme. In dark themes they were cream boxes with
+  near-invisible text.
+- Matching a playlist track whose title holds thousands of brackets or spaces
+  no longer takes seconds: a title of 50,000 took about 15 s and now takes
+  milliseconds.
+- A playlist mirrored to Music Assistant and rewritten twice within a second no
+  longer reports "the tracks are there, in a different order" when they are
+  right.
+
+### Changed
+
+- Each person's Tidal refresh token is encrypted at rest, with the same key as
+  the credentials that send plays. The ones already stored are encrypted at the
+  first start, and everyone stays linked. If the key is lost, each person
+  connects Tidal again on their Profile.
+  See [Upgrading](docs/operations/upgrading.md#tidal-refresh-tokens-are-encrypted-at-rest-2180).
+- App API level 7: on the phone, the Home album widgets (Suggestions, Recently added, Recently released) leave out albums already selected for that phone, and still fill to their size.
+
 ## [2.17.0]
 
 ### Security

@@ -502,5 +502,175 @@ class DeleteMirrorTests(_MirrorSubsonicTestBase):
         self.assertIsNone(self._row(pid)["subsonic_mirror_remote_id"])
 
 
+
+class OverwriteTests(_MirrorSubsonicTestBase):
+    """An edit made to the copy in Navidrome is overwritten by the next
+    write; the run says what it discarded and what it put back. The copy is
+    read before each replace."""
+
+    INDEX = {
+        _key("Artist", "Album", "One"): [{"id": "s1", "track_no": None}],
+        _key("Artist", "Album", "Two"): [{"id": "s2", "track_no": None}],
+    }
+
+    def _write(self, pid, current):
+        with mock.patch("mirror_subsonic.subsonic_client") as client:
+            client.ERROR_DATA_NOT_FOUND = subsonic_client.ERROR_DATA_NOT_FOUND
+            client.mirror_build_tag_index.return_value = self.INDEX
+            client.mirror_read_items.return_value = current
+            client.mirror_create_or_replace_playlist.return_value = {"status": "ok", "remote_id": "9"}
+            mirror_subsonic.write_mirror(self.conn, pid)
+            reads = client.mirror_read_items.call_count
+        run = mirror_runs.missing(self.conn, pid, "subsonic")
+        assert run is not None
+        return run, reads
+
+    def _playlist(self, *titles):
+        pid = self._make_playlist("Mix")
+        for pos, title in enumerate(titles):
+            self._add_playlist_track(pid, pos, self._make_track("Artist", "Album", title))
+        return pid
+
+    @staticmethod
+    def _item(item_id, title, artist="Artist"):
+        return {"id": item_id, "artist": artist, "title": title}
+
+    def test_a_new_copy_is_not_read_and_reports_nothing(self):
+        run, reads = self._write(self._playlist("One"), None)
+        self.assertEqual(reads, 0)
+        self.assertEqual((run["discarded"], run["restored"], run["overwritten"]), (0, 0, []))
+
+    def test_a_track_added_in_navidrome_is_discarded_and_said(self):
+        pid = self._playlist("One")
+        self._write(pid, None)
+        run, reads = self._write(pid, [self._item("s1", "One"), self._item("x9", "Stray", "Someone")])
+        self.assertEqual(reads, 1)
+        self.assertEqual(run["overwritten"], [{"artist": "Someone", "title": "Stray", "change": "discarded"}])
+
+    def test_a_track_removed_in_navidrome_is_put_back_and_said(self):
+        pid = self._playlist("One", "Two")
+        self._write(pid, None)
+        run, _ = self._write(pid, [self._item("s1", "One")])
+        self.assertEqual(run["overwritten"], [{"artist": "Artist", "title": "Two", "change": "restored"}])
+
+    def test_a_change_made_in_trobar_is_not_an_overwrite(self):
+        pid = self._playlist("One")
+        self._write(pid, None)
+        self._add_playlist_track(pid, 1, self._make_track("Artist", "Album", "Two"))
+        run, _ = self._write(pid, [self._item("s1", "One")])
+        self.assertEqual((run["discarded"], run["restored"]), (0, 0))
+
+    def test_a_copy_that_cannot_be_read_is_written_and_says_nothing(self):
+        pid = self._playlist("One")
+        self._write(pid, None)
+        run, _ = self._write(pid, None)
+        self.assertEqual((run["on_target"], run["discarded"], run["restored"]), (1, 0, 0))
+
+    def test_a_copy_gone_between_the_read_and_the_write_reports_nothing(self):
+        # Read fine, then the replace finds the copy gone and makes a new
+        # one: the new copy overwrote nothing, whatever the old one held.
+        pid = self._playlist("One")
+        self._write(pid, None)
+        with mock.patch("mirror_subsonic.subsonic_client") as client:
+            client.ERROR_DATA_NOT_FOUND = subsonic_client.ERROR_DATA_NOT_FOUND
+            client.mirror_build_tag_index.return_value = self.INDEX
+            client.mirror_read_items.return_value = [self._item("s1", "One"), self._item("x9", "Stray")]
+            client.mirror_create_or_replace_playlist.side_effect = [
+                {"status": "error", "code": subsonic_client.ERROR_DATA_NOT_FOUND, "reason": "gone"},
+                {"status": "ok", "remote_id": "10"}]
+            mirror_subsonic.write_mirror(self.conn, pid)
+        run = mirror_runs.missing(self.conn, pid, "subsonic")
+        assert run is not None
+        self.assertEqual((run["discarded"], run["restored"]), (0, 0))
+
+    def test_stopping_the_mirror_forgets_the_baseline(self):
+        pid = self._playlist("One")
+        self._write(pid, None)
+        with mock.patch("mirror_subsonic.subsonic_client") as client:
+            client.mirror_delete_playlist.return_value = True
+            mirror_subsonic.delete_mirror(self.conn, pid)
+        self.conn.commit()
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM mirror_copies WHERE playlist_id = ?", (pid,)).fetchone())
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class HandOverTests(_MirrorSubsonicTestBase):
+    """A mirror copy goes into its owner's Navidrome account (their username
+    from Profile) once, through the mirror account, and stays there."""
+
+    INDEX = {_key("Artist", "Album", "One"): [{"id": "s1", "track_no": None}]}
+
+    def _owned(self, subsonic_username, held_by=None, remote_id=None):
+        uid = self.conn.execute("INSERT INTO users (username, subsonic_username) VALUES ('robert', ?)",
+                                (subsonic_username,)).lastrowid
+        pid = self._make_playlist("Mix", remote_id=remote_id)
+        self.conn.execute("UPDATE playlists SET owner_user_id = ?, subsonic_mirror_owner = ? WHERE id = ?",
+                          (uid, held_by, pid))
+        self._add_playlist_track(pid, 0, self._make_track("Artist", "Album", "One"))
+        return pid
+
+    def _write(self, pid, users=frozenset({"bob", "trobar"}), gives=True, new_id="9", cache=None):
+        with mock.patch("mirror_subsonic.subsonic_client") as client:
+            client.ERROR_DATA_NOT_FOUND = subsonic_client.ERROR_DATA_NOT_FOUND
+            client.mirror_build_tag_index.return_value = self.INDEX
+            client.mirror_read_items.return_value = []
+            client.mirror_create_or_replace_playlist.return_value = {"status": "ok", "remote_id": new_id}
+            client.navidrome_usernames.return_value = users
+            client.navidrome_give_playlist.return_value = gives
+            mirror_subsonic.write_mirror(self.conn, pid, cache)
+            self.conn.commit()
+            gave = [c.args[3:] for c in client.navidrome_give_playlist.call_args_list]
+            looked = client.navidrome_usernames.call_count
+        held = self.conn.execute("SELECT subsonic_mirror_owner FROM playlists WHERE id = ?", (pid,)).fetchone()[0]
+        return held, gave, looked
+
+    def test_a_new_copy_goes_to_its_owner(self):
+        held, gave, _ = self._write(self._owned("Bob"))
+        self.assertEqual((held, gave), ("Bob", [("9", "Bob")]))
+
+    def test_a_copy_already_theirs_is_not_moved_again(self):
+        held, gave, looked = self._write(self._owned("bob", held_by="Bob", remote_id="9"))
+        self.assertEqual((held, gave, looked), ("Bob", [], 0))
+
+    def test_a_recreated_copy_is_given_again(self):
+        # The remembered copy was deleted on the server; the new one is in
+        # the mirror account whatever the row says.
+        held, gave, _ = self._write(self._owned("bob", held_by="bob", remote_id="9"), new_id="10")
+        self.assertEqual((held, gave), ("bob", [("10", "bob")]))
+
+    def test_an_owner_without_a_username_keeps_it_in_the_mirror_account(self):
+        held, gave, looked = self._write(self._owned(None))
+        self.assertEqual((held, gave, looked), (None, [], 0))
+
+    def test_removing_the_username_leaves_the_copy_where_it_is(self):
+        # Moving it back would take it out of their library unasked.
+        held, gave, looked = self._write(self._owned(None, held_by="bob", remote_id="9"))
+        self.assertEqual((held, gave, looked), ("bob", [], 0))
+
+    def test_a_username_the_server_does_not_know_is_not_tried(self):
+        held, gave, _ = self._write(self._owned("carol"))
+        self.assertEqual((held, gave), (None, []))
+
+    def test_a_failed_move_is_tried_on_the_next_write(self):
+        pid = self._owned("bob")
+        held, gave, _ = self._write(pid, gives=False)
+        self.assertEqual((held, len(gave)), (None, 1))
+        held, gave, _ = self._write(pid, gives=True)
+        self.assertEqual((held, len(gave)), ("bob", 1))
+
+    def test_one_run_reads_the_user_list_once(self):
+        cache: dict = {}
+        first = self._owned("bob")
+        self._write(first, cache=cache)
+        _, _, looked = self._write(self._another_of_the_same_owner(first), cache=cache, new_id="10")
+        self.assertEqual(looked, 0)
+
+    def _another_of_the_same_owner(self, pid):
+        owner = self.conn.execute("SELECT owner_user_id FROM playlists WHERE id = ?", (pid,)).fetchone()[0]
+        second = self._make_playlist("Mix 2")
+        self.conn.execute("UPDATE playlists SET owner_user_id = ? WHERE id = ?", (owner, second))
+        self._add_playlist_track(second, 0, self._make_track("Artist", "Album", "One"))
+        return second

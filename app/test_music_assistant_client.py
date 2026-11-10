@@ -165,6 +165,57 @@ class StatusTests(_Base):
         post.assert_not_called()
 
 
+class AccountsTests(unittest.TestCase):
+    """Which streaming accounts a playlist comes from, and the accounts
+    Music Assistant has: what an admin gives to a member."""
+
+    def test_a_playlist_names_each_streaming_account_once(self):
+        playlist = {"provider_mappings": [
+            {"provider_domain": "tidal", "provider_instance": "tidal--a1", "item_id": "x"},
+            {"provider_domain": "tidal", "provider_instance": "tidal--a1", "item_id": "y"},
+            {"provider_domain": "spotify", "provider_instance": "spotify--b2", "item_id": "z"},
+            {"provider_domain": "filesystem_local", "provider_instance": "filesystem_local--c3", "item_id": "p"},
+            {"provider_domain": "builtin", "provider_instance": "builtin", "item_id": "q"},
+        ]}
+        self.assertEqual(ma._accounts(playlist), ["tidal--a1", "spotify--b2"])
+        self.assertEqual(ma._accounts({}), [])
+
+    def test_the_accounts_are_its_streaming_music_providers(self):
+        providers = [
+            {"instance_id": "tidal--a1", "domain": "tidal", "name": "alice-music", "type": "music",
+             "is_streaming_provider": True},
+            {"instance_id": "builtin", "domain": "builtin", "name": "Music Assistant", "type": "music",
+             "is_streaming_provider": False},
+            {"instance_id": "fanarttv", "domain": "fanarttv", "name": "fanart.tv", "type": "metadata",
+             "is_streaming_provider": None},
+        ]
+        with mock.patch.object(ma, "_current_config", return_value=("http://ma.example", "t")), \
+                mock.patch.object(ma, "_command", return_value=providers):
+            self.assertEqual(ma.streaming_accounts(), {"status": "ok", "accounts": [
+                {"instance_id": "tidal--a1", "domain": "tidal", "name": "alice-music"}]})
+        with mock.patch.object(ma, "_current_config", return_value=("http://ma.example", "t")), \
+                mock.patch.object(ma, "_command", return_value=None):
+            self.assertEqual(ma.streaming_accounts()["status"], "error")
+
+
+class MirrorReadTests(unittest.TestCase):
+    """#498: Music Assistant 2.9.9 caches playlist_tracks, and within about a
+    second of a write the cached read can return the list from before it.
+    Measured on a real server, two rewrites with no gap: 19 of 40 read-backs
+    were stale without force_refresh, 0 of 40 with it. Every mirror read asks
+    for a fresh one: the read-back after a write, and the read before one,
+    whose length says how many entries to remove."""
+
+    def test_a_mirror_read_asks_for_a_fresh_list(self):
+        entries = [{"uri": "library://track/1", "provider_mappings": []}]
+        with mock.patch.object(ma, "_current_config", return_value=("http://ma.example", "t")), \
+                mock.patch.object(ma, "_command", return_value=entries) as command:
+            self.assertEqual(ma.mirror_read("42"), ["library://track/1"])
+        cmd, args = command.call_args.args[0], command.call_args.args[1]
+        self.assertEqual(cmd, "music/playlists/playlist_tracks")
+        self.assertEqual(args, {"item_id": "42", "provider_instance_id_or_domain": "library", "force_refresh": True})
+
+
 class ListPlaylistsTests(_Base):
     def test_says_which_service_a_playlist_came_from(self):
         copy = dict(PLAYLISTS[3], item_id="12", name="Road Trip", provider_mappings=[
@@ -181,14 +232,14 @@ class ListPlaylistsTests(_Base):
         self._configure()
         with mock.patch("requests.post", return_value=_resp(json_body=PLAYLISTS)):
             self.assertEqual(ma.list_playlists(),
-                             {"status": "ok", "playlists": [{"id": "9", "title": "Probe mix", "source_ids": []}]})
+                             {"status": "ok", "playlists": [{"id": "9", "title": "Probe mix", "source_ids": [], "accounts": []}]})
 
     def test_keeps_a_read_only_playlist_from_another_provider(self):
         synced = dict(PLAYLISTS[3], item_id="12", name="Discover Weekly", is_editable=False,
                       provider_mappings=[{"item_id": "37i9", "provider_domain": "spotify"}])
         self._configure()
         with mock.patch("requests.post", return_value=_resp(json_body=[synced])):
-            self.assertEqual(ma.list_playlists()["playlists"], [{"id": "12", "title": "Discover Weekly", "source_ids": [("spotify", "37i9")]}])
+            self.assertEqual(ma.list_playlists()["playlists"], [{"id": "12", "title": "Discover Weekly", "source_ids": [("spotify", "37i9")], "accounts": []}])
 
     def test_pages_until_a_short_page(self):
         self._configure()
@@ -197,7 +248,7 @@ class ListPlaylistsTests(_Base):
                 mock.patch("requests.post", side_effect=[_resp(json_body=pages[0]), _resp(json_body=pages[1]),
                                                         _resp(json_body=[])]) as post:
             result = ma.list_playlists()
-        self.assertEqual(result["playlists"], [{"id": "9", "title": "Probe mix", "source_ids": []}])
+        self.assertEqual(result["playlists"], [{"id": "9", "title": "Probe mix", "source_ids": [], "accounts": []}])
         offsets = [c.kwargs["json"]["args"]["offset"] for c in post.call_args_list]
         self.assertEqual(offsets, [0, 2, 4])
 

@@ -36,7 +36,7 @@ from mirror_mediabrowser import MediaBrowserMirror, _ERROR_NOT_FOUND  # noqa: F4
 
 # Looked up on each call, not captured, so patching emby_client here reaches it.
 _mirror = MediaBrowserMirror(
-    "emby", "Emby", lambda: emby_client, lambda: db.get_mirror_emby_config())
+    "emby", "Emby", lambda: emby_client, lambda: db.get_mirror_emby_config(), rewrite_notes=True)
 
 _log = logging.getLogger(__name__)
 

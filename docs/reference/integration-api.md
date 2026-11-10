@@ -31,9 +31,12 @@ monitoring/automation surface rather than a sync target.
 
 ## What it is — and isn't
 
-- **Four endpoints, one credential, admin-minted.** `/api/integrations/devices`,
- `/api/integrations/server`, `/api/integrations/mirrors`,
- and `/api/integrations/actions/scan` are all authenticated by
+- **Every endpoint here, one credential, admin-minted.** The read routes
+  (`/api/integrations/devices`, `/api/integrations/server`,
+  `/api/integrations/mirrors`, `/api/integrations/playlist-sources` and
+  `/api/integrations/playlists`) and the two actions
+  (`/api/integrations/actions/scan` and
+  `/api/integrations/actions/playlist-sync`) are all authenticated by
   the same **integration token**. Only an admin can mint one (`POST
   /api/integration-tokens` requires an admin session) — that's the
   property that keeps a rescan trigger safe now, not a second credential
@@ -47,11 +50,11 @@ monitoring/automation surface rather than a sync target.
   or admin panel already shows them, so neither is scoped per caller at
   all.
 - **A token cannot create or revoke other tokens** — that's a
-  session-only, admin-only route. And it can only ever do the four things
+  session-only, admin-only route. And it can only ever do the things
   above: it is wired into its own authenticator
  (`_authenticated_integration_token`), never into the one every
   session-authenticated route (including every mutating one) uses, so it
-  cannot reach anything outside these four routes regardless of what's
+  cannot reach anything outside these routes regardless of what's
   added elsewhere later.
 - The token grants **nothing an ordinary admin session couldn't already
   do** — starting a library scan has never required anything beyond being
@@ -307,6 +310,69 @@ any other code: a mirror target cleared out from under playlists still
 enabled against it is exactly the silent-drift case this endpoint exists
 to surface.
 
+## Playlist source health
+
+```
+GET /api/integrations/playlist-sources
+Authorization: Bearer <token>
+```
+
+Same errors and rate limiting as [Devices](#devices) above.
+
+Every place a playlist sync reads from is a **source**: the library source
+itself, a member's own listing on it (a Roon profile, a Jellyfin or Emby
+user), a member's linked Tidal or Spotify account, and each public link.
+Each finished sync records whether each source answered; a cancelled one
+records nothing. A source **alerts** once it has failed 3 runs in a row and
+has been failing for at least 12 hours, so one bad night alerts nobody, and
+its first success clears it. Admins see the alerting ones in the web UI's
+header, and every source in **Administration → Configuration → Library →
+Source health**. Instance-wide, like [Mirror health](#mirror-health):
+
+| Field | Type | Notes |
+|---|---|---|
+| `sources_total` | integer | Every source the last sync tried. |
+| `sources_failing` | integer | Sources whose latest run failed, alerting or not: for an earlier warning than `sources_alerting`. |
+| `sources_alerting` | integer | Sources the rule above alerts for. Exact, never affected by `alerting`'s cap. The alert: `> 0`. |
+| `alerting` | array | One entry per alerting source, capped at 50 (see `alerting_truncated`): `{"kind": string, "provider": string, "account": string or null, "failing_since": string, "runs": integer, "reason": string}`. |
+| `alerting_truncated` | boolean | `true` if more sources alert than `alerting` has room for. |
+
+`kind` is `library_source`, `member_listing`, `linked_account` or
+`public_link`. `account` is the member's Trobar username, or a public link's
+playlist title, and `null` for the library source. `failing_since` is ISO 8601 in
+UTC with its zone, `YYYY-MM-DDTHH:MM:SSZ`. `reason` is the provider's own short code or error
+text from the last failed run, cut to one line of at most 200 characters.
+
+## Device playlists
+
+```
+GET /api/integrations/playlists
+Authorization: Bearer <token>
+```
+
+Which playlists each device has, and how complete each one is, plus the
+server's totals. Devices are the ones the token's owner may see, as on
+[Devices](#devices).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `playlists_total` | integer | Every playlist on the server. |
+| `playlists_with_gaps` | integer | Playlists with entries not found in the library that nobody has excluded or accepted, as the Playlists tab's **Gaps** view counts them. |
+| `devices` | array | One entry per device: `{"device_id": integer, "name": string, "playlists_count": integer, "playlists": array, "playlists_truncated": boolean}`. |
+
+Each of a device's `playlists` is `{"playlist_id": integer, "title":
+string or null, "private": boolean, "tracks": integer, "matched": integer,
+"available": integer or null, "has_gaps": boolean}`. `available` is the share of the playlist's
+entries found in the library, as a whole percentage; `null` for a
+playlist with no entries. A device lists at most 100 playlists;
+`playlists_count` is always the full number, and `playlists_truncated`
+says when the list is cut.
+
+A private playlist (one a member owns and hasn't shared) is listed and
+counted like any other, with `"private": true` and `"title": null`. What
+an integration shows can reach people the web UI wouldn't show the title
+to, so it never leaves the server.
+
 ## Actions
 
 ```
@@ -325,7 +391,7 @@ curl -X POST -H "Authorization: Bearer <YOUR_TOKEN>" \
 **The same token as [Devices](#devices), [Server metrics](#server-metrics),
 and [Mirror health](#mirror-health)** — see
 [What it is — and isn't](#what-it-is-and-isnt) above for why one
-admin-minted credential covers all four routes rather than a separate
+admin-minted credential covers every route here rather than a separate
 write-capable token.
 
 Triggers the same background library scan as the web UI's own "Scan
@@ -342,14 +408,29 @@ skips files whose size and modification time haven't changed since the
 last scan, `true`
 re-reads everything. Same meaning as the web UI's own force-rescan option.
 
-There is currently no other action — provider-playlist refresh was
-considered and deliberately left out of scope; ask if
-you need that and it still doesn't exist.
+### Playlist sync
+
+```
+POST /api/integrations/actions/playlist-sync
+Authorization: Bearer <token>
+```
+
+Starts the same playlist sync as the web UI's **Sync playlists** button:
+from the active library provider, every linked Tidal and Spotify account
+and every playlist link. It answers like the scan:
+
+| Status | Body | Meaning |
+|---|---|---|
+| `202` | `{"status": "started", "job_id": <int>}` | Sync started in the background. Playlists change as it commits them; read [Device playlists](#device-playlists) afterwards. |
+| `409` | `{"error": "..."}` | A playlist sync is already running, scheduled or started from the web UI; this call did not start a second one. |
+
+The server also syncs playlists on its own schedule, so this is for
+"now", not for keeping them current.
 
 ## Rate limiting
 
 **30 failed authentication attempts per 5 minutes, per IP**, in its own
-bucket, shared by all four routes above — separate from the login rate
+bucket, shared by every route above — separate from the login rate
 limiter, so a misconfigured integration retrying a stale token can
 neither trip nor be tripped by a brute-force login lockout. Only failures
 count against it; a stream of successful polls never approaches the

@@ -32,6 +32,7 @@ import db
 import jobs
 import playlist_sync
 import selection_store
+import source_health
 import spotify_client
 import sync_state
 import tidal_client
@@ -44,6 +45,7 @@ def _make_conn() -> sqlite3.Connection:
     conn.executescript(db.SCHEMA)
     db._run_migrations(conn)
     db._run_migration_step(conn, db._migrate_playlists_composite_key)  # #75 composite unique indexes
+    db._run_migration_step(conn, db._migrate_subsonic_owners)  # Navidrome owners
     return conn
 
 
@@ -1277,6 +1279,188 @@ class TidalPerOwnerCleanupTests(unittest.TestCase):
         self.assertEqual(result["source_failures"][0]["reason"], "2 of 2 playlists not read")
         self.assertIn("rate_limited", logged)
 
+    def _health(self):
+        conn = db.get_conn()
+        try:
+            return {(r["kind"], r["provider"]): r for r in source_health.rows(conn)}
+        finally:
+            conn.close()
+
+    def test_each_source_tried_is_recorded_in_source_health(self):
+        self._linked()
+        self._run(
+            refresh_access_token={"return_value": ("access", "alice-rt")},
+            list_playlists={"return_value": {"status": "error", "reason": "http_404"}})
+        health = self._health()
+        tidal = health[(source_health.LINKED_ACCOUNT, "tidal")]
+        self.assertEqual((tidal["runs"], tidal["reason"], tidal["account"]), (1, "http_404", "alice"))
+        library = health[(source_health.LIBRARY_SOURCE, "subsonic")]
+        self.assertEqual(library["runs"], 0)
+        self.assertIsNotNone(library["last_success_at"])
+
+    def test_a_tidal_account_that_reads_is_recorded_as_ok(self):
+        self._linked()
+        from unittest import mock
+        with mock.patch.object(tidal_client, "refresh_access_token", return_value=("a", "alice-rt")), \
+                mock.patch.object(tidal_client, "list_playlists", return_value={"status": "ok", "playlists": []}):
+            playlist_sync.sync_playlists(_FullStubProvider([], []), "subsonic")
+        self.assertEqual(self._health()[(source_health.LINKED_ACCOUNT, "tidal")]["runs"], 0)
+
+    def _sync_with(self, provider, provider_id, patches):
+        from unittest import mock
+        with contextlib.ExitStack() as stack:
+            for target, name, kwargs in patches:
+                stack.enter_context(mock.patch.object(target, name, **kwargs))
+            playlist_sync.sync_playlists(provider, provider_id)
+
+    def test_a_library_source_that_fails_is_recorded_with_its_reason(self):
+        self._sync_with(_FailingPrimaryProvider(), "subsonic", [])
+        library = self._health()[(source_health.LIBRARY_SOURCE, "subsonic")]
+        self.assertEqual((library["runs"], library["reason"]), (1, "not_paired"))
+
+    def test_each_member_listing_that_fails_is_recorded(self):
+        from playlist_sync import emby_client, jellyfin_client, roon_client
+        conn = db.get_conn()
+        alice = _make_user(conn, "alice")
+        conn.execute("UPDATE users SET roon_profile = 'Alice', jellyfin_user_id = 'jf-a', "
+                     "emby_user_id = 'em-a' WHERE id = ?", (alice,))
+        conn.commit()
+        conn.close()
+        ok = {"status": "ok", "playlists": []}
+
+        def listing(**kwargs):
+            # The library's own listing answers; the member's doesn't.
+            return {"status": "error", "reason": "profile_not_found"} if kwargs else ok
+
+        for client, provider_id in ((roon_client, "roon"), (jellyfin_client, "jellyfin"), (emby_client, "emby")):
+            with self.subTest(provider_id):
+                self._sync_with(client, provider_id, [(client, "list_playlists", {"side_effect": listing})])
+                member = self._health()[(source_health.MEMBER_LISTING, provider_id)]
+                self.assertEqual((member["runs"], member["reason"], member["account"]),
+                                 (1, "profile_not_found", "alice"))
+                self.assertEqual(self._health()[(source_health.LIBRARY_SOURCE, provider_id)]["runs"], 0)
+
+    def test_a_public_link_that_fails_is_recorded(self):
+        conn = db.get_conn()
+        alice = _make_user(conn, "alice")
+        conn.execute("INSERT INTO playlist_subscriptions (owner_user_id, provider, external_id, url, title) "
+                     "VALUES (?, 'ytmusic', 'PLx', 'https://music.example/playlist?list=PLx', 'Road trip mix')",
+                     (alice,))
+        conn.commit()
+        conn.close()
+        self._sync_with(_FullStubProvider([], []), "subsonic", [
+            (playlist_sync, "sync_one_subscription",
+             {"return_value": {"status": "unavailable", "title": "Road trip mix", "tracks": 0, "matched": 0}})])
+        link = self._health()[(source_health.PUBLIC_LINK, "ytmusic")]
+        self.assertEqual((link["runs"], link["reason"], link["account"]), (1, "unavailable", "Road trip mix"))
+
+    def test_music_assistant_not_set_up_records_nothing_for_it(self):
+        self._sync_with(_FullStubProvider([], []), "subsonic", [
+            (playlist_sync.music_assistant_client, "list_playlists",
+             {"return_value": {"status": "error", "reason": "not_paired"}})])
+        self.assertNotIn((source_health.LIBRARY_SOURCE, "music_assistant"), self._health())
+
+    def test_music_assistant_set_up_and_failing_is_recorded(self):
+        conn = db.get_conn()
+        db.set_config(conn, "music_assistant_url", "http://ma.example:8095")
+        conn.commit()
+        conn.close()
+        self._sync_with(_FullStubProvider([], []), "subsonic", [
+            (playlist_sync.music_assistant_client, "list_playlists",
+             {"return_value": {"status": "error", "reason": "not_paired"}})])
+        self.assertEqual(self._health()[(source_health.LIBRARY_SOURCE, "music_assistant")]["runs"], 1)
+
+    def test_a_cancelled_sync_records_nothing(self):
+        self._linked()
+        from unittest import mock
+
+        def cancel(_count):
+            raise jobs.JobCancelled("cancelled")
+
+        with mock.patch.object(tidal_client, "refresh_access_token", return_value=("a", "alice-rt")), \
+                mock.patch.object(tidal_client, "list_playlists", return_value={"status": "error", "reason": "x"}), \
+                self.assertRaises(jobs.JobCancelled):
+            playlist_sync.sync_playlists(_FullStubProvider([{"id": "p", "title": "P"}], []), "subsonic",
+                                         report=cancel)
+        self.assertEqual(self._health(), {})
+
+    def _ma_sync(self, playlists):
+        from unittest import mock
+        tracks = {"status": "ok", "tracks": []}
+        with mock.patch.object(playlist_sync.music_assistant_client, "list_playlists",
+                               return_value={"status": "ok", "playlists": playlists}), \
+                mock.patch.object(playlist_sync.music_assistant_client, "get_playlist_tracks", return_value=tracks):
+            playlist_sync.sync_playlists(playlist_sync.music_assistant_client, "music_assistant")
+
+    def _ma_rows(self):
+        conn = db.get_conn()
+        try:
+            return {r["source_playlist_id"]: r for r in conn.execute(
+                "SELECT * FROM playlists WHERE source_provider = 'music_assistant'")}
+        finally:
+            conn.close()
+
+    def test_a_mapped_accounts_playlists_become_its_members_and_private(self):
+        conn = db.get_conn()
+        alice = _make_user(conn, "alice")
+        bob = _make_user(conn, "bob")
+        conn.execute("INSERT INTO ma_account_owners (instance_id, user_id) VALUES ('tidal--a1', ?)", (alice,))
+        conn.commit()
+        conn.close()
+        lists = [{"id": "1", "title": "Alice faves", "source_ids": [], "accounts": ["tidal--a1"]},
+                 {"id": "2", "title": "Both follow", "source_ids": [], "accounts": ["tidal--a1", "tidal--b2"]},
+                 {"id": "3", "title": "Bob's", "source_ids": [], "accounts": ["tidal--b2"]},
+                 {"id": "4", "title": "Made in MA", "source_ids": [], "accounts": []}]
+        self._ma_sync(lists)
+        rows = self._ma_rows()
+        self.assertEqual((rows["1"]["owner_user_id"], rows["1"]["shared"]), (alice, 0))
+        for unowned in ("2", "3", "4"):
+            self.assertIsNone(rows[unowned]["owner_user_id"], unowned)
+
+    def test_an_extra_music_assistant_source_gives_owners_too(self):
+        # Music Assistant beside another library source, not as the source itself.
+        from unittest import mock
+        conn = db.get_conn()
+        alice = _make_user(conn, "alice")
+        conn.execute("INSERT INTO ma_account_owners (instance_id, user_id) VALUES ('tidal--a1', ?)", (alice,))
+        db.set_config(conn, "music_assistant_url", "http://ma.example:8095")
+        conn.commit()
+        conn.close()
+        lists = {"status": "ok", "playlists": [
+            {"id": "1", "title": "Alice faves", "source_ids": [], "accounts": ["tidal--a1"]}]}
+        with mock.patch.object(playlist_sync.music_assistant_client, "list_playlists", return_value=lists), \
+                mock.patch.object(playlist_sync.music_assistant_client, "get_playlist_tracks",
+                                  return_value={"status": "ok", "tracks": []}):
+            playlist_sync.sync_playlists(_FullStubProvider([], []), "subsonic")
+        self.assertEqual(self._ma_rows()["1"]["owner_user_id"], alice)
+
+    def test_mapping_an_account_later_revokes_other_members_selections(self):
+        conn = db.get_conn()
+        alice = _make_user(conn, "alice")
+        bob = _make_user(conn, "bob")
+        conn.close()
+        lists = [{"id": "1", "title": "Alice faves", "source_ids": [], "accounts": ["tidal--a1"]}]
+        self._ma_sync(lists)  # everyone's at first: bob selects it for his phone
+        conn = db.get_conn()
+        pid = self._ma_rows()["1"]["id"]
+        device, _ = sync_state.create_device(conn, bob, "bob-phone")
+        sel = conn.execute("INSERT INTO selections (type, target, created_by_user_id) VALUES ('playlist', ?, ?)",
+                           (str(pid), bob)).lastrowid
+        conn.execute("INSERT INTO selection_devices (selection_id, device_id) VALUES (?, ?)", (sel, device))
+        own = conn.execute("INSERT INTO selections (type, target, created_by_user_id) VALUES ('playlist', ?, ?)",
+                           (str(pid), alice)).lastrowid
+        conn.execute("INSERT INTO ma_account_owners (instance_id, user_id) VALUES ('tidal--a1', ?)", (alice,))
+        conn.commit()
+        conn.close()
+        self._ma_sync(lists)
+        conn = db.get_conn()
+        try:
+            left = {r[0] for r in conn.execute("SELECT id FROM selections WHERE type = 'playlist'")}
+        finally:
+            conn.close()
+        self.assertEqual(left, {own}, "bob's selection goes, alice's stays")
+        self.assertEqual(self._ma_rows()["1"]["owner_user_id"], alice)
+
     def test_a_rejected_token_is_a_failure_too(self):
         self._linked()
         result, _ = self._run(refresh_access_token={"side_effect": tidal_client.TidalAuthError("no")})
@@ -1983,6 +2167,114 @@ class SpotifyPerOwnerCleanupTests(unittest.TestCase):
             self.assertEqual(row["spotify_refresh_token"], "alice-rt")
         finally:
             conn.close()
+
+
+class SubsonicOwnerTests(unittest.TestCase):
+    """Navidrome playlist owners: the library account (a Navidrome admin)
+    lists every user's playlists with their owner. A member who gave that
+    username owns theirs; a private one of someone who isn't a member yet
+    is visible to admins only; the library account's own, public ones and
+    a server naming no owner stay everyone's."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="trobar-test-subsonic-owners-"))
+        self._prev_db_path, self._prev_data_dir = db.DB_PATH, db.DATA_DIR
+        db.DATA_DIR = self._tmp
+        db.DB_PATH = self._tmp / "test.db"
+        db.init_db()
+        self.conn = db.get_conn()
+        self.listing = []
+
+    def tearDown(self):
+        self.conn.close()
+        db.DB_PATH, db.DATA_DIR = self._prev_db_path, self._prev_data_dir
+        for f in self._tmp.glob("*"):
+            f.unlink()
+        self._tmp.rmdir()
+
+    def _user(self, username, subsonic_username=None, is_admin=0):
+        cur = self.conn.execute("INSERT INTO users (username, subsonic_username, is_admin) VALUES (?, ?, ?)",
+                                (username, subsonic_username, is_admin))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def _sync(self):
+        listing = {"status": "ok", "playlists": [
+            {"id": i, "title": t, "owner": o, "public": pub} for i, t, o, pub in self.listing]}
+        with mock.patch.object(playlist_sync.subsonic_client, "list_playlists", return_value=listing), \
+             mock.patch.object(playlist_sync.subsonic_client, "account_username", return_value="trobar"), \
+             mock.patch.object(playlist_sync.subsonic_client, "get_playlist_tracks",
+                               side_effect=lambda title, source_playlist_id=None:
+                               {"status": "ok", "playlist": title, "tracks": []}):
+            playlist_sync.sync_playlists(playlist_sync.subsonic_client, "subsonic")
+
+    def _row(self, title):
+        return self.conn.execute(
+            "SELECT id, owner_user_id, shared, source_owner, source_private FROM playlists WHERE title = ?",
+            (title,)).fetchone()
+
+    def test_a_members_playlist_is_theirs_and_private_to_them(self):
+        alice = self._user("alice", subsonic_username="Alice")
+        self.listing = [("a1", "Diary", "alice", False)]  # the server's case differs
+        self._sync()
+        row = self._row("Diary")
+        self.assertEqual((row["owner_user_id"], row["shared"], row["source_private"], row["source_owner"]),
+                         (alice, 0, 0, "alice"))
+
+    def test_a_private_playlist_of_someone_not_a_member_is_for_admins_only(self):
+        self.listing = [("b1", "Bob's secret", "bob", False)]
+        self._sync()
+        row = self._row("Bob's secret")
+        self.assertEqual((row["owner_user_id"], row["source_private"]), (None, 1))
+
+    def test_a_public_one_of_someone_not_a_member_is_everyones(self):
+        self.listing = [("b2", "Bob's party", "bob", True)]
+        self._sync()
+        row = self._row("Bob's party")
+        self.assertEqual((row["owner_user_id"], row["source_private"]), (None, 0))
+
+    def test_the_library_accounts_own_private_playlists_stay_everyones(self):
+        self.listing = [("t1", "House mix", "Trobar", False)]
+        self._sync()
+        self.assertEqual(self._row("House mix")["source_private"], 0)
+
+    def test_a_member_named_like_the_library_account_does_not_take_its_playlists(self):
+        # Refused on Profile; this is the sync's own guard should one exist.
+        self._user("carol", subsonic_username="TROBAR")
+        self.listing = [("t1", "House mix", "trobar", False), ("t2", "House party", "trobar", True)]
+        self._sync()
+        for title in ("House mix", "House party"):
+            row = self._row(title)
+            self.assertEqual((row["owner_user_id"], row["source_private"]), (None, 0), title)
+
+    def test_a_server_that_names_no_owner_changes_nothing(self):
+        self.listing = [("x1", "Plain", None, False)]
+        self._sync()
+        row = self._row("Plain")
+        self.assertEqual((row["owner_user_id"], row["source_private"]), (None, 0))
+
+    def test_turning_private_takes_it_off_members_devices_not_admins(self):
+        member = self._user("carol")
+        admin = self._user("dave", is_admin=1)
+        self.listing = [("b1", "Bob's mix", "bob", True)]
+        self._sync()
+        pid = self._row("Bob's mix")["id"]
+        sync_state.create_selection(self.conn, "playlist", str(pid), member, [])
+        sync_state.create_selection(self.conn, "playlist", str(pid), admin, [])
+        self.conn.commit()
+        self.listing = [("b1", "Bob's mix", "bob", False)]  # bob made it private
+        self._sync()
+        creators = {r[0] for r in self.conn.execute(
+            "SELECT created_by_user_id FROM selections WHERE type = 'playlist' AND target = ?", (str(pid),))}
+        self.assertEqual(creators, {admin})
+
+    def test_giving_the_username_later_hands_it_over(self):
+        self.listing = [("b1", "Bob's secret", "bob", False)]
+        self._sync()
+        bob = self._user("bob", subsonic_username="bob")
+        self._sync()
+        row = self._row("Bob's secret")
+        self.assertEqual((row["owner_user_id"], row["source_private"], row["shared"]), (bob, 0, 0))
 
 
 class PerUserProviderMappingTests(unittest.TestCase):

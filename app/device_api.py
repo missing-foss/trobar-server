@@ -18,6 +18,9 @@ from flask_babel import gettext as _
 
 import artist_images
 import autofit
+import cover_links
+import covers
+import device_store
 import db
 import device_plays
 import jobs
@@ -34,6 +37,7 @@ from web_common import (
     _config_int,
     _contained,
     _refresh_autofit_after_limit_change,
+    _validated_artist_images,
     _validated_max_size_bytes,
     _validated_source_of_truth,
 )
@@ -220,6 +224,25 @@ def api_device_source_of_truth():
         return jsonify({"status": "ok"})
 
 
+@bp.route("/api/device/artist-images", methods=["PATCH"])
+def api_device_artist_images():
+    """Lets the device set its own artist_images (null = off, "small",
+    "full"), the same field and the same check as the web device routes.
+    Only the calling device's row: the token decides which, never the body.
+    Nothing to recompute: the next sync writes or leaves out artist.jpg by
+    what it reads here."""
+    with db.connection() as conn:
+        device = _authenticated_device(conn)
+        body = request.get_json(force=True)
+        if not isinstance(body, dict) or "artist_images" not in body:
+            # Absent is not "off": a body without the field changes nothing.
+            abort(400, description=_("Unsupported artist image setting."))
+        imgs = _validated_artist_images(body.get("artist_images"))
+        conn.execute("UPDATE devices SET artist_images = ? WHERE id = ?", (imgs, device["id"]))
+        conn.commit()
+        return jsonify({"status": "ok", "artist_images": imgs})
+
+
 @bp.route("/api/device/manifest", methods=["POST"])
 def api_device_manifest():
     """#63 recovery: a re-paired device POSTs {"paths": [...]} — the relative
@@ -295,6 +318,16 @@ def api_device_changes():
             conn, [t["track_id"] for t in changes["to_download"]], changes["transcode_format"])
         for t in changes["to_download"]:
             t["estimated_size"] = estimates.get(t["track_id"], t["size"])
+        # trobar-garmin#54: a device that shows covers itself asks for them at
+        # its size, and gets one signed address per album (cover_links): it
+        # can't send its token with an image request.
+        cover_size = request.args.get("cover_size", type=int)
+        if cover_size is not None and _COVER_MIN_PX <= cover_size <= _COVER_MAX_PX:
+            secret = _cover_secret()
+            changes["covers"] = [
+                {"key": a["key"], "track_ids": a["track_ids"],
+                 "url": cover_links.address(secret, device["id"], a["track_id"], cover_size)}
+                for a in device_store.cover_albums(conn, device["id"])]
     # #239: device sync is the trigger for computing the fingerprints this
     # device's provenance DB will store (the locked design decision: reuse
     # #200's cache when a track already has one, compute on first device sync
@@ -556,6 +589,64 @@ def api_device_file(track_id: int):
         # any other failed download.
         return Response(transcode.iter_file(out_path, err_path), mimetype="audio/mpeg",
                         headers={"Accept-Ranges": "none", "Content-Length": str(os.path.getsize(out_path))})
+
+
+def _cover_secret() -> bytes:
+    """The key cover addresses are signed with: the app's own secret key."""
+    key = current_app.secret_key
+    if not key:
+        raise RuntimeError("the app has no secret key to sign cover addresses with")
+    return key.encode("utf-8") if isinstance(key, str) else key
+
+
+# A watch's album cover (trobar-garmin#54): small enough to store dozens of,
+# never so small it's a smudge.
+_COVER_MIN_PX = 32
+_COVER_MAX_PX = 256
+
+
+@bp.route("/api/device/cover/<int:track_id>")
+def api_device_cover(track_id: int):
+    """The album cover of a track this device was offered, at most `size`
+    pixels on its longer side (JPEG, never enlarged), for a device that
+    shows covers itself rather than reading them from the file: a Garmin
+    watch's player doesn't.
+
+    Authenticated by a signed address (cover_links), not a token: the watch
+    can't send one with an image request. The address comes from that
+    device's own /api/device/changes answer and works for this one device,
+    track and size until it expires. Anything else is 403, before anything
+    is looked at; nothing here logs the address. 404 for a track no longer
+    offered to the device, as /api/device/file does, and for an album with
+    no cover."""
+    args = request.args
+    device_id = args.get("d", type=int)
+    size = args.get("size", type=int)
+    expires = args.get("exp", type=int)
+    sig = args.get("sig", "")
+    if device_id is None or size is None or expires is None or not cover_links.valid(
+            _cover_secret(), device_id, track_id, size, expires, sig):
+        abort(403, description=_("This cover address is not valid."))
+    if not _COVER_MIN_PX <= size <= _COVER_MAX_PX:
+        abort(400, description=_("The size must be between {min} and {max} pixels.").format(
+            min=_COVER_MIN_PX, max=_COVER_MAX_PX))
+    with db.connection() as conn:
+        device = {"id": device_id}
+        row = conn.execute(
+            "SELECT t.relative_path, COALESCE(NULLIF(t.album_artist, ''), t.artist) AS artist, t.album "
+            "FROM device_track_state s JOIN tracks t ON t.id = s.track_id "
+            "WHERE s.device_id = ? AND s.track_id = ? AND s.status IN ('pending', 'downloaded') "
+            "AND t.deleted_at IS NULL",
+            (device["id"], track_id),
+        ).fetchone()
+    if row is None:
+        abort(404, description=_("Track not found (removed from the library?)"))
+    source = _contained(db.get_music_root(), row["relative_path"])
+    cover = covers.get_cover(row["artist"] or "", row["album"] or "", source) if source else None
+    if cover is None:
+        abort(404, description=_("No cover for this album"))
+    data, content_type = artist_images.downscale(*cover, max_px=size)
+    return Response(data, mimetype=content_type, headers={"Cache-Control": "private, max-age=86400"})
 
 
 @bp.route("/api/device/artist-image")

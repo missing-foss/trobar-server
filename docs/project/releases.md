@@ -11,7 +11,7 @@ independently** with its own tag namespace:
 
 | Component | Repo | Tag | Artifact |
 |---|---|---|---|
-| Server | [trobar-server](https://github.com/missing-foss/trobar-server) | `vX.Y.Z` | Source / Docker image |
+| Server | [trobar-server](https://github.com/missing-foss/trobar-server) | `vX.Y.Z` | Source only: you build the Docker image with `docker compose build` (no published image) |
 | Android app | [trobar-android](https://github.com/missing-foss/trobar-android) | `vX.Y.Z` | Signed APK on the GitHub Release |
 | Desktop app | [trobar-desktop](https://github.com/missing-foss/trobar-desktop) | `vX.Y.Z` | Linux / macOS / Windows builds on the GitHub Release |
 | Garmin watch app | [trobar-garmin](https://github.com/missing-foss/trobar-garmin) | `vX.Y.Z` | `.prg` on the GitHub Release (sideload-only — no Connect IQ Store listing yet) |

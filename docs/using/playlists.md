@@ -12,8 +12,9 @@ Plex / LMS / Subsonic) and from each member's personal [Tidal](../providers/tida
 alone has no provider playlists — see
 [Providers overview](../providers/index.md). Any household member can also
 paste the link to a public
-[YouTube Music](../providers/youtube-music.md) or
-[Spotify](../providers/spotify-links.md) playlist, with no account at all.
+[YouTube Music](../providers/youtube-music.md),
+[Spotify](../providers/spotify-links.md) or
+[Tidal](../providers/tidal-links.md) playlist, with no account of their own.
 
 Two local sources merge in on top of that, whichever provider is active:
 `.m3u`/`.m3u8` files under your music folder (always), and, when an admin
@@ -37,6 +38,21 @@ Both automatic ones are set under **Administration → Configuration →
 Automatic playlist sync**: an interval of 0 turns the schedule off, and
 unticking **Sync playlists after each library scan** (ticked by default)
 turns off the sync after a scan.
+
+## Sorting the list
+
+**Sort**, in the Playlists toolbar, orders the list four ways:
+
+- **Availability** (the default): the most of their tracks available locally first.
+- **Most tracks**: the longest playlists first.
+- **Newest in Trobar**: the playlists Trobar imported or created most recently
+  first. That is when Trobar first saw a playlist, not when it last changed at
+  its source, which Trobar doesn't record. A playlist deleted at its source and
+  imported again counts as new.
+- **Name (A–Z)**: alphabetical, ignoring case.
+
+Playlists that tie are listed by name. Each browser remembers its own choice.
+The phone app offers the same four orders.
 
 ## How they sync
 
@@ -160,6 +176,25 @@ never gated by the sharing toggle, regardless of the badge.
 Music Assistant says which service and playlist each of its playlists came
 from, so those are matched exactly. Roon doesn't, so its playlists are matched
 by title and shared tracks.
+
+### A member's own streaming account in Music Assistant
+
+Music Assistant can hold several people's streaming accounts, and each
+account brings its own playlists, its favourites among them. By default
+they're everyone's. An admin can give an account to its member in
+**Administration → Configuration**, under Music Assistant's **Streaming
+accounts**. From the next sync, the playlists that come from that account
+alone belong to that member and are private to them; they can share any of
+them again from its row. A playlist that more than one account carries stays
+everyone's.
+
+Making them private takes them off other members' devices, as un-sharing
+does. Before saving, Administration says how many playlists change and whose
+device selections go. Setting the account back to **Everyone** makes its
+playlists visible to all again, but doesn't bring back removed selections.
+
+A streaming account's favourites list shows what that service returns: an
+empty one means the account has no favourited tracks there.
 
 ## Mirroring
 
@@ -294,6 +329,14 @@ Writing back to a streaming provider isn't implemented.
   says the same count when you hover it. The folder mirror has no target:
   its gaps are the tracks not matched locally, which the playlist's
   unresolved tracks already list.
+- **Edits overwritten.** A mirror is a copy: Trobar's playlist is the
+  source, and each write puts the copy back the way Trobar has it. When
+  someone changed the copy since the last write (added a track there, or
+  removed one), that line also says e.g. "3 edits overwritten", the folder
+  included. **Show** lists them (up to 100), each as added there and
+  removed, or removed there and put back. To keep a change, make it to the
+  playlist in Trobar. The playlist's owner sees the same count on its
+  mirror icon; other members who can see the playlist don't.
 
 ## Requesting missing albums from Lidarr
 

@@ -34,6 +34,13 @@ import provider_config
 _log = logging.getLogger(__name__)
 
 
+
+def copy_item(item: dict) -> dict:
+    """One entry of a mirrored playlist's copy, as mirror_copies keeps it:
+    the item's own Id, and its artist and title for showing."""
+    return {"id": str(item["Id"]), "title": item.get("Name") or "",
+            "artist": ", ".join(a for a in item.get("Artists") or [] if a)}
+
 class MediaBrowserClient:
     def __init__(self, name: str, module: ModuleType,
                  mirror_config: Callable[[], tuple[str, str, str] | None]) -> None:

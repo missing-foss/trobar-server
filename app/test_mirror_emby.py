@@ -26,6 +26,7 @@ import db
 import matching
 import emby_client
 import mirror_emby
+import mirror_mediabrowser
 import mirror_runs
 
 
@@ -42,6 +43,10 @@ class _MirrorEmbyTestBase(unittest.TestCase):
         db.DB_PATH = Path(self._tmp) / "music-sync.db"
         db.init_db()
         self.addCleanup(self._restore_db_globals)
+        # #499: the rewrite Emby's notes need, recorded here rather than timed.
+        notes = mock.patch.object(mirror_mediabrowser.mirror_notes, "note_written")
+        self.note_written = notes.start()
+        self.addCleanup(notes.stop)
         self.conn = db.get_conn()
         self._track_seq = 0
         # write_mirror() checks db.get_mirror_emby_config() directly
@@ -154,6 +159,12 @@ class WriteContentTests(_MirrorEmbyTestBase):
                 "Road Trip", ["s1"], None, "u1")
             client.mirror_set_playlist_metadata.assert_called_once_with(
                 "99", "Road Trip", mock.ANY)
+            # #499: the note is handed on to be written again after the run.
+            self.note_written.assert_called_once_with("emby", "99", mock.ANY)
+            note = client.mirror_set_playlist_metadata.call_args.args[2]
+            self.note_written.call_args.args[2]()
+            self.assertEqual(client.mirror_set_playlist_metadata.call_args_list[-1],
+                             mock.call("99", "Road Trip", note))
 
         row = self._row(pid)
         self.assertEqual(row["emby_mirror_remote_id"], "99")

@@ -132,18 +132,31 @@ first sync. You can still raise the tier yourself in the web UI (device →
 Edit) if you want better quality at the cost of more transcoding. See
 [Devices & Storage](../using/devices.md#per-device-options).
 
-!!! warning "The watch's sync screen can get stuck at 0% — this is expected"
-    On some real-device tests, the watch's own native "Syncing…" screen has
-    stayed at 0% and never dismissed itself, **even when the sync actually
-    completed successfully**. This has been confirmed (via debug
-    instrumentation) to be a Connect IQ platform limitation, not a Trobar
-    bug: the app calls the documented completion signal correctly every
-    time, but the watch's own progress UI doesn't always honour it.
+!!! warning "The watch's sync screen can get stuck at 0%"
+    On real-device tests, the watch's own "Syncing…" screen has stayed at 0%
+    and never dismissed itself, **even when the sync actually completed
+    successfully**. Whether that is the watch's firmware or something Trobar
+    can fix is still being worked out.
 
     If this happens: cancel the stuck screen (Back) and check the device's
     entry in the trobar-server web UI (or wait a few seconds and check
     again) — the sync has almost certainly already finished correctly.
     Don't assume it failed just because the screen didn't close on its own.
+
+## When it syncs
+
+The watch syncs on its own, over its own Wi-Fi, when its system asks Trobar
+whether a sync is needed. Trobar says yes once **6 hours** (by default) have
+passed since its last successful sync, to spare the battery, and at the next
+chance after a sync that failed. The **Minimum time between syncs** setting in
+the app's settings in Garmin Connect changes that ("None: every chance", 1, 3,
+6, 12 or 24 hours).
+
+From the next release of Trobar for Garmin, to sync **now**: open Trobar in
+the Music app and press **Select** on its status screen ("Select to sync
+now"). That sync always runs. The watch's own **Sync** entry in the Music menu
+obeys the minimum time, like an automatic sync: if the last sync was recent,
+it ends at once and does nothing.
 
 ## What syncs
 

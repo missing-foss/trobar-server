@@ -41,8 +41,8 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       <template x-for="(s, i) in ['music', 'provider', 'lastfm']" :key="s">
         <div class="flex items-center gap-2">
           <div class="w-2 h-2 rounded-full"
-            :class="step === s ? 'bg-accent' : (['music','provider','lastfm'].indexOf(step) > i ? 'bg-accent/40' : 'bg-gray-300/40')"></div>
-          <div class="w-6 h-px bg-gray-300/30" x-show="i < 2"></div>
+            :class="step === s ? 'bg-accent' : (['music','provider','lastfm'].indexOf(step) > i ? 'bg-accent/40' : 'bg-gray-300')"></div>
+          <div class="w-6 h-px bg-gray-200" x-show="i < 2"></div>
         </div>
       </template>
     </div>
@@ -55,7 +55,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       <a href="/#/admin" class="font-medium text-accent hover:underline">{{ _("Back to Administration") }}</a>
     </div>
 
-    <div class="bg-panel rounded-lg border border-gray-300/30 p-5">
+    <div class="bg-panel rounded-lg border border-gray-200 p-5">
       <template x-if="loading">
         <p class="text-sm text-gray-400 text-center">{{ _("Loading…") }}</p>
       </template>
@@ -85,7 +85,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
             <span x-text="saving ? t('savingLabel') : t('continueLabel')"></span>
           </button>
           <button x-show="musicRootWritable" @click="saveMusicRoot(true)" :disabled="saving"
-            class="w-full text-sm px-3 py-2 rounded border border-gray-300 hover:bg-gray-100/10 disabled:opacity-50">
+            class="w-full text-sm px-3 py-2 rounded border border-gray-300 hover:bg-gray-100 disabled:opacity-50">
             {{ _("Continue anyway") }}
           </button>
         </div>
@@ -101,8 +101,8 @@ SPDX-License-Identifier: AGPL-3.0-or-later
             <template x-for="opt in [{id: 'filesystem', label: 'Filesystem'}, {id: 'roon', label: 'Roon'}, {id: 'subsonic', label: 'Subsonic'}, {id: 'jellyfin', label: 'Jellyfin'}, {id: 'emby', label: 'Emby'}, {id: 'plex', label: 'Plex'}, {id: 'lms', label: 'LMS'}, {id: 'music_assistant', label: 'Music Assistant'}]" :key="opt.id">
               <button type="button" @click="adminConfig.provider = opt.id; providerStatus = null"
                 :disabled="again && adminConfig.provider !== opt.id" :aria-pressed="adminConfig.provider === opt.id"
-                :class="adminConfig.provider===opt.id ? 'bg-indigo-50 text-accent' : 'text-gray-400 hover:bg-gray-100/10'"
-                class="text-xs px-2 py-1 rounded-md border border-gray-300/40 disabled:opacity-40">
+                :class="adminConfig.provider===opt.id ? 'bg-indigo-50 text-accent' : 'text-gray-400 hover:bg-gray-100'"
+                class="text-xs px-2 py-1 rounded-md border border-gray-300 disabled:opacity-40">
                 <span x-text="opt.label"></span>
               </button>
             </template>
@@ -221,7 +221,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
           <div class="flex items-center gap-2" x-show="adminConfig.provider !== 'filesystem'">
             <button @click="testProviderConnection()" :disabled="testing" type="button"
-              class="text-sm px-3 py-1.5 rounded border border-gray-300 hover:bg-gray-100/10 disabled:opacity-50">
+              class="text-sm px-3 py-1.5 rounded border border-gray-300 hover:bg-gray-100 disabled:opacity-50">
               <span x-text="testing ? t('testingLabel') : t('testConnectionLabel')"></span>
             </button>
             <template x-if="providerStatus">

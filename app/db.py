@@ -1887,6 +1887,86 @@ def _migrate_setup_completed_for_old_installs(conn: sqlite3.Connection) -> None:
         set_config(conn, "setup_completed", "1")
 
 
+def _migrate_ma_account_owners(conn: sqlite3.Connection) -> None:
+    """Which member each Music Assistant streaming account belongs to: its
+    playlists become that member's, private to them. An account with no row
+    stays everyone's."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ma_account_owners (
+            instance_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE
+        ) STRICT""")
+
+
+def _migrate_source_health(conn: sqlite3.Connection) -> None:
+    """How each playlist source has fared across syncs (source_health.py):
+    failures in a row, since when, the last reason, and whether it alerts."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS source_health (
+            key TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            subscription_id INTEGER REFERENCES playlist_subscriptions(id) ON DELETE CASCADE,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            failing_since TEXT,
+            last_reason TEXT,
+            last_success_at TEXT,
+            last_seen_at TEXT NOT NULL,
+            alerting INTEGER NOT NULL DEFAULT 0
+        ) STRICT""")
+
+
+
+def _migrate_mirror_overwrites(conn: sqlite3.Connection) -> None:
+    """What a mirror write overwrote on its target (mirror_copies.py).
+
+    mirror_copies: each server sink's copy of a playlist as Trobar last
+    left it, the baseline that tells an edit made on the target from a
+    change Trobar made itself.
+
+    Three mirror_runs columns: how many tracks added on the target the
+    write discarded, how many removed there it put back, and those tracks
+    (JSON, at most mirror_runs.LIST_MAX)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mirror_copies (
+            playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+            sink TEXT NOT NULL,
+            items TEXT NOT NULL,
+            PRIMARY KEY (playlist_id, sink)
+        ) STRICT""")
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(mirror_runs)")}
+    if "discarded" not in existing:
+        conn.execute("ALTER TABLE mirror_runs ADD COLUMN discarded INTEGER NOT NULL DEFAULT 0")
+    if "restored" not in existing:
+        conn.execute("ALTER TABLE mirror_runs ADD COLUMN restored INTEGER NOT NULL DEFAULT 0")
+    if "overwritten" not in existing:
+        conn.execute("ALTER TABLE mirror_runs ADD COLUMN overwritten TEXT NOT NULL DEFAULT '[]'")
+
+def _migrate_subsonic_owners(conn: sqlite3.Connection) -> None:
+    """Navidrome playlist owners. A member gives their Navidrome username
+    (users.subsonic_username; no password: the library account is a
+    Navidrome admin and reads every user's playlists). Each Subsonic
+    playlist records its owner there (playlists.source_owner) and whether
+    it is private there (playlists.source_private). A private one whose
+    owner isn't a member yet is visible to admins only."""
+    users = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "subsonic_username" not in users:
+        conn.execute("ALTER TABLE users ADD COLUMN subsonic_username TEXT")
+    playlists = {row[1] for row in conn.execute("PRAGMA table_info(playlists)")}
+    if "source_owner" not in playlists:
+        conn.execute("ALTER TABLE playlists ADD COLUMN source_owner TEXT")
+    if "source_private" not in playlists:
+        conn.execute("ALTER TABLE playlists ADD COLUMN source_private INTEGER NOT NULL DEFAULT 0")
+    # Whose account the Subsonic mirror copy is in, when Trobar gave it to
+    # its owner (their Navidrome username); NULL is the mirror account.
+    if "subsonic_mirror_owner" not in playlists:
+        conn.execute("ALTER TABLE playlists ADD COLUMN subsonic_mirror_owner TEXT")
+    # One Navidrome user per member, whatever the case: it decides whose
+    # private playlists someone receives.
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_subsonic_username "
+                 "ON users (subsonic_username COLLATE NOCASE) WHERE subsonic_username IS NOT NULL")
+
 # The numbered schema migrations. PRAGMA user_version records how many have
 # run; each runs once, in order. Append, never edit or reorder one that has
 # shipped: a database that already ran it will not run it again.
@@ -1909,6 +1989,10 @@ MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _migrate_play_sends,
     _migrate_lastfm_session,
     _migrate_setup_completed_for_old_installs,
+    _migrate_source_health,
+    _migrate_ma_account_owners,
+    _migrate_mirror_overwrites,
+    _migrate_subsonic_owners,
 )
 
 
@@ -2003,6 +2087,10 @@ def init_db() -> None:
         )
         _seed_spotify_experimental_default(conn)
         _seed_playlist_sync_interval_default(conn)
+        # Tidal refresh tokens stored in cleartext are encrypted. Every start:
+        # one the credential key couldn't seal is tried again.
+        import tidal_token  # here, not at the top: it imports credential_store, which imports db
+        tidal_token.convert_cleartext(conn)
         conn.commit()
 
 

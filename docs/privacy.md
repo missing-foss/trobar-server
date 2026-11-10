@@ -158,15 +158,20 @@ tools to tell what kind of drive each one is and how much space it has.
 access token an administrator creates in Trobar.
 
 **What it sends to your server:** requests for the status of the server, its
-devices and its playlist mirrors, every five minutes; and a library scan when
-you press the scan button.
+devices, their playlists and its playlist mirrors, every five minutes; a
+library scan when you press the scan button; and a playlist sync when you
+press the sync button.
 
 **What it shows in Home Assistant:**
 
 - for every device in the household, not only yours: its name, type and
   owner's username, whether it is yours, its free and total space, pending
   tracks, how many files on it Trobar doesn't know, and its last sync;
-- for the server: its version, library size and last scan;
+- for every device: which playlists it has and how much of each is in the
+  library, with each playlist's title, except a private playlist's: that one
+  is shown untitled;
+- for the server: its version, library size, last scan and how many
+  playlists it has, and how many of them have gaps;
 - when playlist mirrors fail: for each failing playlist, its title, where it
   was being copied to, the error and when it was last written. This list
   covers the whole server, so it includes other users' playlist titles.
@@ -195,7 +200,9 @@ Everything is in `DATA_DIR` on your machine (see
 - **linked accounts:** when you link Spotify or Tidal, that account's id,
   display name and access, and for Tidal which permissions the link was
   granted; when you map your account to a Jellyfin, Emby or
-  Roon user, that user's id or profile;
+  Roon user, that user's id or profile; when you give your Navidrome
+  username, that username, and never the password you proved it with: it
+  is used for one sign-in and not kept;
 - **devices:** name, type, owner, a hash of the device's token (not the token
   itself), storage figures the device reported, and when it last synced;
 - **access for apps:** hashes of pairing codes and of the tokens
@@ -217,10 +224,11 @@ Everything is in `DATA_DIR` on your machine (see
   account they came from. It decides when administrators see a thank-you
   card, and whether each administrator dismissed it;
 - **connections you set up:** provider addresses, keys and passwords, the
-  Roon pairing token, and the access granted when you link a Spotify or
-  Tidal account. These are stored in plain text, so protect `DATA_DIR` like
+  Roon pairing token, and the access granted when you link a Spotify
+  account. These are stored in plain text, so protect `DATA_DIR` like
   a password store. The Maloja API key, ListenBrainz user token and Last.fm
-  session are the exception: they are encrypted, with a key kept in a file of its own. That
+  session, and the access granted when you link Tidal, are the exception: they
+  are encrypted, with a key kept in a file of its own. That
   protects a leaked database or snapshot. It protects against someone who can
   read all of `DATA_DIR` only if an administrator keeps that key elsewhere;
 - **caches** of cover art and artist pictures, and MP3 copies of tracks
@@ -275,6 +283,7 @@ below happens only when you, or your administrator, set it up:
 | Spotify, Tidal | once a user links an account | requests on that account, to read its playlists |
 | Tidal | only for a playlist shared between two linked members, while the share is active, and once after it ends if its owner asks for their original to be deleted | requests on the recipient's account, to create and update the copy; for a two-way share, on the owner's account, to add or remove tracks; and for that deletion, on both, to check the copy holds every track before deleting the owner's playlist |
 | Spotify, YouTube Music | once a user adds a public playlist link | the playlist's address, to read it |
+| Tidal | once a user adds a public playlist link | the playlist's id, with the server's own Tidal app credentials, to read it |
 | AcoustID, then MusicBrainz | only with an AcoustID key | each track's audio fingerprint to AcoustID, and the recording it matched to MusicBrainz, to find the track's ISRC |
 | MusicBrainz | only while Lidarr requests are set up | the artist and title (or ISRC) of playlist tracks missing from your library |
 | TheAudioDB | only with a TheAudioDB key | artist names, for artist pictures |

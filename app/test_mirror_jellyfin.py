@@ -25,6 +25,7 @@ import db
 import matching
 import jellyfin_client
 import mirror_jellyfin
+import mirror_notes
 import mirror_runs
 
 
@@ -159,6 +160,20 @@ class WriteContentTests(_MirrorJellyfinTestBase):
         self.assertIsNotNone(row["jellyfin_mirror_last_written_at"])
         self.assertIsNone(row["jellyfin_mirror_last_error"])
         self.assertIsNone(row["jellyfin_mirror_last_error_code"])
+
+    def test_jellyfin_keeps_its_note_so_none_is_written_again(self):
+        # #499 is Emby's: Jellyfin keeps the note, measured on 10.11.11 and 12.2.
+        pid = self._make_playlist("Road Trip")
+        t1 = self._make_track("Artist A", "Album", "Song A")
+        self._add_playlist_track(pid, 0, t1)
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client, \
+                mock.patch.object(mirror_notes, "note_written") as note_written:
+            client.mirror_build_tag_index.return_value = {
+                _key("Artist A", "Album", "Song A"): [{"id": "s1", "track_no": None}],
+            }
+            client.mirror_create_or_replace_playlist.return_value = {"status": "ok", "remote_id": "99"}
+            mirror_jellyfin.write_mirror(self.conn, pid)
+        note_written.assert_not_called()
 
     def test_only_target_indexed_tracks_are_included(self):
         pid = self._make_playlist("Partial")
@@ -670,6 +685,78 @@ class CoverageRunTests(_MirrorJellyfinTestBase):
         assert run is not None
         self.assertEqual((run["total"], run["on_target"], run["lacked"]), (1, 0, 1))
 
+
+
+class OverwriteTests(_MirrorJellyfinTestBase):
+    """An edit made to the copy in Jellyfin is overwritten by the next
+    write; the run says what it discarded and what it put back. The client
+    hands back the copy it cleared as "previous"."""
+
+    INDEX = {
+        _key("Artist", "Album", "One"): [{"id": "s1", "track_no": None}],
+        _key("Artist", "Album", "Two"): [{"id": "s2", "track_no": None}],
+    }
+
+    def _write(self, pid, previous, remote_id="9"):
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client:
+            client.mirror_build_tag_index.return_value = self.INDEX
+            client.mirror_create_or_replace_playlist.return_value = {
+                "status": "ok", "remote_id": remote_id, "previous": previous}
+            mirror_jellyfin.write_mirror(self.conn, pid)
+        run = mirror_runs.missing(self.conn, pid, "jellyfin")
+        assert run is not None
+        return run
+
+    def _playlist(self, *titles):
+        pid = self._make_playlist("Mix")
+        for pos, title in enumerate(titles):
+            self._add_playlist_track(pid, pos, self._make_track("Artist", "Album", title))
+        return pid
+
+    @staticmethod
+    def _item(item_id, title, artist="Artist"):
+        return {"id": item_id, "artist": artist, "title": title}
+
+    def test_the_first_write_reports_nothing(self):
+        run = self._write(self._playlist("One"), None)
+        self.assertEqual((run["discarded"], run["restored"], run["overwritten"]), (0, 0, []))
+
+    def test_a_track_added_in_jellyfin_is_discarded_and_said(self):
+        pid = self._playlist("One")
+        self._write(pid, None)
+        run = self._write(pid, [self._item("s1", "One"), self._item("x9", "Stray", "Someone")])
+        self.assertEqual((run["discarded"], run["restored"]), (1, 0))
+        self.assertEqual(run["overwritten"], [{"artist": "Someone", "title": "Stray", "change": "discarded"}])
+
+    def test_a_track_removed_in_jellyfin_is_put_back_and_said(self):
+        pid = self._playlist("One", "Two")
+        self._write(pid, None)
+        run = self._write(pid, [self._item("s1", "One")])
+        self.assertEqual((run["discarded"], run["restored"]), (0, 1))
+        # Named as Trobar wrote it: the baseline is what was written.
+        self.assertEqual(run["overwritten"], [{"artist": "Artist", "title": "Two", "change": "restored"}])
+
+    def test_a_change_made_in_trobar_is_not_an_overwrite(self):
+        pid = self._playlist("One")
+        self._write(pid, None)
+        self._add_playlist_track(pid, 1, self._make_track("Artist", "Album", "Two"))
+        run = self._write(pid, [self._item("s1", "One")])
+        self.assertEqual((run["discarded"], run["restored"], run["overwritten"]), (0, 0, []))
+
+    def test_without_a_baseline_an_extra_track_is_not_said(self):
+        pid = self._playlist("One")
+        run = self._write(pid, [self._item("s1", "One"), self._item("x9", "Stray")])
+        self.assertEqual(run["discarded"], 0)
+
+    def test_stopping_the_mirror_forgets_the_baseline(self):
+        pid = self._playlist("One")
+        self._write(pid, None)
+        with mock.patch("mirror_jellyfin.jellyfin_client") as client:
+            client.mirror_delete_playlist.return_value = True
+            mirror_jellyfin.delete_mirror(self.conn, pid)
+        self.conn.commit()
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM mirror_copies WHERE playlist_id = ?", (pid,)).fetchone())
 
 if __name__ == "__main__":
     unittest.main()
